@@ -1,0 +1,21 @@
+---
+Language: Cpp
+# BasedOnStyle:  LLVM
+ColumnLimit: 100
+IndentCaseLabels: true
+AllowShortFunctionsOnASingleLine: Empty
+NamespaceIndentation: All
+---
+Language: Proto
+# Don't format .proto files.
+DisableFormat: true
+---
+Language: ObjC
+# clang-format misunderstands some header files as Objective-C files
+DisableFormat: true
+---
+Language: Java
+ColumnLimit: 100
+---
+Language: Json
+BasedOnStyle: llvm
