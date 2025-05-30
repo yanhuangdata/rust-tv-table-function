@@ -1,0 +1,28 @@
+[package]
+name = "rust-tvtf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow = { version = "=54.2.1", features = ["chrono-tz", "ffi"] }
+arrow-csv = "=54.2.1"
+arrow-schema = { version = "=54.2.1" }
+anyhow = "1.0.98"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+parking_lot = "0.12.4"
+
+[build-dependencies]
+anyhow = "1.0.98"
+build-rs = "0.1.2"
+cc = "1.2.23"
+zngur = "0.5.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+debug = "full"
+
+[dev-dependencies]
+tempfile = "3.20.0"

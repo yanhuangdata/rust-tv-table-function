@@ -1,0 +1,226 @@
+#convert_panic_to_exception
+
+// Section Rust std
+
+type () {
+    #layout(size = 0, align = 1); // Unit type has stable layout
+    wellknown_traits(Copy);
+}
+
+mod ::std {
+    type string::String {
+        #layout(size = 24, align = 8);
+        fn as_str(&self) -> &str;
+        fn clone(&self) -> ::std::string::String;
+        fn from_utf8_unchecked(::std::vec::Vec<u8>) -> ::std::string::String;
+    }
+
+    mod vec {
+        type Vec<u8> {
+            #layout(size = 24, align = 8);
+            wellknown_traits(Debug);
+
+            fn len(&self) -> usize;
+
+            fn as_ptr(&self) -> *const u8;
+
+            fn push(&mut self, u8);
+
+            fn new() -> ::std::vec::Vec<u8>;
+
+            fn with_capacity(usize) -> ::std::vec::Vec<u8>;
+
+            fn from_raw_parts(*mut u8, usize, usize) -> ::std::vec::Vec<u8>;
+        }
+
+        type Vec<::std::sync::Arc<::arrow::record_batch::RecordBatch>> {
+            #layout(size = 24, align = 8);
+            wellknown_traits(Debug);
+            fn len(&self) -> usize;
+        }
+
+        type Vec<::std::string::String> {
+            #layout(size = 24, align = 8);
+            wellknown_traits(Debug);
+
+            fn len(&self) -> usize;
+
+            fn push(& mut self,::std::string::String);
+
+            fn new() -> ::std::vec::Vec<::std::string::String>;
+
+            fn get(&self, usize) -> ::std::option::Option<&::std::string::String> deref [::std::string::String];
+        }
+
+        type Vec<crate::FunctionRegistry> {
+            #layout(size = 24, align = 8);
+
+            fn len(&self) -> usize;
+
+            fn push(&mut self, crate::FunctionRegistry);
+
+            fn new() -> ::std::vec::Vec<crate::FunctionRegistry>;
+
+            fn get(&self, usize) -> ::std::option::Option<&crate::FunctionRegistry> deref [crate::FunctionRegistry];
+        }
+    }
+
+    type Box<dyn crate::TableFunction> {
+        #layout(size = 16, align = 8);
+    }
+
+    type collections::HashMap<string::String, string::String> {
+        #layout(size = 48, align = 8);
+        wellknown_traits(Debug);
+        fn new() -> ::std::collections::HashMap<::std::string::String, ::std::string::String>;
+        fn with_capacity(usize) -> ::std::collections::HashMap<::std::string::String, ::std::string::String>;
+        fn insert(&mut self, ::std::string::String, ::std::string::String) -> ::std::option::Option<::std::string::String>;
+    }
+
+    type collections::HashSet<string::String> {
+        #layout(size = 48, align = 8);
+        wellknown_traits(Debug);
+
+        fn new() -> ::std::collections::HashSet<::std::string::String>;
+        fn with_capacity(usize) -> ::std::collections::HashSet<::std::string::String>;
+        fn insert(&mut self, ::std::string::String) -> bool;
+    }
+
+    mod option {
+        type Option<::std::vec::Vec<::std::string::String>> {
+            #layout(size = 24, align = 8);
+            constructor Some(::std::vec::Vec<::std::string::String>);
+            constructor None;
+        }
+
+        type Option<::arrow::record_batch::RecordBatch> {
+            #layout(size = 40, align = 8);
+            constructor Some(::arrow::record_batch::RecordBatch);
+            constructor None;
+        }
+
+        type Option<::std::collections::HashSet<::std::string::String>> {
+            #layout(size = 48, align = 8);
+            constructor Some(::std::collections::HashSet<::std::string::String>);
+            constructor None;
+        }
+
+        type Option<::std::collections::HashMap<::std::string::String,::std::string::String>>{
+            #layout(size = 48, align = 8);
+            constructor Some(::std::collections::HashMap<::std::string::String,::std::string::String>);
+            constructor None;
+        }
+
+        type Option<::std::string::String> {
+            #layout(size = 24, align = 8);
+            constructor Some(::std::string::String);
+            constructor None;
+        }
+
+        type Option<i64> {
+            #layout(size = 16, align = 8);
+            constructor Some(i64);
+            constructor None;
+        }
+
+        type Option<i32> {
+            #layout(size = 8, align = 4);
+            constructor Some(i32);
+            constructor None;
+            fn is_none(&self) -> bool;
+            fn is_some(&self) -> bool;
+            fn unwrap(self) -> i32;
+        }
+
+         type Option<&::std::string::String> {
+            #layout(size = 8, align = 8);
+            fn is_none(&self) -> bool;
+            fn is_some(&self) -> bool;
+            fn unwrap(self) -> &::std::string::String;
+        }
+
+        type Option<&crate::FunctionRegistry> {
+            #layout(size = 8, align = 8);
+            fn is_none(&self) -> bool;
+            fn is_some(&self) -> bool;
+            fn unwrap(self) -> &crate::FunctionRegistry;
+        }
+    }
+
+}
+
+
+type ::arrow::ffi_stream::FFI_ArrowArrayStream {
+    #layout(size = 40, align = 8);
+}
+
+type ::arrow::record_batch::RecordBatch {
+    #layout(size = 40, align = 8);    
+}
+
+type ::std::result::Result::<::std::option::Option<::arrow::record_batch::RecordBatch>, ::anyhow::Error> {
+    #layout(size = 40, align = 8);
+    constructor Ok(::std::option::Option<::arrow::record_batch::RecordBatch>);
+    fn is_ok(&self) -> bool;
+    fn is_err(&self) -> bool; 
+    fn unwrap(self) -> ::std::option::Option<::arrow::record_batch::RecordBatch>;
+    fn unwrap_err(self) -> ::anyhow::Error;
+}
+
+type ::anyhow::Error {
+    #layout(size = 8, align = 8);
+    fn to_string(&self) -> ::std::string::String;
+}
+
+type ::std::result::Result::<i64, ::anyhow::Error> {
+    #layout(size = 16, align = 8);
+    constructor Ok(i64);
+    fn is_ok(&self) -> bool;
+    fn is_err(&self) -> bool; 
+    fn unwrap(self) -> i64;
+    fn unwrap_err(self) -> ::anyhow::Error;
+}
+
+type ::std::result::Result::<Box<dyn crate::TableFunction>, ::anyhow::Error> {
+    #layout(size = 16, align = 8);
+    constructor Ok(Box<dyn crate::TableFunction>);
+    fn is_ok(&self) -> bool;
+    fn is_err(&self) -> bool;
+    fn unwrap(self) -> Box<dyn crate::TableFunction>;
+
+    // unwrap_err require T to implement Debug trait, due to zngur's limitations,
+    // we cannot achieve a trait bound with Debug.
+    // So we use unwrap_err_unchecked
+    fn unwrap_err_unchecked(self) -> ::anyhow::Error;
+}
+
+type str {
+    wellknown_traits(?Sized);
+
+    fn as_ptr(&self) -> *const u8;
+    fn len(&self) -> usize;
+    fn to_owned(&self) -> ::std::string::String;
+}
+
+type bool {
+    #layout(size = 1, align = 1);
+    wellknown_traits(Copy);
+}
+
+// Section crate types
+
+mod crate {
+    type FunctionRegistry {
+        #layout(size = 32, align = 8);
+        fn name(&self) -> &str;
+    }
+
+    trait TableFunction {
+        fn process(&mut self, ::arrow::record_batch::RecordBatch) -> ::std::result::Result::<::std::option::Option<::arrow::record_batch::RecordBatch>, ::anyhow::Error>;
+        fn finalize(&mut self) -> ::std::result::Result::<::std::option::Option<::arrow::record_batch::RecordBatch>, ::anyhow::Error>;
+    }
+    fn create_raw(&crate::FunctionRegistry, *const i8, *const i8) -> ::std::result::Result::<Box<dyn crate::TableFunction>, ::anyhow::Error>;
+    fn get_function_registries() -> ::std::vec::Vec<crate::FunctionRegistry>;
+    fn process_raw(&mut Box<dyn crate::TableFunction>, i64) -> ::std::result::Result::<i64, ::anyhow::Error>;
+    fn finalize_raw(&mut Box<dyn crate::TableFunction>) -> ::std::result::Result::<i64, ::anyhow::Error>;
+}

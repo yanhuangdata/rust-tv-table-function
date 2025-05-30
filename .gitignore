@@ -1,0 +1,15 @@
+.idea
+.vscode
+
+.DS_Store
+
+build-cmake-*
+cmake-*-*
+
+/target
+cpp/zngur/*
+!cpp/zngur/extra_generated.h
+cpp/src/zngur_tvtf
+cpp/src/*.dylib
+src/zngur_generated.rs
+generated.cpp

@@ -1,0 +1,161 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "default-config-preset",
+      "binaryDir": "${sourceDir}/build-cmake-$env{X_BUILD_TYPE}-$env{X_HOST_PLATFORM}",
+      "generator": "Unix Makefiles",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "Boost_NO_WARN_NEW_VERSIONS": "ON",
+        "CMAKE_EXE_LINKER_FLAGS": "$env{CMAKE_LINKER_FLAGS}"
+      },
+      "hidden": true
+    },
+    {
+      "name": "debug-config-preset",
+      "inherits": "default-config-preset",
+      "displayName": "Debug Preset",
+      "environment": {
+        "X_BUILD_TYPE": "debug"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      },
+      "hidden": true
+    },
+    {
+      "name": "relwithdebinfo-config-preset",
+      "inherits": "default-config-preset",
+      "displayName": "RelWithDebInfo Preset",
+      "environment": {
+        "X_BUILD_TYPE": "relwithdebinfo"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "hidden": true
+    },
+    {
+      "name": "release-config-preset",
+      "inherits": "default-config-preset",
+      "displayName": "Release Preset",
+      "environment": {
+        "X_BUILD_TYPE": "release"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "hidden": true
+    },
+    {
+      "name": "osx-arm64-config-preset",
+      "inherits": "default-config-preset",
+      "displayName": "Arm64 OSX Preset",
+      "environment": {
+        "VCPKG_DEFAULT_TRIPLET": "arm64-osx",
+        "VCPKG_DEFAULT_HOST_TRIPLET": "arm64-osx"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "hidden": true
+    },
+    {
+      "name": "osx-config-preset",
+      "displayName": "macOS Preset",
+      "environment": {
+        "X_HOST_PLATFORM": "osx"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "hidden": true
+    },
+    {
+      "name": "linux-config-preset",
+      "displayName": "Linux Preset",
+      "environment": {
+        "X_HOST_PLATFORM": "linux"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "hidden": true
+    },
+    {
+      "name": "debug-osx",
+      "inherits": ["debug-config-preset", "osx-config-preset"]
+    },
+    {
+      "name": "debug-osx-arm64",
+      "inherits": ["debug-config-preset", "osx-config-preset", "osx-arm64-config-preset"]
+    },
+    {
+      "name": "debug-linux",
+      "inherits": ["debug-config-preset", "linux-config-preset"]
+    },
+    {
+      "name": "relwithdebinfo-osx",
+      "inherits": ["relwithdebinfo-config-preset", "osx-config-preset"]
+    },
+    {
+      "name": "relwithdebinfo-osx-arm64",
+      "inherits": ["relwithdebinfo-config-preset", "osx-config-preset", "osx-arm64-config-preset"]
+    },
+    {
+      "name": "relwithdebinfo-linux",
+      "inherits": ["relwithdebinfo-config-preset", "linux-config-preset"]
+    },
+    {
+      "name": "release-osx",
+      "inherits": ["release-config-preset", "osx-config-preset"]
+    },
+    {
+      "name": "release-osx-arm64",
+      "inherits": ["release-config-preset", "osx-config-preset", "osx-arm64-config-preset"]
+    },
+    {
+      "name": "release-linux",
+      "inherits": ["release-config-preset", "linux-config-preset"]
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug-osx-build",
+      "configurePreset": "debug-osx"
+    },
+    {
+      "name": "debug-linux-build",
+      "configurePreset": "debug-linux"
+    },
+    {
+      "name": "debug-osx-arm64-build",
+      "configurePreset": "debug-osx-arm64"
+    },
+    {
+      "name": "relwithdebinfo-osx-build",
+      "configurePreset": "relwithdebinfo-osx"
+    },
+    {
+      "name": "relwithdebinfo-osx-arm64-build",
+      "configurePreset": "relwithdebinfo-osx-arm64"
+    },
+    {
+      "name": "relwithdebinfo-linux-build",
+      "configurePreset": "relwithdebinfo-linux"
+    }
+  ]
+}

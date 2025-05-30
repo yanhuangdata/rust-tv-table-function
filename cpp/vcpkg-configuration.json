@@ -1,0 +1,10 @@
+{
+  "registries": [
+    {
+      "kind": "filesystem",
+      "path": "./vcpkg_registry",
+      "packages": [
+      ]
+    }
+  ]
+}

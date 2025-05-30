@@ -1,0 +1,31 @@
+{
+  "$schema": "https://raw.githubusercontent.com/yanhuangdata/piemaker-schema-json/main/piemaker.schema.json",
+  "namespace": "stonewave",
+  "name": "rust-tv-table-function",
+  "dependencies": [
+    {
+      "package": "Arrow",
+      "link": "Arrow::arrow_static",
+      "scope": "PRIVATE"
+    },
+    {
+      "library": "CoreFoundation",
+      "platform": "Darwin"
+    },
+    {
+      "vcpkg": "catch2"
+    },
+    {
+      "header": "boost/algorithm/string.hpp",
+      "vcpkg": "boost-algorithm",
+      "scope": "PRIVATE"
+    },
+    {
+      "link": "${RUST_TV_TABLE_FUNCTION_LIBRARY}",
+      "$comment": "zngur"
+    }
+  ],
+  "properties": {
+    "POSITION_INDEPENDENT_CODE": "ON"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "$doc": "https://github.com/microsoft/vcpkg/blob/master/docs/maintainers/registries.md#filesystem-registries",
+  "default": {
+  }
+}
