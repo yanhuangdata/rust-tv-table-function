@@ -5,6 +5,7 @@ use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_utils::{DynamicArrowArrayStreamReader, VecRecordBatchReader};
 use funcs::addtotals::AddTotals;
 use funcs::outputcsv::OutputCsv;
+use std::ffi::c_char;
 use std::ptr::null_mut;
 
 mod arg;
@@ -14,6 +15,13 @@ mod funcs;
 #[allow(clippy::all)]
 mod zngur_generated;
 
+/// # SAFETY
+///
+/// This function is unsafe because it dereferences raw pointers.
+///
+/// For `parameters`, it expects a null-terminated UTF-8 string, it may be `nullptr`.
+///
+/// For `timezone`, it expects a null-terminated UTF-8 string, it must be valid.
 pub unsafe fn create_raw(
     registry: &FunctionRegistry,
     parameters: *const i8,
@@ -24,12 +32,15 @@ pub unsafe fn create_raw(
     } else {
         unsafe {
             Some(std::str::from_utf8_unchecked(
-                std::ffi::CStr::from_ptr(parameters).to_bytes(),
+                std::ffi::CStr::from_ptr(parameters as *const c_char).to_bytes(),
             ))
         }
     };
-    let timezone =
-        unsafe { std::str::from_utf8_unchecked(std::ffi::CStr::from_ptr(timezone).to_bytes()) };
+    let timezone = unsafe {
+        std::str::from_utf8_unchecked(
+            std::ffi::CStr::from_ptr(timezone as *const c_char).to_bytes(),
+        )
+    };
     create(registry, parameters, timezone)
 }
 
@@ -103,6 +114,12 @@ pub trait TableFunction {
 /// The input_stream should contain 0 or 1 RecordBatch
 ///
 /// Returns may be `nullptr`. Otherwise, returns `*mut FFI_ArrowArrayStream`
+///
+/// # SAFETY
+///
+/// This function is unsafe because it dereferences a raw pointer and
+/// expects the caller to ensure that the pointer is valid and
+/// points to a `Box<dyn TableFunction>`.
 pub unsafe fn process_raw(
     func: &mut Box<dyn TableFunction>,
     input_stream: i64,
@@ -130,6 +147,12 @@ pub unsafe fn process_raw(
 /// Wrapper over `finalize` method.
 ///
 /// Returns may be `nullptr`. Otherwise, returns `i64` as `*mut FFI_ArrowArrayStream`.
+///
+/// # SAFETY
+///
+/// This function is unsafe because it dereferences a raw pointer and
+/// expects the caller to ensure that the pointer is valid and
+/// points to a `Box<dyn TableFunction>`.
 pub unsafe fn finalize_raw(func: &mut Box<dyn TableFunction>) -> anyhow::Result<i64> {
     let Some(output) = func.finalize()? else {
         return Ok(null_mut::<FFI_ArrowArrayStream>() as i64);
