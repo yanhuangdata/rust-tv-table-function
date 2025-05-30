@@ -118,7 +118,6 @@ impl RecordBatchReader for DynamicArrowArrayStreamReader {
     }
 }
 
-
 pub struct VecRecordBatchReader {
     schema: SchemaRef,
     iter: Box<dyn Iterator<Item = RecordBatch> + Send>,
