@@ -1,0 +1,37 @@
+name: lint
+
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - name: Run cargo fmt
+        run: |
+          cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: |
+          cargo clippy --all -- -D warnings
+
+      - name: Run clang-format
+        uses: jidicula/clang-format-action@v4.15.0
+        with:
+          clang-format-version: '16'
+          check-path: cpp
+          exclude-regex: '(cpp/src/zngur_tvtf|build-.*|cpp/zngur)' # generated code

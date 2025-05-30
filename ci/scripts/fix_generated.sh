@@ -1,5 +1,7 @@
+#!/usr/bin/env bash
 
-#!/usr/bin/env sh
+set -x # enable debugging
+
 # Function to determine the OS
 get_os() {
     case "$(uname -s)" in
