@@ -42,7 +42,8 @@ impl OutputCsv {
             .collect::<Vec<_>>();
         // arg 0
         let target_path = || {
-            let target_path = scalars.first()
+            let target_path = scalars
+                .first()
                 .context("No `target_path` parameter provided.")?;
             let Arg::String(target_path) = target_path else {
                 return Err(anyhow::anyhow!("`target_path` must be a string."));
@@ -71,11 +72,9 @@ impl OutputCsv {
         match scalars.len() {
             1 => init(false),
             2 => init(tee()?),
-            n => {
-                Err(anyhow!(
-                    "Invalid parameters, there is no {n}-args constructor"
-                ))
-            }
+            n => Err(anyhow!(
+                "Invalid parameters, there is no {n}-args constructor"
+            )),
         }
     }
 }
