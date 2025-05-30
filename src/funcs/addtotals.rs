@@ -37,7 +37,8 @@ impl AddTotals {
         if scalars.len() != 1 {
             return Ok(Self::default());
         }
-        let arg0 = scalars.first()
+        let arg0 = scalars
+            .first()
             .context("No `output_column_name` parameter provided.")?;
         let Arg::String(output_column_name) = arg0 else {
             return Err(anyhow::anyhow!("`output_column_name` must be a string."));
