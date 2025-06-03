@@ -35,45 +35,41 @@ jobs:
       matrix:
         include:
           # Native builds
-          - target: universal-apple-darwin
+          - target: aarch64-apple-darwin
             # macos-14 for M1 runners
             os: macos-14
-            build-target: universal-apple-darwin
-            build-tool: cargo
+            build-target: aarch64-apple-darwin
 
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             build-target: x86_64-unknown-linux-gnu
-            build-tool: cargo
 
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             build-target: aarch64-unknown-linux-gnu
-            build-tool: cargo
 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/upload-rust-binary-action@v1.26.0
+      - name: Test
+        run: |
+          cargo build --release --target ${{ matrix.build-target }}
+
+      - name: Build and package release
+        run: |
+          ./ci/scripts/pack-release.sh "${{ matrix.build-target }}" "rust_tvtf" "${{ needs.create-release.outputs.version }}"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
         with:
-          bin: rust-tvtf
-          include: cpp/zngur/generated/generated.h,cpp/zngur/generated/extra_generated.h
-          archive: $tag-$target
-          build-tool: ${{ matrix.build-tool }}
-          target: ${{ matrix.build-target }}
-          tar: all
-          checksum: sha256
+          files: |
+            cpp/zngur/extra_generated.h
+            cpp/zngur/generated.h
+            rust_tvtf-${{ needs.create-release.outputs.version }}-${{ matrix.build-target }}.tar.gz
+            rust_tvtf-${{ needs.create-release.outputs.version }}-${{ matrix.build-target }}.tar.gz.sha256
+          draft: true
+          tag_name: ${{ needs.create-release.outputs.version }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Set archive output variable
-        id: archive-output
-        shell: bash
-        run: |
-          echo "${{ matrix.target }}-tar=${{ github.ref_name }}-${{ matrix.target }}".tar.gz >> $GITHUB_OUTPUT
-
-    outputs:
-      x86_64-linux-tar: ${{ steps.archive-output.outputs.x86_64-unknown-linux-gnu-tar }}
-      aarch64-linux-tar: ${{ steps.archive-output.outputs.aarch64-unknown-linux-gnu-tar }}
-      mac-tar: ${{ steps.archive-output.outputs.universal-apple-darwin-tar }}
