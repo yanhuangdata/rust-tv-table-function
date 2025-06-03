@@ -97,39 +97,69 @@
     },
     {
       "name": "debug-osx",
-      "inherits": ["debug-config-preset", "osx-config-preset"]
+      "inherits": [
+        "debug-config-preset",
+        "osx-config-preset"
+      ]
     },
     {
       "name": "debug-osx-arm64",
-      "inherits": ["debug-config-preset", "osx-config-preset", "osx-arm64-config-preset"]
+      "inherits": [
+        "debug-config-preset",
+        "osx-config-preset",
+        "osx-arm64-config-preset"
+      ]
     },
     {
       "name": "debug-linux",
-      "inherits": ["debug-config-preset", "linux-config-preset"]
+      "inherits": [
+        "debug-config-preset",
+        "linux-config-preset"
+      ]
     },
     {
       "name": "relwithdebinfo-osx",
-      "inherits": ["relwithdebinfo-config-preset", "osx-config-preset"]
+      "inherits": [
+        "relwithdebinfo-config-preset",
+        "osx-config-preset"
+      ]
     },
     {
       "name": "relwithdebinfo-osx-arm64",
-      "inherits": ["relwithdebinfo-config-preset", "osx-config-preset", "osx-arm64-config-preset"]
+      "inherits": [
+        "relwithdebinfo-config-preset",
+        "osx-config-preset",
+        "osx-arm64-config-preset"
+      ]
     },
     {
       "name": "relwithdebinfo-linux",
-      "inherits": ["relwithdebinfo-config-preset", "linux-config-preset"]
+      "inherits": [
+        "relwithdebinfo-config-preset",
+        "linux-config-preset"
+      ]
     },
     {
       "name": "release-osx",
-      "inherits": ["release-config-preset", "osx-config-preset"]
+      "inherits": [
+        "release-config-preset",
+        "osx-config-preset"
+      ]
     },
     {
       "name": "release-osx-arm64",
-      "inherits": ["release-config-preset", "osx-config-preset", "osx-arm64-config-preset"]
+      "inherits": [
+        "release-config-preset",
+        "osx-config-preset",
+        "osx-arm64-config-preset"
+      ]
     },
     {
       "name": "release-linux",
-      "inherits": ["release-config-preset", "linux-config-preset"]
+      "inherits": [
+        "release-config-preset",
+        "linux-config-preset"
+      ]
     }
   ],
   "buildPresets": [
@@ -155,6 +185,32 @@
     },
     {
       "name": "relwithdebinfo-linux-build",
+      "configurePreset": "relwithdebinfo-linux"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "debug-osx-test",
+      "configurePreset": "debug-osx"
+    },
+    {
+      "name": "debug-linux-test",
+      "configurePreset": "debug-linux"
+    },
+    {
+      "name": "debug-osx-arm64-test",
+      "configurePreset": "debug-osx-arm64"
+    },
+    {
+      "name": "relwithdebinfo-osx-test",
+      "configurePreset": "relwithdebinfo-osx"
+    },
+    {
+      "name": "relwithdebinfo-osx-arm64-test",
+      "configurePreset": "relwithdebinfo-osx-arm64"
+    },
+    {
+      "name": "relwithdebinfo-linux-test",
       "configurePreset": "relwithdebinfo-linux"
     }
   ]
