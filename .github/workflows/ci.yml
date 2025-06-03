@@ -1,11 +1,11 @@
-name: lint
-
+name: CI
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 on:
   push:
