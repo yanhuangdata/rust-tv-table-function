@@ -105,7 +105,7 @@ macro(setup_dependencies)
     # add third party dependencies
     # only the top level project will search all dependencies for itself and all its sub projects so that cmake configuration faster
 
-    find_package(Arrow REQUIRED)
+#    find_package(Arrow REQUIRED)
 
     if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
         find_library(COREFOUNDATION_LIBRARY NAMES CoreFoundation REQUIRED)
@@ -116,9 +116,9 @@ macro(setup_dependencies)
         endif ()
 
     endif ()
-    find_path(BOOST_ALGORITHM_STRING_HPP_INCLUDE_DIR
-            boost/algorithm/string.hpp
-            REQUIRED)
+#    find_path(BOOST_ALGORITHM_STRING_HPP_INCLUDE_DIR
+#            boost/algorithm/string.hpp
+#            REQUIRED)
     message(STATUS "[header directory found] include=boost/algorithm/string.hpp include_dir=${BOOST_ALGORITHM_STRING_HPP_INCLUDE_DIR}")
 
 endmacro()
@@ -169,7 +169,7 @@ function(setup_src)
     set(PUBLIC_LINKED_LIBRARIES "")
     set(INTERFACE_LINKED_LIBRARIES "")
     set(PRIVATE_LINKED_LIBRARIES "")
-    list(APPEND PRIVATE_LINKED_LIBRARIES Arrow::arrow_static)
+#    list(APPEND PRIVATE_LINKED_LIBRARIES Arrow::arrow_static)
 
     if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
         list(APPEND PUBLIC_LINKED_LIBRARIES ${COREFOUNDATION_LIBRARY})

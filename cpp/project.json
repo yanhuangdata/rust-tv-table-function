@@ -4,11 +4,6 @@
   "name": "rust-tv-table-function",
   "dependencies": [
     {
-      "package": "Arrow",
-      "link": "Arrow::arrow_static",
-      "scope": "PRIVATE"
-    },
-    {
       "library": "CoreFoundation",
       "platform": "Darwin"
     },

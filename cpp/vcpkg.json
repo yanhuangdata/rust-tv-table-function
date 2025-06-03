@@ -6,7 +6,6 @@
   "description": "rust-tv-table-function",
   "builtin-baseline": "8ea2dffddcc8dc78bffcb8c3952a31290bd01aa5",
   "dependencies": [
-    "arrow",
     "catch2",
     "spdlog",
     "fmt"
