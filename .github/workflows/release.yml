@@ -52,7 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dsherret/rust-toolchain-file@v1
       - name: Test
         run: |
           cargo build --release --target ${{ matrix.build-target }}
