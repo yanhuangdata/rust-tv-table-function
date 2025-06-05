@@ -3,17 +3,11 @@ use arg::Args;
 use arrow::array::RecordBatch;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_utils::{DynamicArrowArrayStreamReader, VecRecordBatchReader};
-use funcs::addtotals::AddTotals;
-use funcs::outputcsv::OutputCsv;
 use std::ffi::c_char;
 use std::ptr::null_mut;
 
-mod arg;
+pub mod arg;
 mod arrow_utils;
-mod funcs;
-#[rustfmt::skip]
-#[allow(clippy::all)]
-mod zngur_generated;
 
 /// # SAFETY
 ///
@@ -61,24 +55,6 @@ pub fn create(
         timezone: String::from(timezone),
     };
     create_closure(ctx)
-}
-
-pub fn get_function_registries() -> Vec<FunctionRegistry> {
-    vec![
-        FunctionRegistry {
-            name: "addtotals",
-            // TODO: simplify this, possibly a IntoFuncInit trait
-            init: Box::new(|ctx| {
-                AddTotals::new(ctx.parameters).map(|f| Box::new(f) as Box<dyn TableFunction>)
-            }),
-        },
-        FunctionRegistry {
-            name: "output_csv",
-            init: Box::new(|ctx| {
-                OutputCsv::new(ctx.parameters).map(|f| Box::new(f) as Box<dyn TableFunction>)
-            }),
-        },
-    ]
 }
 
 type TableFunctionInitialize =

@@ -7,10 +7,8 @@ use arrow::{
 };
 use arrow_schema::{DataType, Field, Schema};
 
-use crate::{
-    arg::{Arg, Args},
-    TableFunction,
-};
+use crate::TableFunction;
+use rust_tvtf_api::arg::{Arg, Args};
 
 #[derive(Debug)]
 pub struct AddTotals {
