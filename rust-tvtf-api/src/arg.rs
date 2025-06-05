@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub type Args = Vec<Arg>;
 
@@ -13,6 +13,18 @@ pub enum Arg {
     Timestamp(i64),
     Interval(String),
     Column(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ArgType {
+    Int,
+    String,
+    Bool,
+    Float,
+    Timestamp,
+    Interval,
+    Column,
 }
 
 impl Arg {

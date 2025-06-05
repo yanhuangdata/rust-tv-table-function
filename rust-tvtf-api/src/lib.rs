@@ -3,17 +3,16 @@ use arg::Args;
 use arrow::array::RecordBatch;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_utils::{DynamicArrowArrayStreamReader, VecRecordBatchReader};
-use funcs::addtotals::AddTotals;
-use funcs::outputcsv::OutputCsv;
+use derive_builder::Builder;
+use serde::Serialize;
 use std::ffi::c_char;
 use std::ptr::null_mut;
+use std::sync::Arc;
 
-mod arg;
+use crate::arg::ArgType;
+
+pub mod arg;
 mod arrow_utils;
-mod funcs;
-#[rustfmt::skip]
-#[allow(clippy::all)]
-mod zngur_generated;
 
 /// # SAFETY
 ///
@@ -63,35 +62,50 @@ pub fn create(
     create_closure(ctx)
 }
 
-pub fn get_function_registries() -> Vec<FunctionRegistry> {
-    vec![
-        FunctionRegistry {
-            name: "addtotals",
-            // TODO: simplify this, possibly a IntoFuncInit trait
-            init: Box::new(|ctx| {
-                AddTotals::new(ctx.parameters).map(|f| Box::new(f) as Box<dyn TableFunction>)
-            }),
-        },
-        FunctionRegistry {
-            name: "output_csv",
-            init: Box::new(|ctx| {
-                OutputCsv::new(ctx.parameters).map(|f| Box::new(f) as Box<dyn TableFunction>)
-            }),
-        },
-    ]
+type TableFunctionInitialize =
+    Arc<dyn Fn(FunctionContext) -> anyhow::Result<Box<dyn TableFunction>>>;
+
+#[derive(Builder)]
+pub struct FunctionRegistry {
+    #[builder(setter(into))]
+    name: &'static str,
+    init: TableFunctionInitialize,
+    #[builder(setter(strip_option, each(name = "signature", into)))]
+    signatures: Option<Vec<Signature>>,
 }
 
-type TableFunctionInitialize =
-    Box<dyn Fn(FunctionContext) -> anyhow::Result<Box<dyn TableFunction>>>;
-
-pub struct FunctionRegistry {
-    pub name: &'static str,
-    pub init: TableFunctionInitialize,
+impl std::fmt::Debug for FunctionRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunctionRegistry")
+            .field("name", &self.name)
+            .field("init", &Arc::as_ptr(&self.init))
+            .field("signatures", &self.signatures)
+            .finish()
+    }
 }
 
 impl FunctionRegistry {
     pub fn name(&self) -> &'static str {
         self.name
+    }
+
+    pub fn signatures(&self) -> anyhow::Result<String> {
+        serde_json::to_string(&self.signatures).context("Failed to get signatures")
+    }
+
+    pub fn builder() -> FunctionRegistryBuilder {
+        FunctionRegistryBuilder::default()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Signature {
+    pub args: Vec<ArgType>,
+}
+
+impl From<Vec<ArgType>> for Signature {
+    fn from(value: Vec<ArgType>) -> Self {
+        Signature { args: value }
     }
 }
 

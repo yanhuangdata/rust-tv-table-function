@@ -3,7 +3,7 @@ use std::convert::TryFrom;
 use std::{ffi::CStr, sync::Arc};
 
 use arrow::array::{RecordBatchReader, StructArray};
-use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{ArrowError, DataType, Schema, SchemaRef};
@@ -58,7 +58,7 @@ impl DynamicArrowArrayStreamReader {
     /// See [`FFI_ArrowArrayStream::from_raw`]
     #[allow(dead_code)]
     pub unsafe fn from_raw(raw_stream: *mut FFI_ArrowArrayStream) -> Result<Self, ArrowError> {
-        Self::try_new(FFI_ArrowArrayStream::from_raw(raw_stream))
+        unsafe { Self::try_new(FFI_ArrowArrayStream::from_raw(raw_stream)) }
     }
 
     /// Get the last error from `ArrowArrayStreamReader`
