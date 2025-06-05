@@ -32,7 +32,7 @@ TEST_CASE("call rust") {
     }
     auto table_func =
         rust::rust_tvtf_api::create_raw(&api, registry, nullptr,
-                                         reinterpret_cast<int8_t const *>("Asia/Shanghai"))
+                                        reinterpret_cast<int8_t const *>("Asia/Shanghai"))
             .unwrap(&api);
     REQUIRE(name_view == "addtotals");
   }
