@@ -1,0 +1,17 @@
+[package]
+name = "rust-tvtf-example"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+anyhow = { workspace = true }
+rust-tvtf-api = { path = "../rust-tvtf-api" }
+
+[build-dependencies]
+anyhow = { workspace = true }
+zngur = { workspace = true }
