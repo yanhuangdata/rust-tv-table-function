@@ -13,3 +13,6 @@ cpp/src/zngur_tvtf
 cpp/src/*.dylib
 zngur_generated.rs
 generated.cpp
+
+*.tar.gz
+*.sha256
