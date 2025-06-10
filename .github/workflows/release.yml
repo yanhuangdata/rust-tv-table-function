@@ -60,6 +60,7 @@ jobs:
       - name: Build and package release
         run: |
           ./ci/scripts/pack-release.sh "${{ matrix.build-target }}" "rust_tvtf" "${{ needs.create-release.outputs.version }}"
+          ./ci/scripts/pack-release.sh "${{ matrix.build-target }}" "rust_tvtf_example" "${{ needs.create-release.outputs.version }}"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
