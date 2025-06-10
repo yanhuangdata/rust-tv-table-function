@@ -1,0 +1,114 @@
+#convert_panic_to_exception
+
+// Section Rust std
+
+mod ::std {
+    type string::String {
+        #layout(size = 24, align = 8);
+        fn as_str(&self) -> &str;
+        fn clone(&self) -> ::std::string::String;
+    }
+
+    mod vec {
+        type Vec<::rust_tvtf_api::FunctionRegistry> {
+            #layout(size = 24, align = 8);
+
+            fn len(&self) -> usize;
+
+            fn new() -> ::std::vec::Vec<::rust_tvtf_api::FunctionRegistry>;
+
+            fn get(&self, usize) -> ::std::option::Option<&::rust_tvtf_api::FunctionRegistry> deref [::rust_tvtf_api::FunctionRegistry];
+        }
+    }
+
+    type Box<dyn ::rust_tvtf_api::TableFunction> {
+        #layout(size = 16, align = 8);
+    }
+
+    mod option {
+        type Option<&::rust_tvtf_api::FunctionRegistry> {
+            #layout(size = 8, align = 8);
+            fn is_none(&self) -> bool;
+            fn is_some(&self) -> bool;
+            fn unwrap(self) -> &::rust_tvtf_api::FunctionRegistry;
+        }
+    }
+
+}
+
+type ::anyhow::Error {
+    #layout(size = 8, align = 8);
+    fn to_string(&self) -> ::std::string::String;
+}
+
+type ::std::result::Result::<i64, ::anyhow::Error> {
+    #layout(size = 16, align = 8);
+    constructor Ok(i64);
+    fn is_ok(&self) -> bool;
+    fn is_err(&self) -> bool; 
+    fn unwrap(self) -> i64;
+    fn unwrap_err(self) -> ::anyhow::Error;
+}
+
+type ::std::result::Result::<::std::string::String, ::anyhow::Error> {
+    #layout(size = 24, align = 8);
+    fn is_ok(&self) -> bool;
+    fn is_err(&self) -> bool; 
+    fn unwrap(self) -> ::std::string::String;
+    fn unwrap_err(self) -> ::anyhow::Error;
+}
+
+
+
+type ::std::result::Result::<::std::vec::Vec<::rust_tvtf_api::FunctionRegistry>, ::anyhow::Error> {
+    #layout(size = 24, align = 8);
+    fn is_ok(&self) -> bool;
+    fn is_err(&self) -> bool; 
+    fn unwrap(self) -> ::std::vec::Vec<::rust_tvtf_api::FunctionRegistry>;
+    fn unwrap_err(self) -> ::anyhow::Error;
+}
+
+
+type ::std::result::Result::<Box<dyn ::rust_tvtf_api::TableFunction>, ::anyhow::Error> {
+    #layout(size = 16, align = 8);
+    constructor Ok(Box<dyn ::rust_tvtf_api::TableFunction>);
+    fn is_ok(&self) -> bool;
+    fn is_err(&self) -> bool;
+    fn unwrap(self) -> Box<dyn ::rust_tvtf_api::TableFunction>;
+
+    // unwrap_err require T to implement Debug trait, due to zngur's limitations,
+    // we cannot achieve a trait bound with Debug.
+    // So we use unwrap_err_unchecked
+    fn unwrap_err_unchecked(self) -> ::anyhow::Error;
+}
+
+type str {
+    wellknown_traits(?Sized);
+
+    fn as_ptr(&self) -> *const u8;
+    fn len(&self) -> usize;
+    fn to_owned(&self) -> ::std::string::String;
+}
+
+type bool {
+    #layout(size = 1, align = 1);
+    wellknown_traits(Copy);
+}
+
+// Section crate types
+
+mod rust_tvtf_api {
+    type FunctionRegistry {
+        #layout(size = 56, align = 8);
+        fn name(&self) -> &str;
+        fn signatures(&self) -> ::std::result::Result::<::std::string::String, ::anyhow::Error>;
+    }
+
+    fn create_raw(&::rust_tvtf_api::FunctionRegistry, *const i8, *const i8) -> ::std::result::Result::<Box<dyn ::rust_tvtf_api::TableFunction>, ::anyhow::Error>;
+    fn process_raw(&mut Box<dyn ::rust_tvtf_api::TableFunction>, i64) -> ::std::result::Result::<i64, ::anyhow::Error>;
+    fn finalize_raw(&mut Box<dyn ::rust_tvtf_api::TableFunction>) -> ::std::result::Result::<i64, ::anyhow::Error>;
+}
+
+mod crate {
+    fn get_function_registries() -> ::std::result::Result::<::std::vec::Vec<::rust_tvtf_api::FunctionRegistry>, ::anyhow::Error>;
+}
