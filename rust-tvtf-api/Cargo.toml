@@ -1,7 +1,10 @@
 [package]
 name = "rust-tvtf-api"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+description = "Yanhuang Data Rust Table Function API"
+license = "Apache-2.0"
+homepage = "https://www.yanhuangdata.com"
 
 [dependencies]
 arrow = { workspace = true }
