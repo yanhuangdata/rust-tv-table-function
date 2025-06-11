@@ -70,6 +70,8 @@ jobs:
             cpp/zngur/generated.h
             rust_tvtf-${{ needs.create-release.outputs.version }}-${{ matrix.build-target }}.tar.gz
             rust_tvtf-${{ needs.create-release.outputs.version }}-${{ matrix.build-target }}.tar.gz.sha256
+            rust_tvtf_example-${{ needs.create-release.outputs.version }}-${{ matrix.build-target }}.tar.gz
+            rust_tvtf_example-${{ needs.create-release.outputs.version }}-${{ matrix.build-target }}.tar.gz.sha256
           draft: true
           tag_name: ${{ needs.create-release.outputs.version }}
         env:
