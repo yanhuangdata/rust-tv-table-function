@@ -2,35 +2,16 @@ name: Publish releases to GitHub
 on:
   push:
     tags:
-      - v[0-9]+.*
+      - '[0-9]+.*'
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  create-release:
-    if: github.repository_owner == 'yanhuangdata'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: taiki-e/create-gh-release-action@v1
-        id: create-gh-release
-        with:
-          draft: true
-          branch: main
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    outputs:
-      version: ${{ steps.create-gh-release.outputs.version }}
-
   build-binaries:
     name: Build binaries for ${{ matrix.target }}
     if: github.repository_owner == 'yanhuangdata'
-    needs:
-      - create-release
     strategy:
       matrix:
         include:
@@ -51,6 +32,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Set env
+        run: echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
       - name: Install Rust
         uses: dsherret/rust-toolchain-file@v1
       - name: Test
@@ -59,8 +42,8 @@ jobs:
 
       - name: Build and package release
         run: |
-          ./ci/scripts/pack-release.sh "${{ matrix.build-target }}" "rust_tvtf" "${{ needs.create-release.outputs.version }}"
-          ./ci/scripts/pack-release.sh "${{ matrix.build-target }}" "rust_tvtf_example" "${{ needs.create-release.outputs.version }}"
+          ./ci/scripts/pack-release.sh "${{ matrix.build-target }}" "rust_tvtf" "${{ env.RELEASE_VERSION }}"
+          ./ci/scripts/pack-release.sh "${{ matrix.build-target }}" "rust_tvtf_example" "${{ env.RELEASE_VERSION }}"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
@@ -68,11 +51,11 @@ jobs:
           files: |
             cpp/zngur/extra_generated.h
             cpp/zngur/generated.h
-            rust_tvtf-${{ needs.create-release.outputs.version }}-${{ matrix.build-target }}.tar.gz
-            rust_tvtf-${{ needs.create-release.outputs.version }}-${{ matrix.build-target }}.tar.gz.sha256
-            rust_tvtf_example-${{ needs.create-release.outputs.version }}-${{ matrix.build-target }}.tar.gz
-            rust_tvtf_example-${{ needs.create-release.outputs.version }}-${{ matrix.build-target }}.tar.gz.sha256
+            rust_tvtf-${{ env.RELEASE_VERSION }}-${{ matrix.build-target }}.tar.gz
+            rust_tvtf-${{ env.RELEASE_VERSION }}-${{ matrix.build-target }}.tar.gz.sha256
+            rust_tvtf_example-${{ env.RELEASE_VERSION }}-${{ matrix.build-target }}.tar.gz
+            rust_tvtf_example-${{ env.RELEASE_VERSION }}-${{ matrix.build-target }}.tar.gz.sha256
           draft: true
-          tag_name: ${{ needs.create-release.outputs.version }}
+          tag_name: ${{ env.RELEASE_VERSION }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
