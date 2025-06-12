@@ -3,6 +3,10 @@ use std::{path::PathBuf, process::Command};
 use zngur::Zngur;
 
 fn main() -> anyhow::Result<()> {
+    if std::env::var("TARGET").unwrap().contains("apple-darwin") {
+        println!("cargo::rustc-link-arg-cdylib=-Wl,-install_name,@rpath/librust_tvtf.dylib");
+    }
+
     println!("cargo:rerun-if-changed=main.zng");
     println!("cargo:rerun-if-changed=../ci/scripts/fix_generated.sh");
     println!("cargo:rerun-if-changed=../zngur/extra_generated.h");
