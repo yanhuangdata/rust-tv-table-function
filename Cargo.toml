@@ -15,8 +15,8 @@ tempfile = "3.20.0"
 
 [workspace.dependencies.zngur]
 git = "https://github.com/yanhuangdata/zngur.git"
-# feat: add `zngur_dyn_api`, support dynamic libraries at runtime
-rev = "0e5da6cd903fcd2007612438477d24f2eaa3deed"
+# feat: error handling for dlsym
+rev = "841523fe905330c0cd9259e3d348e76b8ae080a0"
 
 [profile.release]
 debug = "full"
