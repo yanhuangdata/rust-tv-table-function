@@ -1,7 +1,7 @@
-use std::{sync::Arc, vec};
-
 use anyhow::Context;
 use rust_tvtf_api::{FunctionRegistry, TableFunction, arg::ArgType};
+use std::iter::repeat_n;
+use std::{sync::Arc, vec};
 
 use crate::funcs::*;
 
@@ -28,6 +28,18 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
             }))
             .signature(vec![ArgType::String])
             .signature(vec![ArgType::String, ArgType::Bool])
+            .build()
+            .context("create `output_csv` registry failed")?,
+        FunctionRegistry::builder()
+            .name("transaction")
+            .init(Arc::new(|ctx| {
+                TransFunction::new(ctx.parameters).map(|f| Box::new(f) as Box<dyn TableFunction>)
+            }))
+            .signatures(
+                (1..=5)
+                    .map(|n| repeat_n(ArgType::String, n).collect::<Vec<_>>().into())
+                    .collect(),
+            )
             .build()
             .context("create `output_csv` registry failed")?,
     ])

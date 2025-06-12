@@ -1,0 +1,984 @@
+use anyhow::{Context, Result, anyhow};
+use arrow::array::{AsArray, ListBuilder, StringBuilder};
+use arrow::datatypes::{Float64Type, Int64Type, TimestampMicrosecondType};
+use arrow::{
+    array::{Array, BooleanArray, Float64Array, Int64Array, TimestampMicrosecondArray},
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
+use chrono::{DateTime, TimeZone, Utc};
+use regex::Regex;
+use rust_tvtf_api::TableFunction;
+use rust_tvtf_api::arg::{Arg, Args};
+use std::sync::LazyLock;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
+
+// Reserved field names for transaction events and raw events
+const FIELD_TIME: &str = "_time";
+const FIELD_MESSAGE: &str = "_message";
+const FIELD_DURATION: &str = "_duration";
+const FIELD_EVENT_COUNT: &str = "_event_count";
+const FIELD_IS_CLOSED: &str = "_is_closed";
+
+// Trans specific fields that are not part of the original event's fields
+const TRANS_RESERVED_FIELDS: [&str; 5] = [
+    FIELD_TIME,
+    FIELD_MESSAGE,
+    FIELD_DURATION,
+    FIELD_EVENT_COUNT,
+    FIELD_IS_CLOSED,
+];
+
+#[derive(Debug, Default)]
+pub struct TransParams {
+    pub fields: Vec<String>,
+    pub starts_with: Option<String>,
+    pub starts_with_regex: Option<Regex>,
+    pub ends_with: Option<String>,
+    pub ends_with_regex: Option<Regex>,
+    pub max_span: Duration,
+    pub max_events: u64,
+}
+
+impl TransParams {
+    pub fn new(params: Option<Args>) -> Result<Self> {
+        let mut parsed_params = TransParams {
+            max_events: 1000,
+            ..Default::default()
+        };
+
+        let Some(params) = params else {
+            return Ok(parsed_params);
+        };
+
+        for param in params.into_iter().filter(|p| p.is_scalar()) {
+            let Arg::String(s) = param else {
+                return Err(anyhow!("Invalid parameter type. Expected string."));
+            };
+
+            if s.starts_with("fields=") {
+                parsed_params.fields = s
+                    .split('=')
+                    .nth(1)
+                    .unwrap_or("")
+                    .split(',')
+                    .map(|f| f.to_string())
+                    .collect();
+            } else if s.starts_with("starts_with=") || s.starts_with("start_with=") {
+                parsed_params.starts_with = Some(s.split('=').nth(1).unwrap_or("").to_string());
+            } else if s.starts_with("starts_with_regex=") || s.starts_with("start_with_regex=") {
+                let regex_str = s.split('=').nth(1).unwrap_or("");
+                parsed_params.starts_with_regex =
+                    Some(Regex::new(regex_str).context(format!("Invalid regex: {}", regex_str))?);
+            } else if s.starts_with("ends_with=") || s.starts_with("end_with=") {
+                parsed_params.ends_with = Some(s.split('=').nth(1).unwrap_or("").to_string());
+            } else if s.starts_with("ends_with_regex=") || s.starts_with("end_with_regex=") {
+                let regex_str = s.split('=').nth(1).unwrap_or("");
+                parsed_params.ends_with_regex =
+                    Some(Regex::new(regex_str).context(format!("Invalid regex: {}", regex_str))?);
+            } else if s.starts_with("max_span=") {
+                let span_str = s.split('=').nth(1).unwrap_or("");
+                static DURATION_REGEX: LazyLock<Regex> =
+                    LazyLock::new(|| Regex::new(r"(\d+)([smhd])").unwrap());
+                if let Some(m) = DURATION_REGEX.captures(span_str) {
+                    let value: u64 = m[1].parse()?;
+                    let unit = &m[2];
+                    let seconds = match unit {
+                        "s" => value,
+                        "m" => value * 60,
+                        "h" => value * 3600,
+                        "d" => value * 86400,
+                        _ => return Err(anyhow!("Invalid time unit: {}", unit)),
+                    };
+                    parsed_params.max_span = Duration::from_secs(seconds);
+                } else {
+                    return Err(anyhow!("Invalid max_span format: {}", span_str));
+                }
+            } else if s.starts_with("max_events=") {
+                let max_events_val: i64 = s.split('=').nth(1).unwrap_or("").parse()?;
+                parsed_params.max_events = if max_events_val <= 0 {
+                    1000
+                } else {
+                    max_events_val as u64
+                };
+            } else {
+                return Err(anyhow!("Invalid parameter for trans table function: {}", s));
+            }
+        }
+        Ok(parsed_params)
+    }
+
+    fn matches_starts_with(&self, message: &str) -> bool {
+        if let Some(s) = &self.starts_with {
+            if message.contains(s) {
+                return true;
+            }
+        }
+        if let Some(r) = &self.starts_with_regex {
+            if r.is_match(message) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn matches_ends_with(&self, message: &str) -> bool {
+        if let Some(s) = &self.ends_with {
+            if message.contains(s) {
+                return true;
+            }
+        }
+        if let Some(r) = &self.ends_with_regex {
+            if r.is_match(message) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[derive(Debug)]
+struct Transaction {
+    field_names: Vec<String>,
+    fields: HashMap<String, Vec<String>>,
+    start_time: Option<DateTime<Utc>>,
+    end_time: Option<DateTime<Utc>>,
+    messages: VecDeque<String>,
+    event_count: u64,
+    is_closed: bool,
+}
+
+impl Transaction {
+    fn new(field_names: Vec<String>) -> Self {
+        Transaction {
+            field_names,
+            fields: HashMap::new(),
+            start_time: None,
+            end_time: None,
+            messages: VecDeque::new(),
+            event_count: 0,
+            is_closed: false,
+        }
+    }
+
+    fn merge_event(&mut self, event: &HashMap<String, Option<String>>) {
+        if let Some(Some(message)) = event.get(FIELD_MESSAGE) {
+            self.messages.push_front(message.clone());
+        }
+
+        for (k, v_opt) in event {
+            if TRANS_RESERVED_FIELDS.contains(&k.as_str()) {
+                continue;
+            }
+
+            if let Some(v) = v_opt {
+                if self.field_names.contains(k) {
+                    self.fields.insert(k.clone(), vec![v.clone()]);
+                } else {
+                    let entry = self.fields.entry(k.clone()).or_default();
+                    if !entry.contains(v) {
+                        entry.push(v.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    fn add_event(&mut self, event: &HashMap<String, Option<String>>) -> Result<()> {
+        let time_str = event
+            .get(FIELD_TIME)
+            .and_then(Option::as_ref)
+            .context("Event missing _time field or _time is null")?;
+
+        let time = time_str
+            .parse::<i64>()
+            .map(|ts| Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now))
+            .context("Failed to parse _time as timestamp")?;
+
+        self.event_count += 1;
+
+        if self.end_time.is_none() {
+            self.start_time = Some(time);
+            self.end_time = Some(time);
+            self.merge_event(event);
+        } else if time <= self.start_time.unwrap() {
+            self.start_time = Some(time);
+            self.merge_event(event);
+        } else if time <= self.end_time.unwrap() && time >= self.start_time.unwrap() {
+            self.merge_event(event);
+        }
+
+        Ok(())
+    }
+
+    fn get_duration(&self) -> Option<f64> {
+        if let (Some(start), Some(end)) = (self.start_time, self.end_time) {
+            Some((end - start).num_seconds() as f64)
+        } else {
+            None
+        }
+    }
+
+    fn get_event_count(&self) -> u64 {
+        self.event_count
+    }
+
+    fn set_is_closed(&mut self) {
+        self.is_closed = true;
+    }
+
+    #[allow(dead_code)]
+    fn get_is_closed(&self) -> bool {
+        self.is_closed
+    }
+
+    fn to_record_batch(&self) -> Result<RecordBatch> {
+        let mut fields = vec![
+            Field::new(
+                FIELD_TIME,
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new(
+                FIELD_MESSAGE,
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                false,
+            ),
+            Field::new(FIELD_DURATION, DataType::Float64, true),
+            Field::new(FIELD_EVENT_COUNT, DataType::Int64, false),
+            Field::new(FIELD_IS_CLOSED, DataType::Boolean, false),
+        ];
+
+        let mut arrays: Vec<Arc<dyn Array>> = vec![
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                self.start_time.map(|dt| dt.timestamp_micros()),
+            ])),
+            Arc::new({
+                let mut builder = ListBuilder::new(StringBuilder::new());
+                for x in self.messages.iter() {
+                    builder.values().append_value(x);
+                }
+                builder.append(true);
+
+                builder.finish()
+            }),
+            Arc::new(Float64Array::from(vec![self.get_duration()])),
+            Arc::new(Int64Array::from(vec![self.get_event_count() as i64])),
+            Arc::new(BooleanArray::from(vec![self.is_closed])),
+        ];
+
+        let mut sorted_field_names: Vec<&String> = self.fields.keys().collect();
+        sorted_field_names.sort();
+
+        for k in sorted_field_names {
+            let v_list = self.fields.get(k).unwrap();
+            fields.push(Field::new(
+                k,
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                false,
+            ));
+            arrays.push({
+                let mut builder = ListBuilder::new(StringBuilder::new());
+                for x in v_list.iter() {
+                    builder.values().append_value(x);
+                }
+                builder.append(true);
+
+                Arc::new(builder.finish())
+            });
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, arrays).context("Failed to create record batch")
+    }
+}
+
+type TransKey = Vec<Option<String>>;
+
+struct TransactionPool {
+    params: TransParams,
+    frozen_trans: Vec<Transaction>,
+    live_trans: HashMap<TransKey, Transaction>,
+    earliest_event_timestamp: Option<DateTime<Utc>>,
+    trans_complete_flag: HashMap<TransKey, bool>,
+}
+
+impl TransactionPool {
+    fn new(params: TransParams) -> Self {
+        TransactionPool {
+            params,
+            frozen_trans: Vec::new(),
+            live_trans: HashMap::new(),
+            earliest_event_timestamp: None,
+            trans_complete_flag: HashMap::new(),
+        }
+    }
+
+    fn is_valid_event(&self, event: &HashMap<String, Option<String>>) -> bool {
+        let Some(time_str) = event.get(FIELD_TIME) else {
+            return false;
+        };
+        let Some(time_str_val) = time_str else {
+            return false;
+        };
+
+        let Ok(time) = time_str_val
+            .parse::<i64>()
+            .map(|ts| Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now))
+        else {
+            return false;
+        };
+
+        if !self.params.fields.is_empty() {
+            let has_at_least_one_field = self
+                .params
+                .fields
+                .iter()
+                .any(|f| event.get(f).is_some() && event.get(f).unwrap().is_some());
+            if !has_at_least_one_field {
+                return false;
+            }
+        }
+
+        if let Some(earliest_ts) = self.earliest_event_timestamp {
+            if time > earliest_ts {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn freeze_trans_exceeded_max_span_restriction(&mut self) {
+        if self.params.max_span.as_secs() > 0 {
+            let mut keys_to_freeze = Vec::new();
+            if let Some(earliest_ts) = self.earliest_event_timestamp {
+                for (trans_key, trans) in &self.live_trans {
+                    if let Some(end_time) = trans.end_time {
+                        if (end_time - earliest_ts).num_seconds() as u64
+                            > self.params.max_span.as_secs()
+                        {
+                            keys_to_freeze.push(trans_key.clone());
+                        }
+                    }
+                }
+            }
+            for key in keys_to_freeze {
+                if let Some(trans) = self.live_trans.remove(&key) {
+                    self.frozen_trans.push(trans);
+                    self.trans_complete_flag.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn make_trans_key(&self, event: &HashMap<String, Option<String>>) -> TransKey {
+        self.params
+            .fields
+            .iter()
+            .map(|f| {
+                event
+                    .get(f)
+                    .and_then(|v_opt| v_opt.as_ref().map(|s| s.to_string()))
+            })
+            .collect()
+    }
+
+    fn add_event(&mut self, event: HashMap<String, Option<String>>) -> Result<()> {
+        if !self.is_valid_event(&event) {
+            return Ok(());
+        }
+
+        let time_str = event.get(FIELD_TIME).and_then(Option::as_ref).unwrap();
+        let time = time_str
+            .parse::<i64>()
+            .map(|ts| Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now))
+            .context("Failed to parse _time as timestamp")?;
+        self.earliest_event_timestamp = Some(time);
+
+        self.freeze_trans_exceeded_max_span_restriction();
+
+        let trans_key = self.make_trans_key(&event);
+        let message = event
+            .get(FIELD_MESSAGE)
+            .and_then(Option::as_ref)
+            .map_or("", |s| s.as_str());
+
+        let current_trans = self.live_trans.remove(&trans_key);
+
+        if current_trans.is_none() {
+            let mut new_trans = Transaction::new(self.params.fields.clone());
+            new_trans.add_event(&event)?;
+
+            if self.params.matches_ends_with(message)
+                || (self.params.ends_with.is_none() && self.params.ends_with_regex.is_none())
+            {
+                self.trans_complete_flag.insert(trans_key.clone(), true);
+            }
+
+            if self.params.matches_starts_with(message) {
+                if self.trans_complete_flag.contains_key(&trans_key) {
+                    new_trans.set_is_closed();
+                }
+                self.frozen_trans.push(new_trans);
+                self.trans_complete_flag.remove(&trans_key);
+            } else {
+                self.live_trans.insert(trans_key.clone(), new_trans);
+            }
+        } else {
+            let mut trans = current_trans.unwrap();
+            if self.params.matches_starts_with(message) {
+                trans.add_event(&event)?;
+                if self.trans_complete_flag.contains_key(&trans_key) {
+                    trans.set_is_closed();
+                }
+                self.frozen_trans.push(trans);
+                self.trans_complete_flag.remove(&trans_key);
+            } else if self.params.matches_ends_with(message) {
+                self.frozen_trans.push(trans);
+
+                let mut new_trans = Transaction::new(self.params.fields.clone());
+                new_trans.add_event(&event)?;
+                self.live_trans.insert(trans_key.clone(), new_trans);
+                self.trans_complete_flag.insert(trans_key.clone(), true);
+            } else {
+                trans.add_event(&event)?;
+                self.live_trans.insert(trans_key.clone(), trans);
+            }
+        }
+
+        if let Some(trans) = self.live_trans.get(&trans_key) {
+            if trans.get_event_count() >= self.params.max_events {
+                let trans_to_freeze = self.live_trans.remove(&trans_key).unwrap();
+                self.frozen_trans.push(trans_to_freeze);
+                self.trans_complete_flag.remove(&trans_key);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn get_frozen_trans(&mut self) -> Vec<Transaction> {
+        std::mem::take(&mut self.frozen_trans)
+    }
+
+    fn get_live_trans(&mut self) -> Vec<Transaction> {
+        let mut live_transactions: Vec<Transaction> = Vec::new();
+        for (_, trans) in self.live_trans.drain() {
+            live_transactions.push(trans);
+        }
+        live_transactions
+    }
+}
+
+#[derive(Default)]
+pub struct TransFunction {
+    trans_pool: Option<TransactionPool>,
+}
+
+impl TransFunction {
+    pub fn new(params: Option<Args>) -> Result<Self> {
+        let trans_params = TransParams::new(params)?;
+        Ok(TransFunction {
+            trans_pool: Some(TransactionPool::new(trans_params)),
+        })
+    }
+}
+
+impl TableFunction for TransFunction {
+    fn process(&mut self, input: RecordBatch) -> Result<Option<RecordBatch>> {
+        let trans_pool = self
+            .trans_pool
+            .as_mut()
+            .context("TransPool not initialized")?;
+
+        let schema = input.schema();
+        let mut events: Vec<HashMap<String, Option<String>>> = Vec::with_capacity(input.num_rows());
+
+        for row_idx in 0..input.num_rows() {
+            let mut event = HashMap::new();
+            for col_idx in 0..input.num_columns() {
+                let field = schema.field(col_idx);
+                let array = input.column(col_idx);
+                let value_str = if array.is_null(row_idx) {
+                    None
+                } else {
+                    Some(match array.data_type() {
+                        DataType::Utf8 => array.as_string::<i32>().value(row_idx).to_string(),
+                        DataType::Int64 => {
+                            array.as_primitive::<Int64Type>().value(row_idx).to_string()
+                        }
+                        DataType::Float64 => array
+                            .as_primitive::<Float64Type>()
+                            .value(row_idx)
+                            .to_string(),
+                        DataType::Boolean => array.as_boolean().value(row_idx).to_string(),
+                        DataType::Timestamp(_, _) => array
+                            .as_primitive::<TimestampMicrosecondType>()
+                            .value(row_idx)
+                            .to_string(),
+                        _ => Err(anyhow!("unsupported data type: {}", field.data_type()))?,
+                    })
+                };
+                event.insert(field.name().clone(), value_str);
+            }
+            events.push(event);
+        }
+
+        for event in events {
+            trans_pool.add_event(event)?;
+        }
+
+        let frozen_batches: Vec<RecordBatch> = trans_pool
+            .get_frozen_trans()
+            .into_iter()
+            .filter_map(|t| t.to_record_batch().ok())
+            .collect();
+
+        if frozen_batches.is_empty() {
+            Ok(None)
+        } else {
+            if frozen_batches.len() > 1 {
+                eprintln!(
+                    "Warning: Multiple frozen batches generated, only returning the first one."
+                );
+            }
+            Ok(frozen_batches.into_iter().next())
+        }
+    }
+
+    fn finalize(&mut self) -> Result<Option<RecordBatch>> {
+        let trans_pool = self
+            .trans_pool
+            .as_mut()
+            .context("TransPool not initialized")?;
+
+        let live_batches: Vec<RecordBatch> = trans_pool
+            .get_live_trans()
+            .into_iter()
+            .filter_map(|t| t.to_record_batch().ok())
+            .collect();
+
+        if live_batches.is_empty() {
+            Ok(None)
+        } else {
+            if live_batches.len() > 1 {
+                eprintln!(
+                    "Warning: Multiple live batches generated during finalize, only returning the first one."
+                );
+            }
+            Ok(live_batches.into_iter().next())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ListArray, StringArray, TimestampMicrosecondArray};
+    use chrono::{Duration as ChronoDuration, Utc};
+    use std::sync::Arc;
+
+    // Helper function to create a simple event HashMap
+    fn create_event(
+        time_micros: i64,
+        message: &str,
+        other_fields: &[(&str, &str)],
+    ) -> HashMap<String, Option<String>> {
+        let mut event = HashMap::new();
+        event.insert(FIELD_TIME.to_string(), Some(time_micros.to_string()));
+        event.insert(FIELD_MESSAGE.to_string(), Some(message.to_string()));
+        for (k, v) in other_fields {
+            event.insert(k.to_string(), Some(v.to_string()));
+        }
+        event
+    }
+
+    // Helper to extract values from a ListArray of StringArray
+    fn extract_list_string_values(array: &Arc<dyn Array>) -> Vec<String> {
+        let list_array = array.as_any().downcast_ref::<ListArray>().unwrap();
+        let first = list_array.value(0);
+        let values_array = first.as_any().downcast_ref::<StringArray>().unwrap();
+        (0..values_array.len())
+            .map(|i| values_array.value(i).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_trans_params_new() {
+        let params_args = Some(vec![
+            Arg::String("fields=client_ip,session_id".to_string()),
+            Arg::String("starts_with=login".to_string()),
+            Arg::String("ends_with_regex=logout_\\d+".to_string()),
+            Arg::String("max_span=10m".to_string()),
+            Arg::String("max_events=500".to_string()),
+        ]);
+        let params = TransParams::new(params_args).unwrap();
+
+        assert_eq!(params.fields, vec!["client_ip", "session_id"]);
+        assert_eq!(params.starts_with, Some("login".to_string()));
+        assert!(params.starts_with_regex.is_none());
+        assert_eq!(params.ends_with_regex.unwrap().as_str(), "logout_\\d+");
+        assert_eq!(params.max_span, Duration::from_secs(600));
+        assert_eq!(params.max_events, 500);
+
+        let default_params = TransParams::new(None).unwrap();
+        assert_eq!(default_params.max_events, 1000);
+        assert!(default_params.fields.is_empty());
+
+        let err_params = Some(vec![Arg::String("invalid_param".to_string())]);
+        assert!(TransParams::new(err_params).is_err());
+    }
+
+    #[test]
+    fn test_trans_params_matches() {
+        let params = TransParams {
+            starts_with: Some("start".to_string()),
+            starts_with_regex: Some(Regex::new("start_\\d+").unwrap()),
+            ends_with: Some("end".to_string()),
+            ends_with_regex: Some(Regex::new("end_\\w+").unwrap()),
+            ..Default::default()
+        };
+
+        assert!(params.matches_starts_with("this is a start message"));
+        assert!(params.matches_starts_with("start_123 event"));
+        assert!(!params.matches_starts_with("no match here"));
+
+        assert!(params.matches_ends_with("this is an end message"));
+        assert!(params.matches_ends_with("end_abc event"));
+        assert!(!params.matches_ends_with("no match here"));
+    }
+
+    #[test]
+    fn test_transaction_add_event_and_merge() {
+        let mut trans = Transaction::new(vec!["user_id".to_string()]);
+        let now = Utc::now();
+
+        let event1 = create_event(
+            (now - ChronoDuration::seconds(20)).timestamp_micros(),
+            "message two",
+            &[("user_id", "user1"), ("status", "success")],
+        );
+        let event2 = create_event(
+            (now - ChronoDuration::seconds(10)).timestamp_micros(),
+            "message one",
+            &[("user_id", "user1"), ("data", "abc")],
+        );
+        let event3 = create_event(
+            (now - ChronoDuration::seconds(30)).timestamp_micros(),
+            "message three",
+            &[("user_id", "user1"), ("status", "fail")],
+        );
+
+        trans.add_event(&event2).unwrap(); // First event, becomes end_time
+        trans.add_event(&event1).unwrap(); // Earlier than event2, becomes start_time
+        trans.add_event(&event3).unwrap(); // Even earlier, updates start_time
+
+        assert_eq!(trans.get_event_count(), 3);
+        assert_eq!(trans.messages.len(), 3);
+        assert_eq!(trans.messages.front().unwrap(), "message three"); // Oldest event at front
+        assert_eq!(trans.messages.back().unwrap(), "message one"); // Newest event at back
+
+        assert_eq!(trans.fields["user_id"], vec!["user1"]);
+        assert!(trans.fields["status"].contains(&"success".to_string()));
+        assert!(trans.fields["status"].contains(&"fail".to_string()));
+        assert_eq!(trans.fields["data"], vec!["abc"]);
+
+        let expected_duration = ((now - ChronoDuration::seconds(10)).timestamp_micros()
+            - (now - ChronoDuration::seconds(30)).timestamp_micros())
+            as f64
+            / 1_000_000.0;
+        assert_eq!(trans.get_duration().unwrap(), expected_duration);
+        assert!(!trans.get_is_closed());
+        trans.set_is_closed();
+        assert!(trans.get_is_closed());
+    }
+
+    #[test]
+    fn test_transaction_to_record_batch() {
+        let mut trans = Transaction::new(vec!["user_id".to_string()]);
+        let now = Utc::now();
+        let event1_time = now - ChronoDuration::seconds(20);
+        let event2_time = now - ChronoDuration::seconds(10);
+
+        trans
+            .add_event(&create_event(
+                event2_time.timestamp_micros(),
+                "second message",
+                &[("user_id", "user_a"), ("status", "completed")],
+            ))
+            .unwrap();
+        trans
+            .add_event(&create_event(
+                event1_time.timestamp_micros(),
+                "first message",
+                &[("user_id", "user_a"), ("source", "web")],
+            ))
+            .unwrap();
+        trans.set_is_closed();
+
+        let rb = trans.to_record_batch().unwrap();
+
+        // 8 columns: _time, _message, _duration, _event_count, _is_closed, source, status, user_id (sorted)
+        assert_eq!(rb.num_columns(), 8);
+        assert_eq!(rb.num_rows(), 1);
+
+        let time_array = rb
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(time_array.value(0), event1_time.timestamp_micros());
+
+        let message_values = extract_list_string_values(rb.column(1));
+        assert_eq!(message_values, vec!["first message", "second message"]);
+
+        let duration_array = rb
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(duration_array.value(0), trans.get_duration().unwrap());
+
+        let event_count_array = rb.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(event_count_array.value(0), 2);
+
+        let is_closed_array = rb
+            .column(4)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(is_closed_array.value(0));
+
+        // Check values of dynamic fields, they are sorted by name
+        assert_eq!(rb.schema().field(5).name(), "source");
+        assert_eq!(extract_list_string_values(rb.column(5)), vec!["web"]);
+
+        assert_eq!(rb.schema().field(6).name(), "status");
+        assert_eq!(extract_list_string_values(rb.column(6)), vec!["completed"]);
+
+        assert_eq!(rb.schema().field(7).name(), "user_id");
+        assert_eq!(extract_list_string_values(rb.column(7)), vec!["user_a"]);
+    }
+
+    #[test]
+    fn test_trans_pool_add_events_basic_scenario() {
+        let params =
+            TransParams::new(Some(vec![Arg::String("fields=user_id".to_string())])).unwrap();
+        let mut pool = TransactionPool::new(params);
+        let now = Utc::now();
+
+        let event1_time = now - ChronoDuration::seconds(5);
+        let event2_time = now - ChronoDuration::seconds(10);
+        let event3_time = now - ChronoDuration::seconds(20);
+        let event4_time = now - ChronoDuration::seconds(30);
+
+        // Event 1
+        let event1 = create_event(
+            event1_time.timestamp_micros(),
+            "login",
+            &[("user_id", "user1")],
+        );
+        pool.add_event(event1).unwrap();
+        assert_eq!(pool.live_trans.len(), 1);
+        assert_eq!(pool.frozen_trans.len(), 0);
+
+        // Event 2 (same user)
+        let event2 = create_event(
+            event2_time.timestamp_micros(),
+            "login",
+            &[("user_id", "user1")],
+        );
+
+        pool.add_event(event2).unwrap();
+        assert_eq!(pool.live_trans.len(), 1);
+        assert_eq!(pool.frozen_trans.len(), 0);
+        assert_eq!(
+            pool.live_trans.values().next().unwrap().get_event_count(),
+            2
+        );
+
+        // Event 3 (different user)
+        let event3 = create_event(
+            event3_time.timestamp_micros(),
+            "login",
+            &[("user_id", "user2")],
+        );
+        pool.add_event(event3).unwrap();
+        assert_eq!(pool.live_trans.len(), 2);
+        assert_eq!(pool.frozen_trans.len(), 0);
+
+        let event4 = create_event(
+            event4_time.timestamp_micros(),
+            "logout",
+            &[("user_id", "user1")],
+        );
+        pool.add_event(event4).unwrap();
+        assert_eq!(pool.live_trans.len(), 2);
+        assert_eq!(pool.frozen_trans.len(), 0);
+        assert_eq!(
+            pool.live_trans
+                .get(&vec![Some("user1".to_string())])
+                .unwrap()
+                .get_event_count(),
+            3
+        );
+        assert_eq!(
+            pool.live_trans
+                .get(&vec![Some("user2".to_string())])
+                .unwrap()
+                .get_event_count(),
+            1
+        );
+
+        let mut pool_max_events = TransactionPool::new(
+            TransParams::new(Some(vec![
+                Arg::String("fields=user_id".to_string()),
+                Arg::String("max_events=3".to_string()),
+            ]))
+            .unwrap(),
+        );
+        let now_fe = Utc::now();
+        pool_max_events
+            .add_event(create_event(
+                now_fe.timestamp_micros(),
+                "event A",
+                &[("user_id", "userX")],
+            ))
+            .unwrap();
+        pool_max_events
+            .add_event(create_event(
+                (now_fe - ChronoDuration::seconds(1)).timestamp_micros(),
+                "event B",
+                &[("user_id", "userX")],
+            ))
+            .unwrap();
+        assert_eq!(pool_max_events.live_trans.len(), 1);
+        assert_eq!(pool_max_events.frozen_trans.len(), 0);
+        pool_max_events
+            .add_event(create_event(
+                (now_fe - ChronoDuration::seconds(2)).timestamp_micros(),
+                "event C",
+                &[("user_id", "userX")],
+            ))
+            .unwrap();
+        assert_eq!(pool_max_events.live_trans.len(), 0); // userX trans should be frozen
+        assert_eq!(pool_max_events.frozen_trans.len(), 1);
+        assert_eq!(pool_max_events.frozen_trans[0].get_event_count(), 3);
+    }
+
+    #[test]
+    fn test_trans_pool_max_span_restriction() {
+        let params = TransParams::new(Some(vec![
+            Arg::String("fields=id".to_string()),
+            Arg::String("max_span=10s".to_string()), // 10 second max span
+        ]))
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        let now = Utc::now();
+
+        // Event 1 for trans_a (within span)
+        let event1 = create_event(
+            (now - ChronoDuration::seconds(15)).timestamp_micros(),
+            "event_a_2",
+            &[("id", "trans_a")],
+        );
+        // Event 2 for trans_a
+        let event2 = create_event(
+            (now - ChronoDuration::seconds(20)).timestamp_micros(),
+            "event_a_1",
+            &[("id", "trans_a")],
+        );
+        let event3 = create_event(
+            (now - ChronoDuration::seconds(25)).timestamp_micros(),
+            "event_b_2",
+            &[("id", "trans_b")],
+        );
+        // Event 4 for trans_b
+        let event4 = create_event(
+            (now - ChronoDuration::seconds(30)).timestamp_micros(),
+            "event_b_1",
+            &[("id", "trans_b")],
+        );
+        let event5_time = now - ChronoDuration::seconds(45);
+        let event5 = create_event(
+            event5_time.timestamp_micros(),
+            "event_c_1",
+            &[("id", "trans_c")],
+        );
+        let event6_time = now - ChronoDuration::seconds(80);
+        let event6 = create_event(
+            event6_time.timestamp_micros(),
+            "event_c_1",
+            &[("id", "trans_c")],
+        );
+
+        pool.add_event(event1).unwrap();
+        pool.add_event(event2).unwrap();
+        pool.add_event(event3).unwrap();
+        pool.add_event(event4).unwrap();
+        pool.add_event(event5).unwrap();
+        pool.add_event(event6).unwrap();
+
+        assert_eq!(pool.live_trans.len(), 1);
+        assert_eq!(pool.frozen_trans.len(), 3);
+    }
+
+    #[test]
+    fn test_trans_pool_multi_value_fields() {
+        let params = TransParams::new(Some(vec![Arg::String(
+            "fields=client_ip,status".to_string(),
+        )]))
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        let now = Utc::now();
+
+        // Event 1
+        let event1 = create_event(
+            now.timestamp_micros(),
+            "msg1",
+            &[("client_ip", "1.1.1.1"), ("status", "200")],
+        );
+        pool.add_event(event1).unwrap();
+        assert_eq!(pool.live_trans.len(), 1);
+        let key1 = vec![Some("1.1.1.1".to_string()), Some("200".to_string())];
+        assert!(pool.live_trans.contains_key(&key1));
+
+        // Event 2 (same client_ip, different status) -> new transaction
+        let event2 = create_event(
+            (now - ChronoDuration::seconds(1)).timestamp_micros(),
+            "msg2",
+            &[("client_ip", "1.1.1.1"), ("status", "404")],
+        );
+        pool.add_event(event2).unwrap();
+        assert_eq!(pool.live_trans.len(), 2); // Two live transactions
+        let key2 = vec![Some("1.1.1.1".to_string()), Some("404".to_string())];
+        assert!(pool.live_trans.contains_key(&key2));
+        assert_eq!(pool.live_trans.get(&key1).unwrap().get_event_count(), 1);
+        assert_eq!(pool.live_trans.get(&key2).unwrap().get_event_count(), 1);
+
+        // Event 3 (different client_ip, same status as key1) -> new transaction
+        let event3 = create_event(
+            (now - ChronoDuration::seconds(2)).timestamp_micros(),
+            "msg3",
+            &[("client_ip", "2.2.2.2"), ("status", "200")],
+        );
+        pool.add_event(event3).unwrap();
+        assert_eq!(pool.live_trans.len(), 3); // Three live transactions
+        let key3 = vec![Some("2.2.2.2".to_string()), Some("200".to_string())];
+        assert!(pool.live_trans.contains_key(&key3));
+
+        // Event 4 (same as Event 1 key) -> merges with key1 transaction
+        let event4 = create_event(
+            (now - ChronoDuration::seconds(3)).timestamp_micros(),
+            "msg4",
+            &[("client_ip", "1.1.1.1"), ("status", "200")],
+        );
+        pool.add_event(event4).unwrap();
+        assert_eq!(pool.live_trans.len(), 3); // Still three live transactions
+        assert_eq!(pool.live_trans.get(&key1).unwrap().get_event_count(), 2);
+    }
+}
