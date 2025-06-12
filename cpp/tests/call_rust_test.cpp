@@ -21,6 +21,8 @@ TEST_CASE("call rust") {
   REQUIRE(std::filesystem::exists(dylib_path));
   void *dylib = dlopen(dylib_path.c_str(), RTLD_LAZY | RTLD_GLOBAL);
   auto api = __zngur_dyn_api{dylib};
+  std::string error_msg;
+  REQUIRE(api.init(error_msg));
   auto registries_result = rust::crate::get_function_registries(&api);
   if (registries_result.is_err(&api)) {
     FAIL("Failed to get function registries");
