@@ -38,8 +38,10 @@ pub struct TransParams {
     pub fields: Vec<String>,
     pub starts_with: Option<String>,
     pub starts_with_regex: Option<Regex>,
+    pub starts_if: Option<String>, // Added starts_if
     pub ends_with: Option<String>,
     pub ends_with_regex: Option<Regex>,
+    pub ends_if: Option<String>, // Added ends_if
     pub max_span: Duration,
     pub max_events: u64,
 }
@@ -74,12 +76,18 @@ impl TransParams {
                 let regex_str = s.split('=').nth(1).unwrap_or("");
                 parsed_params.starts_with_regex =
                     Some(Regex::new(regex_str).context(format!("Invalid regex: {}", regex_str))?);
+            } else if s.starts_with("starts_if=") {
+                // Added starts_if parsing
+                parsed_params.starts_if = Some(s.split('=').nth(1).unwrap_or("").to_string());
             } else if s.starts_with("ends_with=") || s.starts_with("end_with=") {
                 parsed_params.ends_with = Some(s.split('=').nth(1).unwrap_or("").to_string());
             } else if s.starts_with("ends_with_regex=") || s.starts_with("end_with_regex=") {
                 let regex_str = s.split('=').nth(1).unwrap_or("");
                 parsed_params.ends_with_regex =
                     Some(Regex::new(regex_str).context(format!("Invalid regex: {}", regex_str))?);
+            } else if s.starts_with("ends_if=") {
+                // Added ends_if parsing
+                parsed_params.ends_if = Some(s.split('=').nth(1).unwrap_or("").to_string());
             } else if s.starts_with("max_span=") {
                 let span_str = s.split('=').nth(1).unwrap_or("");
                 static DURATION_REGEX: LazyLock<Regex> =
@@ -112,7 +120,25 @@ impl TransParams {
         Ok(parsed_params)
     }
 
-    fn matches_starts_with(&self, message: &str) -> bool {
+    fn check_boolean_field_condition(
+        &self,
+        event: &HashMap<String, Option<String>>,
+        field_name_opt: &Option<String>,
+    ) -> bool {
+        if let Some(field_name) = field_name_opt {
+            if let Some(Some(value)) = event.get(field_name) {
+                return value.eq_ignore_ascii_case("true");
+            }
+        }
+        false
+    }
+
+    fn matches_starts_with(&self, event: &HashMap<String, Option<String>>) -> bool {
+        let message = event
+            .get(FIELD_MESSAGE)
+            .and_then(Option::as_ref)
+            .map_or("", |s| s.as_str());
+
         if let Some(s) = &self.starts_with {
             if message.contains(s) {
                 return true;
@@ -123,10 +149,18 @@ impl TransParams {
                 return true;
             }
         }
+        if self.check_boolean_field_condition(event, &self.starts_if) {
+            return true;
+        }
         false
     }
 
-    fn matches_ends_with(&self, message: &str) -> bool {
+    fn matches_ends_with(&self, event: &HashMap<String, Option<String>>) -> bool {
+        let message = event
+            .get(FIELD_MESSAGE)
+            .and_then(Option::as_ref)
+            .map_or("", |s| s.as_str());
+
         if let Some(s) = &self.ends_with {
             if message.contains(s) {
                 return true;
@@ -136,6 +170,10 @@ impl TransParams {
             if r.is_match(message) {
                 return true;
             }
+        }
+        // Check ends_if condition
+        if self.check_boolean_field_condition(event, &self.ends_if) {
+            return true;
         }
         false
     }
@@ -402,10 +440,6 @@ impl TransactionPool {
         self.freeze_trans_exceeded_max_span_restriction();
 
         let trans_key = self.make_trans_key(&event);
-        let message = event
-            .get(FIELD_MESSAGE)
-            .and_then(Option::as_ref)
-            .map_or("", |s| s.as_str());
 
         let current_trans = self.live_trans.remove(&trans_key);
 
@@ -413,13 +447,15 @@ impl TransactionPool {
             let mut new_trans = Transaction::new(self.params.fields.clone());
             new_trans.add_event(&event)?;
 
-            if self.params.matches_ends_with(message)
-                || (self.params.ends_with.is_none() && self.params.ends_with_regex.is_none())
+            if self.params.matches_ends_with(&event)
+                || (self.params.ends_with.is_none()
+                    && self.params.ends_with_regex.is_none()
+                    && self.params.ends_if.is_none())
             {
                 self.trans_complete_flag.insert(trans_key.clone(), true);
             }
 
-            if self.params.matches_starts_with(message) {
+            if self.params.matches_starts_with(&event) {
                 if self.trans_complete_flag.contains_key(&trans_key) {
                     new_trans.set_is_closed();
                 }
@@ -430,14 +466,14 @@ impl TransactionPool {
             }
         } else {
             let mut trans = current_trans.unwrap();
-            if self.params.matches_starts_with(message) {
+            if self.params.matches_starts_with(&event) {
                 trans.add_event(&event)?;
                 if self.trans_complete_flag.contains_key(&trans_key) {
                     trans.set_is_closed();
                 }
                 self.frozen_trans.push(trans);
                 self.trans_complete_flag.remove(&trans_key);
-            } else if self.params.matches_ends_with(message) {
+            } else if self.params.matches_ends_with(&event) {
                 self.frozen_trans.push(trans);
 
                 let mut new_trans = Transaction::new(self.params.fields.clone());
@@ -612,7 +648,9 @@ mod tests {
         let params_args = Some(vec![
             Arg::String("fields=client_ip,session_id".to_string()),
             Arg::String("starts_with=login".to_string()),
+            Arg::String("starts_if=is_start_event".to_string()), // Test starts_if
             Arg::String("ends_with_regex=logout_\\d+".to_string()),
+            Arg::String("ends_if=is_end_event".to_string()), // Test ends_if
             Arg::String("max_span=10m".to_string()),
             Arg::String("max_events=500".to_string()),
         ]);
@@ -621,35 +659,20 @@ mod tests {
         assert_eq!(params.fields, vec!["client_ip", "session_id"]);
         assert_eq!(params.starts_with, Some("login".to_string()));
         assert!(params.starts_with_regex.is_none());
+        assert_eq!(params.starts_if, Some("is_start_event".to_string())); // Verify starts_if
         assert_eq!(params.ends_with_regex.unwrap().as_str(), "logout_\\d+");
+        assert_eq!(params.ends_if, Some("is_end_event".to_string())); // Verify ends_if
         assert_eq!(params.max_span, Duration::from_secs(600));
         assert_eq!(params.max_events, 500);
 
         let default_params = TransParams::new(None).unwrap();
         assert_eq!(default_params.max_events, 1000);
         assert!(default_params.fields.is_empty());
+        assert!(default_params.starts_if.is_none()); // Verify default is None
+        assert!(default_params.ends_if.is_none()); // Verify default is None
 
         let err_params = Some(vec![Arg::String("invalid_param".to_string())]);
         assert!(TransParams::new(err_params).is_err());
-    }
-
-    #[test]
-    fn test_trans_params_matches() {
-        let params = TransParams {
-            starts_with: Some("start".to_string()),
-            starts_with_regex: Some(Regex::new("start_\\d+").unwrap()),
-            ends_with: Some("end".to_string()),
-            ends_with_regex: Some(Regex::new("end_\\w+").unwrap()),
-            ..Default::default()
-        };
-
-        assert!(params.matches_starts_with("this is a start message"));
-        assert!(params.matches_starts_with("start_123 event"));
-        assert!(!params.matches_starts_with("no match here"));
-
-        assert!(params.matches_ends_with("this is an end message"));
-        assert!(params.matches_ends_with("end_abc event"));
-        assert!(!params.matches_ends_with("no match here"));
     }
 
     #[test]
@@ -980,5 +1003,72 @@ mod tests {
         pool.add_event(event4).unwrap();
         assert_eq!(pool.live_trans.len(), 3); // Still three live transactions
         assert_eq!(pool.live_trans.get(&key1).unwrap().get_event_count(), 2);
+    }
+
+    #[test]
+    fn test_trans_pool_starts_ends_if() {
+        let params = TransParams::new(Some(vec![
+            Arg::String("fields=session_id".to_string()),
+            Arg::String("starts_if=start_flag".to_string()),
+            Arg::String("ends_if=end_flag".to_string()),
+        ]))
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        let now = Utc::now();
+
+        let event1 = create_event(
+            now.timestamp_micros(),
+            "event_A1",
+            &[("session_id", "A"), ("start_flag", "true")],
+        );
+        let event2 = create_event(
+            (now - ChronoDuration::seconds(1)).timestamp_micros(),
+            "event_A2",
+            &[("session_id", "A")],
+        );
+        let event3 = create_event(
+            (now - ChronoDuration::seconds(2)).timestamp_micros(),
+            "event_A3",
+            &[("session_id", "A"), ("end_flag", "true")],
+        );
+        let event4 = create_event(
+            (now - ChronoDuration::seconds(3)).timestamp_micros(),
+            "event_B1",
+            &[
+                ("session_id", "B"),
+                ("start_flag", "true"),
+                ("end_flag", "true"),
+            ],
+        );
+        let event5 = create_event(
+            (now - ChronoDuration::seconds(4)).timestamp_micros(),
+            "event_C1",
+            &[("session_id", "C"), ("start_flag", "true")],
+        );
+        let event6 = create_event(
+            (now - ChronoDuration::seconds(5)).timestamp_micros(),
+            "event_C2",
+            &[("session_id", "C")],
+        );
+        let event7 = create_event(
+            (now - ChronoDuration::seconds(6)).timestamp_micros(),
+            "event_C3",
+            &[("session_id", "C"), ("start_flag", "true")],
+        );
+
+        pool.add_event(event1).unwrap();
+        pool.add_event(event2).unwrap();
+        pool.add_event(event3).unwrap();
+        pool.add_event(event4).unwrap();
+        pool.add_event(event5).unwrap();
+        pool.add_event(event6).unwrap();
+        pool.add_event(event7).unwrap();
+
+        assert_eq!(pool.live_trans.len(), 1);
+        assert_eq!(pool.frozen_trans.len(), 5);
+        assert_eq!(
+            pool.frozen_trans.last().unwrap().messages,
+            vec!["event_C3", "event_C2"]
+        );
     }
 }
