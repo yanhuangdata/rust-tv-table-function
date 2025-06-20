@@ -1,3 +1,4 @@
+use crate::arg::{Arg, ArgType, NamedArg};
 use anyhow::Context;
 use arg::Args;
 use arrow::array::RecordBatch;
@@ -5,11 +6,10 @@ use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_utils::{DynamicArrowArrayStreamReader, VecRecordBatchReader};
 use derive_builder::Builder;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::ffi::c_char;
 use std::ptr::null_mut;
 use std::sync::Arc;
-
-use crate::arg::ArgType;
 
 pub mod arg;
 mod arrow_utils;
@@ -18,20 +18,32 @@ mod arrow_utils;
 ///
 /// This function is unsafe because it dereferences raw pointers.
 ///
-/// For `parameters`, it expects a null-terminated UTF-8 string, it may be `nullptr`.
+/// For `arguments`, it expects a null-terminated UTF-8 string, it may be `nullptr`.
+///
+/// For `named_arguments`, it expects a null-terminated UTF-8 string, it may be `nullptr`.
 ///
 /// For `timezone`, it expects a null-terminated UTF-8 string, it must be valid.
 pub unsafe fn create_raw(
     registry: &FunctionRegistry,
-    parameters: *const i8,
+    arguments: *const i8,
+    named_arguments: *const i8,
     timezone: *const i8,
 ) -> anyhow::Result<Box<dyn TableFunction>> {
-    let parameters = if parameters.is_null() {
+    let arguments = if arguments.is_null() {
         None
     } else {
         unsafe {
             Some(std::str::from_utf8_unchecked(
-                std::ffi::CStr::from_ptr(parameters as *const c_char).to_bytes(),
+                std::ffi::CStr::from_ptr(arguments as *const c_char).to_bytes(),
+            ))
+        }
+    };
+    let named_arguments = if named_arguments.is_null() {
+        None
+    } else {
+        unsafe {
+            Some(std::str::from_utf8_unchecked(
+                std::ffi::CStr::from_ptr(named_arguments as *const c_char).to_bytes(),
             ))
         }
     };
@@ -40,22 +52,32 @@ pub unsafe fn create_raw(
             std::ffi::CStr::from_ptr(timezone as *const c_char).to_bytes(),
         )
     };
-    create(registry, parameters, timezone)
+    create(registry, arguments, named_arguments, timezone)
 }
 
 pub fn create(
     registry: &FunctionRegistry,
-    parameters: Option<&str>,
+    arguments: Option<&str>,
+    named_arguments: Option<&str>,
     timezone: &str,
 ) -> anyhow::Result<Box<dyn TableFunction>> {
     let create_closure = &(registry.init);
-    let parameters = if let Some(param) = parameters {
-        serde_json::from_str(param).context("serde json failed")?
+    let arguments = if let Some(arg) = arguments {
+        serde_json::from_str(arg).context("Failed to parse arguments from JSON")?
     } else {
         None
     };
+    let named_arguments: Vec<NamedArg> = if let Some(arg) = named_arguments {
+        serde_json::from_str(arg).context("Failed to parse named arguments from JSON")?
+    } else {
+        vec![]
+    };
     let ctx = FunctionContext {
-        parameters,
+        arguments,
+        named_arguments: named_arguments
+            .into_iter()
+            .map(|named| (named.name, named.arg))
+            .collect(),
         // TODO: parse as value instead of string
         timezone: String::from(timezone),
     };
@@ -98,19 +120,67 @@ impl FunctionRegistry {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Builder)]
 pub struct Signature {
-    pub args: Vec<ArgType>,
+    #[builder(setter(each(name = "parameter", into)))]
+    pub(crate) parameters: Vec<Parameter>,
 }
 
-impl From<Vec<ArgType>> for Signature {
-    fn from(value: Vec<ArgType>) -> Self {
-        Signature { args: value }
+impl Signature {
+    pub fn builder() -> SignatureBuilder {
+        SignatureBuilder::default()
+    }
+
+    pub fn empty() -> Signature {
+        Signature { parameters: vec![] }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Parameter {
+    pub(crate) name: Option<String>,
+    pub(crate) default: Option<Arg>,
+    pub(crate) arg_type: ArgType,
+}
+
+impl From<ArgType> for Parameter {
+    fn from(value: ArgType) -> Self {
+        Parameter {
+            name: None,
+            default: None,
+            arg_type: value,
+        }
+    }
+}
+
+impl<NAME, ARG> From<(Option<NAME>, ArgType, Option<ARG>)> for Parameter
+where
+    NAME: Into<Cow<'static, str>>,
+    ARG: Into<Arg>,
+{
+    fn from((name, arg_type, default): (Option<NAME>, ArgType, Option<ARG>)) -> Self {
+        Parameter {
+            name: name.map(|x| x.into().into_owned()),
+            default: default.map(|x| x.into()),
+            arg_type,
+        }
+    }
+}
+
+impl<P> From<Vec<P>> for Signature
+where
+    P: Into<Parameter>,
+{
+    fn from(value: Vec<P>) -> Self {
+        Signature {
+            parameters: value.into_iter().map(|x| x.into()).collect(),
+        }
     }
 }
 
 pub struct FunctionContext {
-    pub parameters: Option<Args>,
+    pub arguments: Option<Args>,
+    pub named_arguments: Vec<(String, Arg)>,
     pub timezone: String,
 }
 

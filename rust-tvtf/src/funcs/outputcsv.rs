@@ -70,7 +70,7 @@ impl OutputCsv {
             1 => init(false),
             2 => init(tee()?),
             n => Err(anyhow!(
-                "Invalid parameters, there is no {n}-args constructor"
+                "Invalid arguments, there is no {n}-args constructor"
             )),
         }
     }

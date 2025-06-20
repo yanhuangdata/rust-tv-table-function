@@ -47,7 +47,7 @@ impl CountColumn {
                 }
             }
             n => Err(anyhow::anyhow!(
-                "Invalid parameters, there is no {n}-args constructor"
+                "Invalid arguments, there is no {n}-args constructor"
             )),
         }
     }
@@ -270,7 +270,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "Invalid parameters, there is no 2-args constructor"
+            "Invalid arguments, there is no 2-args constructor"
         );
     }
 }

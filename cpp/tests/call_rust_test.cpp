@@ -43,9 +43,11 @@ TEST_CASE("call rust") {
     auto sig = sig_result.unwrap(&api);
     auto sig_view = std::string_view{reinterpret_cast<const char *>(sig.as_str(&api).as_ptr(&api)),
                                      sig.as_str(&api).len(&api)};
-    REQUIRE(sig_view == R"([{"args":[]},{"args":["INT"]}])");
+    REQUIRE(
+        sig_view ==
+        R"([{"parameters":[]},{"parameters":[{"name":null,"default":null,"arg_type":"INT"}]}])");
     auto table_func =
-        rust::rust_tvtf_api::create_raw(&api, registry, nullptr,
+        rust::rust_tvtf_api::create_raw(&api, registry, nullptr, nullptr,
                                         reinterpret_cast<int8_t const *>("Asia/Shanghai"))
             .unwrap(&api);
     REQUIRE(name_view == "addtotals");
