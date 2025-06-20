@@ -1,9 +1,8 @@
-use anyhow::Context;
-use rust_tvtf_api::{FunctionRegistry, TableFunction, arg::ArgType};
-use std::iter::repeat_n;
-use std::{sync::Arc, vec};
-
 use crate::funcs::*;
+use anyhow::Context;
+use rust_tvtf_api::Signature;
+use rust_tvtf_api::{FunctionRegistry, TableFunction, arg::ArgType};
+use std::{sync::Arc, vec};
 
 pub mod funcs;
 #[rustfmt::skip]
@@ -15,16 +14,16 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
         FunctionRegistry::builder()
             .name("addtotals")
             .init(Arc::new(|ctx| {
-                AddTotals::new(ctx.parameters).map(|f| Box::new(f) as Box<dyn TableFunction>)
+                AddTotals::new(ctx.arguments).map(|f| Box::new(f) as Box<dyn TableFunction>)
             }))
-            .signature(vec![])
+            .signature(Signature::empty())
             .signature(vec![ArgType::Int])
             .build()
             .context("create `addtotals` registry failed")?,
         FunctionRegistry::builder()
             .name("output_csv")
             .init(Arc::new(|ctx| {
-                OutputCsv::new(ctx.parameters).map(|f| Box::new(f) as Box<dyn TableFunction>)
+                OutputCsv::new(ctx.arguments).map(|f| Box::new(f) as Box<dyn TableFunction>)
             }))
             .signature(vec![ArgType::String])
             .signature(vec![ArgType::String, ArgType::Bool])
@@ -33,12 +32,21 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
         FunctionRegistry::builder()
             .name("transaction")
             .init(Arc::new(|ctx| {
-                TransFunction::new(ctx.parameters).map(|f| Box::new(f) as Box<dyn TableFunction>)
+                TransFunction::new(ctx.arguments, ctx.named_arguments)
+                    .map(|f| Box::new(f) as Box<dyn TableFunction>)
             }))
-            .signatures(
-                (1..=5)
-                    .map(|n| repeat_n(ArgType::String, n).collect::<Vec<_>>().into())
-                    .collect(),
+            .signature(
+                Signature::builder()
+                    .parameter(ArgType::String) // fields
+                    .parameter((Some("starts_with"), ArgType::String, Some("")))
+                    .parameter((Some("starts_with_regex"), ArgType::String, Some("")))
+                    .parameter((Some("starts_if"), ArgType::String, Some("")))
+                    .parameter((Some("ends_with"), ArgType::String, Some("")))
+                    .parameter((Some("ends_with_regex"), ArgType::String, Some("")))
+                    .parameter((Some("ends_if"), ArgType::String, Some("")))
+                    .parameter((Some("max_span"), ArgType::Int, Some(1000)))
+                    .build()
+                    .context("Failed to build signature parameters")?,
             )
             .build()
             .context("create `output_csv` registry failed")?,
