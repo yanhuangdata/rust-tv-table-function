@@ -104,7 +104,7 @@ mod rust_tvtf_api {
         fn signatures(&self) -> ::std::result::Result::<::std::string::String, ::anyhow::Error>;
     }
 
-    fn create_raw(&::rust_tvtf_api::FunctionRegistry, *const i8, *const i8) -> ::std::result::Result::<Box<dyn ::rust_tvtf_api::TableFunction>, ::anyhow::Error>;
+    fn create_raw(&::rust_tvtf_api::FunctionRegistry, *const i8, *const i8, *const i8) -> ::std::result::Result::<Box<dyn ::rust_tvtf_api::TableFunction>, ::anyhow::Error>;
     fn process_raw(&mut Box<dyn ::rust_tvtf_api::TableFunction>, i64) -> ::std::result::Result::<i64, ::anyhow::Error>;
     fn finalize_raw(&mut Box<dyn ::rust_tvtf_api::TableFunction>) -> ::std::result::Result::<i64, ::anyhow::Error>;
 }
