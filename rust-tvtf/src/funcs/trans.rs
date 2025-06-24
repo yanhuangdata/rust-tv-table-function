@@ -52,9 +52,6 @@ impl TransParams {
             max_events: 1000,
             ..Default::default()
         };
-        dbg!(&params);
-        dbg!(&named_arguments);
-
         if let Some(params_vec_raw) = params {
             let mut params_iter = params_vec_raw.into_iter().filter(|x| x.is_scalar());
             if let Some(first_param) = params_iter.next() {
