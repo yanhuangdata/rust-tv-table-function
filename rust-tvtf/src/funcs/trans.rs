@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, anyhow};
 use arrow::array::{AsArray, ListBuilder, StringBuilder};
-use arrow::compute::concat_batches;
 use arrow::datatypes::{Float64Type, Int64Type, TimestampMicrosecondType};
 use arrow::{
     array::{Array, BooleanArray, Float64Array, Int64Array, TimestampMicrosecondArray},
@@ -332,66 +331,101 @@ impl Transaction {
     fn get_is_closed(&self) -> bool {
         self.is_closed
     }
+}
 
-    fn to_record_batch(&self) -> Result<RecordBatch> {
-        let mut fields = vec![
-            Field::new(
-                FIELD_TIME,
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-                false,
-            ),
-            Field::new(
-                FIELD_MESSAGE,
-                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                false,
-            ),
-            Field::new(FIELD_DURATION, DataType::Float64, true),
-            Field::new(FIELD_EVENT_COUNT, DataType::Int64, false),
-            Field::new(FIELD_IS_CLOSED, DataType::Boolean, false),
-        ];
-
-        let mut arrays: Vec<Arc<dyn Array>> = vec![
-            Arc::new(TimestampMicrosecondArray::from(vec![
-                self.start_time.map(|dt| dt.timestamp_micros()),
-            ])),
-            Arc::new({
-                let mut builder = ListBuilder::new(StringBuilder::new());
-                for x in self.messages.iter() {
-                    builder.values().append_value(x);
-                }
-                builder.append(true);
-
-                builder.finish()
-            }),
-            Arc::new(Float64Array::from(vec![self.get_duration()])),
-            Arc::new(Int64Array::from(vec![self.get_event_count() as i64])),
-            Arc::new(BooleanArray::from(vec![self.is_closed])),
-        ];
-
-        let mut sorted_field_names: Vec<&String> = self.fields.keys().collect();
-        sorted_field_names.sort();
-
-        for k in sorted_field_names {
-            let v_list = self.fields.get(k).unwrap();
-            fields.push(Field::new(
-                k,
-                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                false,
-            ));
-            arrays.push({
-                let mut builder = ListBuilder::new(StringBuilder::new());
-                for x in v_list.iter() {
-                    builder.values().append_value(x);
-                }
-                builder.append(true);
-
-                Arc::new(builder.finish())
-            });
-        }
-
-        let schema = Arc::new(Schema::new(fields));
-        RecordBatch::try_new(schema, arrays).context("Failed to create record batch")
+fn to_record_batch(transactions: &[Transaction]) -> Result<Option<RecordBatch>> {
+    if transactions.is_empty() {
+        return Ok(None);
     }
+
+    // Collect all unique field names from all transactions
+    let mut all_field_names = std::collections::HashSet::new();
+    for transaction in transactions {
+        for field_name in transaction.fields.keys() {
+            all_field_names.insert(field_name.clone());
+        }
+    }
+    let mut sorted_field_names: Vec<String> = all_field_names.into_iter().collect();
+    sorted_field_names.sort();
+
+    // Create schema
+    let mut fields = vec![
+        Field::new(
+            FIELD_TIME,
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new(
+            FIELD_MESSAGE,
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            false,
+        ),
+        Field::new(FIELD_DURATION, DataType::Float64, true),
+        Field::new(FIELD_EVENT_COUNT, DataType::Int64, false),
+        Field::new(FIELD_IS_CLOSED, DataType::Boolean, false),
+    ];
+
+    for field_name in &sorted_field_names {
+        fields.push(Field::new(
+            field_name,
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            false,
+        ));
+    }
+
+    // Create arrays
+    let mut arrays: Vec<Arc<dyn Array>> = Vec::new();
+
+    // Time array
+    let time_values: Vec<Option<i64>> = transactions
+        .iter()
+        .map(|t| t.start_time.map(|dt| dt.timestamp_micros()))
+        .collect();
+    arrays.push(Arc::new(TimestampMicrosecondArray::from(time_values)));
+
+    // Messages array
+    let mut messages_builder = ListBuilder::new(StringBuilder::new());
+    for transaction in transactions {
+        for message in transaction.messages.iter() {
+            messages_builder.values().append_value(message);
+        }
+        messages_builder.append(true);
+    }
+    arrays.push(Arc::new(messages_builder.finish()));
+
+    // Duration array
+    let duration_values: Vec<Option<f64>> = transactions.iter().map(|t| t.get_duration()).collect();
+    arrays.push(Arc::new(Float64Array::from(duration_values)));
+
+    // Event count array
+    let event_count_values: Vec<i64> = transactions
+        .iter()
+        .map(|t| t.get_event_count() as i64)
+        .collect();
+    arrays.push(Arc::new(Int64Array::from(event_count_values)));
+
+    // Is closed array
+    let is_closed_values: Vec<bool> = transactions.iter().map(|t| t.is_closed).collect();
+    arrays.push(Arc::new(BooleanArray::from(is_closed_values)));
+
+    // Dynamic field arrays
+    for field_name in &sorted_field_names {
+        let mut field_builder = ListBuilder::new(StringBuilder::new());
+        for transaction in transactions {
+            if let Some(values) = transaction.fields.get(field_name) {
+                for value in values {
+                    field_builder.values().append_value(value);
+                }
+            }
+            field_builder.append(true);
+        }
+        arrays.push(Arc::new(field_builder.finish()));
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    Ok(Some(
+        RecordBatch::try_new(schema, arrays).context("Failed to create record batch")?,
+    ))
 }
 
 type TransKey = Vec<Option<String>>;
@@ -583,17 +617,6 @@ impl TransFunction {
     }
 }
 
-fn merge_batches(batches: Vec<RecordBatch>) -> Result<Option<RecordBatch>> {
-    match batches.len() {
-        0 => Ok(None),
-        1 => Ok(batches.into_iter().next()),
-        _ => Ok(Some(
-            concat_batches(batches.first().unwrap().schema_ref(), batches.iter())
-                .context("Failed to concat results")?,
-        )),
-    }
-}
-
 impl TableFunction for TransFunction {
     fn process(&mut self, input: RecordBatch) -> Result<Option<RecordBatch>> {
         let trans_pool = self
@@ -638,13 +661,7 @@ impl TableFunction for TransFunction {
             trans_pool.add_event(event)?;
         }
 
-        let frozen_batches: Vec<RecordBatch> = trans_pool
-            .get_frozen_trans()
-            .into_iter()
-            .filter_map(|t| t.to_record_batch().ok())
-            .collect();
-
-        merge_batches(frozen_batches)
+        to_record_batch(&trans_pool.get_frozen_trans())
     }
 
     fn finalize(&mut self) -> Result<Option<RecordBatch>> {
@@ -653,13 +670,7 @@ impl TableFunction for TransFunction {
             .as_mut()
             .context("TransPool not initialized")?;
 
-        let live_batches: Vec<RecordBatch> = trans_pool
-            .get_live_trans()
-            .into_iter()
-            .filter_map(|t| t.to_record_batch().ok())
-            .collect();
-
-        merge_batches(live_batches)
+        to_record_batch(&trans_pool.get_live_trans())
     }
 }
 
@@ -843,7 +854,8 @@ mod tests {
             .unwrap();
         trans.set_is_closed();
 
-        let rb = trans.to_record_batch().unwrap();
+        let transactions = vec![trans];
+        let rb = to_record_batch(&transactions).unwrap().unwrap();
 
         // 8 columns: _time, _message, _duration, _event_count, _is_closed, source, status, user_id (sorted)
         assert_eq!(rb.num_columns(), 8);
@@ -864,7 +876,10 @@ mod tests {
             .as_any()
             .downcast_ref::<Float64Array>()
             .unwrap();
-        assert_eq!(duration_array.value(0), trans.get_duration().unwrap());
+        assert_eq!(
+            duration_array.value(0),
+            transactions[0].get_duration().unwrap()
+        );
 
         let event_count_array = rb.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(event_count_array.value(0), 2);
