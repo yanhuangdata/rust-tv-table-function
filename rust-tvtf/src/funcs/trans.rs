@@ -63,10 +63,11 @@ impl TransParams {
             match name.as_str() {
                 "fields" => {
                     let Arg::String(s) = arg else {
-                        return Err(anyhow!(
-                            "Invalid type for the positional 'fields' parameter. Expected string."
-                        ));
+                        return Err(anyhow!("Invalid type for {}. Expected string.", name));
                     };
+                    if s.is_empty() {
+                        continue;
+                    }
                     parsed_params.fields = s.split(',').map(|f| f.trim().to_string()).collect();
                 }
                 "starts_with" => {
@@ -644,7 +645,7 @@ impl TableFunction for TransFunction {
                             .as_primitive::<TimestampMicrosecondType>()
                             .value(row_idx)
                             .to_string(),
-                        _ => Err(anyhow!("unsupported data type: {}", field.data_type()))?,
+                        _ => continue,
                     })
                 };
                 event.insert(field.name().clone(), value_str);
