@@ -38,10 +38,10 @@ pub struct TransParams {
     pub fields: Vec<String>,
     pub starts_with: Option<String>,
     pub starts_with_regex: Option<Regex>,
-    pub starts_if: Option<String>,
+    pub starts_if_field: Option<String>,
     pub ends_with: Option<String>,
     pub ends_with_regex: Option<Regex>,
-    pub ends_if: Option<String>,
+    pub ends_if_field: Option<String>,
     pub max_span: Duration,
     pub max_events: u64,
 }
@@ -54,23 +54,21 @@ impl TransParams {
         };
         if let Some(params_vec_raw) = params {
             let mut params_iter = params_vec_raw.into_iter().filter(|x| x.is_scalar());
-            if let Some(first_param) = params_iter.next() {
-                let Arg::String(s) = first_param else {
-                    return Err(anyhow!(
-                        "Invalid type for the positional 'fields' parameter. Expected string."
-                    ));
-                };
-                parsed_params.fields = s.split(',').map(|f| f.trim().to_string()).collect();
-                if params_iter.next().is_some() {
-                    return Err(anyhow!(
-                        "Too many scalar parameters. Only 'fields' is supported as a single positional scalar parameter."
-                    ));
-                }
+            if let Some(_first_param) = params_iter.next() {
+                return Err(anyhow!("Too many positional parameters."));
             }
         }
 
         for (name, arg) in named_arguments {
             match name.as_str() {
+                "fields" => {
+                    let Arg::String(s) = arg else {
+                        return Err(anyhow!(
+                            "Invalid type for the positional 'fields' parameter. Expected string."
+                        ));
+                    };
+                    parsed_params.fields = s.split(',').map(|f| f.trim().to_string()).collect();
+                }
                 "starts_with" => {
                     let Arg::String(s) = arg else {
                         return Err(anyhow!("Invalid type for {}. Expected string.", name));
@@ -90,14 +88,14 @@ impl TransParams {
                     parsed_params.starts_with_regex =
                         Some(Regex::new(&s).context(format!("Invalid regex for {}: {}", name, s))?);
                 }
-                "starts_if" => {
+                "starts_if_field" => {
                     let Arg::String(s) = arg else {
                         return Err(anyhow!("Invalid type for {}. Expected string.", name));
                     };
                     if s.is_empty() {
                         continue;
                     }
-                    parsed_params.starts_if = Some(s);
+                    parsed_params.starts_if_field = Some(s);
                 }
                 "ends_with" => {
                     let Arg::String(s) = arg else {
@@ -110,7 +108,7 @@ impl TransParams {
                 }
                 "ends_with_regex" => {
                     let Arg::String(s) = arg else {
-                        return Err(anyhow!("Invalid type for {}. Expected string.", name));
+                        return Err(anyhow!("Invalid typ5e for {}. Expected string.", name));
                     };
                     if s.is_empty() {
                         continue;
@@ -118,14 +116,14 @@ impl TransParams {
                     parsed_params.ends_with_regex =
                         Some(Regex::new(&s).context(format!("Invalid regex for {}: {}", name, s))?);
                 }
-                "ends_if" => {
+                "ends_if_field" => {
                     let Arg::String(s) = arg else {
                         return Err(anyhow!("Invalid type for {}. Expected string.", name));
                     };
                     if s.is_empty() {
                         continue;
                     }
-                    parsed_params.ends_if = Some(s);
+                    parsed_params.ends_if_field = Some(s);
                 }
                 "max_span" => {
                     let Arg::String(s) = arg else {
@@ -204,7 +202,7 @@ impl TransParams {
                 return true;
             }
         }
-        if self.check_boolean_field_condition(event, &self.starts_if) {
+        if self.check_boolean_field_condition(event, &self.starts_if_field) {
             return true;
         }
         false
@@ -226,8 +224,8 @@ impl TransParams {
                 return true;
             }
         }
-        // Check ends_if condition
-        if self.check_boolean_field_condition(event, &self.ends_if) {
+        // Check ends_if_field condition
+        if self.check_boolean_field_condition(event, &self.ends_if_field) {
             return true;
         }
         false
@@ -540,7 +538,7 @@ impl TransactionPool {
             if self.params.matches_ends_with(&event)
                 || (self.params.ends_with.is_none()
                     && self.params.ends_with_regex.is_none()
-                    && self.params.ends_if.is_none())
+                    && self.params.ends_if_field.is_none())
             {
                 self.trans_complete_flag.insert(trans_key.clone(), true);
             }
@@ -711,11 +709,15 @@ mod tests {
 
     #[test]
     fn test_trans_params_new() {
-        let params_args = Some(vec![Arg::String("client_ip,session_id".to_string())]);
+        let params_args = Some(vec![]);
         let named_args = vec![
+            (
+                "fields".to_string(),
+                Arg::String("client_ip,session_id".to_string()),
+            ),
             ("starts_with".to_string(), Arg::String("login".to_string())),
             (
-                "starts_if".to_string(),
+                "starts_if_field".to_string(),
                 Arg::String("is_start_event".to_string()),
             ),
             (
@@ -723,7 +725,7 @@ mod tests {
                 Arg::String("logout_\\d+".to_string()),
             ),
             (
-                "ends_if".to_string(),
+                "ends_if_field".to_string(),
                 Arg::String("is_end_event".to_string()),
             ),
             ("max_span".to_string(), Arg::String("10m".to_string())),
@@ -735,25 +737,18 @@ mod tests {
         assert_eq!(params.fields, vec!["client_ip", "session_id"]);
         assert_eq!(params.starts_with, Some("login".to_string()));
         assert!(params.starts_with_regex.is_none());
-        assert_eq!(params.starts_if, Some("is_start_event".to_string()));
+        assert_eq!(params.starts_if_field, Some("is_start_event".to_string()));
         assert_eq!(params.ends_with_regex.unwrap().as_str(), "logout_\\d+");
-        assert_eq!(params.ends_if, Some("is_end_event".to_string()));
+        assert_eq!(params.ends_if_field, Some("is_end_event".to_string()));
         assert_eq!(params.max_span, Duration::from_secs(600));
         assert_eq!(params.max_events, 500);
-
-        // Test with only positional 'fields' and no named arguments
-        let params_only_fields = Some(vec![Arg::String("user_id".to_string())]);
-        let no_named_args: Vec<(String, Arg)> = Vec::new();
-        let params_fields_only = TransParams::new(params_only_fields, no_named_args).unwrap();
-        assert_eq!(params_fields_only.fields, vec!["user_id"]);
-        assert_eq!(params_fields_only.max_events, 1000); // Default value
 
         // Test with no parameters (both scalar and named)
         let default_params = TransParams::new(None, Vec::new()).unwrap();
         assert_eq!(default_params.max_events, 1000);
         assert!(default_params.fields.is_empty());
-        assert!(default_params.starts_if.is_none());
-        assert!(default_params.ends_if.is_none());
+        assert!(default_params.starts_if_field.is_none());
+        assert!(default_params.ends_if_field.is_none());
 
         // Test error for invalid type for positional 'fields' parameter (e.g., Int instead of String)
         let err_scalar_type = Some(vec![Arg::Int(123)]);
@@ -901,8 +896,11 @@ mod tests {
 
     #[test]
     fn test_trans_pool_add_events_basic_scenario() {
-        let params =
-            TransParams::new(Some(vec![Arg::String("user_id".to_string())]), Vec::new()).unwrap();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![("fields".to_string(), Arg::String("user_id".to_string()))],
+        )
+        .unwrap();
         let mut pool = TransactionPool::new(params);
         let now = Utc::now();
 
@@ -971,8 +969,11 @@ mod tests {
 
         let mut pool_max_events = TransactionPool::new(
             TransParams::new(
-                Some(vec![Arg::String("user_id".to_string())]),
-                vec![("max_events".to_string(), Arg::Int(3))],
+                Some(vec![]),
+                vec![
+                    ("fields".to_string(), Arg::String("user_id".to_string())),
+                    ("max_events".to_string(), Arg::Int(3)),
+                ],
             )
             .unwrap(),
         );
@@ -1008,8 +1009,11 @@ mod tests {
     #[test]
     fn test_trans_pool_max_span_restriction() {
         let params = TransParams::new(
-            Some(vec![Arg::String("id".to_string())]),
-            vec![("max_span".to_string(), Arg::String("10s".to_string()))],
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("id".to_string())),
+                ("max_span".to_string(), Arg::String("10s".to_string())),
+            ],
         )
         .unwrap();
         let mut pool = TransactionPool::new(params);
@@ -1065,8 +1069,11 @@ mod tests {
     #[test]
     fn test_trans_pool_multi_value_fields() {
         let params = TransParams::new(
-            Some(vec![Arg::String("client_ip,status".to_string())]),
-            Vec::new(),
+            Some(vec![]),
+            vec![(
+                "fields".to_string(),
+                Arg::String("client_ip,status".to_string()),
+            )],
         )
         .unwrap();
         let mut pool = TransactionPool::new(params);
@@ -1119,15 +1126,19 @@ mod tests {
     }
 
     #[test]
-    fn test_trans_pool_starts_ends_if() {
+    fn test_trans_pool_starts_ends_if_field() {
         let params = TransParams::new(
-            Some(vec![Arg::String("session_id".to_string())]),
+            Some(vec![]),
             vec![
+                ("fields".to_string(), Arg::String("session_id".to_string())),
                 (
-                    "starts_if".to_string(),
+                    "starts_if_field".to_string(),
                     Arg::String("start_flag".to_string()),
                 ),
-                ("ends_if".to_string(), Arg::String("end_flag".to_string())),
+                (
+                    "ends_if_field".to_string(),
+                    Arg::String("end_flag".to_string()),
+                ),
             ],
         )
         .unwrap();
