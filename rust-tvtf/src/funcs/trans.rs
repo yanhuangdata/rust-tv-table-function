@@ -7,6 +7,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use chrono::{DateTime, TimeZone, Utc};
+use parking_lot::Mutex;
 use regex::Regex;
 use rust_tvtf_api::TableFunction;
 use rust_tvtf_api::arg::{Arg, Args};
@@ -602,6 +603,7 @@ impl TransactionPool {
 #[derive(Default)]
 pub struct TransFunction {
     trans_pool: Option<TransactionPool>,
+    mutex: parking_lot::Mutex<()>,
 }
 
 impl TransFunction {
@@ -609,12 +611,14 @@ impl TransFunction {
         let trans_params = TransParams::new(params, named_arguments)?;
         Ok(TransFunction {
             trans_pool: Some(TransactionPool::new(trans_params)),
+            mutex: Mutex::default(),
         })
     }
 }
 
 impl TableFunction for TransFunction {
     fn process(&mut self, input: RecordBatch) -> Result<Option<RecordBatch>> {
+        let _lock = self.mutex.lock();
         let trans_pool = self
             .trans_pool
             .as_mut()
@@ -661,6 +665,7 @@ impl TableFunction for TransFunction {
     }
 
     fn finalize(&mut self) -> Result<Option<RecordBatch>> {
+        let _lock = self.mutex.lock();
         let trans_pool = self
             .trans_pool
             .as_mut()

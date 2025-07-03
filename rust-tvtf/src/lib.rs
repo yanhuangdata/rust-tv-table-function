@@ -44,7 +44,8 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
                     .parameter((Some("ends_with"), ArgType::String, Some("")))
                     .parameter((Some("ends_with_regex"), ArgType::String, Some("")))
                     .parameter((Some("ends_if"), ArgType::String, Some("")))
-                    .parameter((Some("max_span"), ArgType::Int, Some(1000)))
+                    .parameter((Some("max_span"), ArgType::String, Some("")))
+                    .parameter((Some("max_events"), ArgType::Int, Some(1000)))
                     .build()
                     .context("Failed to build signature parameters")?,
             )
