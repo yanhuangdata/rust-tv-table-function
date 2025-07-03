@@ -1,6 +1,6 @@
 [package]
 name = "rust-tvtf-api"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 description = "Yanhuang Data Rust Table Function API"
 license = "Apache-2.0"
