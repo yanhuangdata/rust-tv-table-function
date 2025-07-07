@@ -34,7 +34,7 @@ const TRANS_RESERVED_FIELDS: [&str; 5] = [
     FIELD_IS_CLOSED,
 ];
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TransParams {
     pub fields: Vec<String>,
     pub starts_with: Option<String>,
@@ -45,6 +45,22 @@ pub struct TransParams {
     pub ends_if_field: Option<String>,
     pub max_span: Duration,
     pub max_events: u64,
+}
+
+impl Default for TransParams {
+    fn default() -> Self {
+        Self {
+            fields: Default::default(),
+            starts_with: Default::default(),
+            starts_with_regex: Default::default(),
+            starts_if_field: Default::default(),
+            ends_with: Default::default(),
+            ends_with_regex: Default::default(),
+            ends_if_field: Default::default(),
+            max_span: Default::default(),
+            max_events: 1000,
+        }
+    }
 }
 
 impl TransParams {
@@ -330,7 +346,10 @@ impl Transaction {
     }
 }
 
-fn to_record_batch(transactions: &[Transaction]) -> Result<Option<RecordBatch>> {
+fn to_record_batch(
+    params: &TransParams,
+    transactions: &[Transaction],
+) -> Result<Option<RecordBatch>> {
     if transactions.is_empty() {
         return Ok(None);
     }
@@ -363,11 +382,15 @@ fn to_record_batch(transactions: &[Transaction]) -> Result<Option<RecordBatch>> 
     ];
 
     for field_name in &sorted_field_names {
-        fields.push(Field::new(
-            field_name,
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-            false,
-        ));
+        if params.fields.contains(field_name) {
+            fields.push(Field::new(field_name, DataType::Utf8, true));
+        } else {
+            fields.push(Field::new(
+                field_name,
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                false,
+            ));
+        }
     }
 
     // Create arrays
@@ -407,16 +430,35 @@ fn to_record_batch(transactions: &[Transaction]) -> Result<Option<RecordBatch>> 
 
     // Dynamic field arrays
     for field_name in &sorted_field_names {
-        let mut field_builder = ListBuilder::new(StringBuilder::new());
-        for transaction in transactions {
-            if let Some(values) = transaction.fields.get(field_name) {
-                for value in values {
-                    field_builder.values().append_value(value);
+        if params.fields.contains(field_name) {
+            let mut field_builder = StringBuilder::new();
+            for transaction in transactions.iter() {
+                if let Some(values) = transaction.fields.get(field_name) {
+                    let mut values = values.clone();
+                    values.dedup();
+                    values.sort_unstable();
+                    let Some(value) = values.first() else {
+                        continue;
+                    };
+                    field_builder.append_value(value);
                 }
             }
-            field_builder.append(true);
+            arrays.push(Arc::new(field_builder.finish()));
+        } else {
+            let mut field_builder = ListBuilder::new(StringBuilder::new());
+            for transaction in transactions.iter() {
+                if let Some(values) = transaction.fields.get(field_name) {
+                    let mut values = values.clone();
+                    values.dedup();
+                    values.sort_unstable();
+                    for value in values {
+                        field_builder.values().append_value(value);
+                    }
+                }
+                field_builder.append(true);
+            }
+            arrays.push(Arc::new(field_builder.finish()));
         }
-        arrays.push(Arc::new(field_builder.finish()));
     }
 
     let schema = Arc::new(Schema::new(fields));
@@ -661,7 +703,8 @@ impl TableFunction for TransFunction {
             trans_pool.add_event(event)?;
         }
 
-        to_record_batch(&trans_pool.get_frozen_trans())
+        let frozen = trans_pool.get_frozen_trans();
+        to_record_batch(&trans_pool.params, &frozen)
     }
 
     fn finalize(&mut self) -> Result<Option<RecordBatch>> {
@@ -671,7 +714,8 @@ impl TableFunction for TransFunction {
             .as_mut()
             .context("TransPool not initialized")?;
 
-        to_record_batch(&trans_pool.get_live_trans())
+        let lives = trans_pool.get_live_trans();
+        to_record_batch(&trans_pool.params, &lives)
     }
 }
 
@@ -853,7 +897,9 @@ mod tests {
         trans.set_is_closed();
 
         let transactions = vec![trans];
-        let rb = to_record_batch(&transactions).unwrap().unwrap();
+        let rb = to_record_batch(&TransParams::default(), &transactions)
+            .unwrap()
+            .unwrap();
 
         // 8 columns: _time, _message, _duration, _event_count, _is_closed, source, status, user_id (sorted)
         assert_eq!(rb.num_columns(), 8);
