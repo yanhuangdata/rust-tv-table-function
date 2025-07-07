@@ -369,16 +369,16 @@ fn to_record_batch(
         Field::new(
             FIELD_TIME,
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-            false,
+            true,
         ),
         Field::new(
             FIELD_MESSAGE,
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-            false,
+            true,
         ),
         Field::new(FIELD_DURATION, DataType::Float64, true),
-        Field::new(FIELD_EVENT_COUNT, DataType::Int64, false),
-        Field::new(FIELD_IS_CLOSED, DataType::Boolean, false),
+        Field::new(FIELD_EVENT_COUNT, DataType::Int64, true),
+        Field::new(FIELD_IS_CLOSED, DataType::Boolean, true),
     ];
 
     for field_name in &sorted_field_names {
@@ -388,7 +388,7 @@ fn to_record_batch(
             fields.push(Field::new(
                 field_name,
                 DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                false,
+                true,
             ));
         }
     }
