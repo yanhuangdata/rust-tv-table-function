@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use arrow::array::{AsArray, ListBuilder, StringBuilder};
+use arrow::array::{ArrayRef, AsArray, ListBuilder, StringBuilder};
 use arrow::datatypes::{Float64Type, Int64Type, TimestampMicrosecondType};
 use arrow::{
     array::{Array, BooleanArray, Float64Array, Int64Array, TimestampMicrosecondArray},
@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use regex::Regex;
 use rust_tvtf_api::TableFunction;
 use rust_tvtf_api::arg::{Arg, Args};
+use smallvec::{SmallVec, smallvec};
 use std::sync::LazyLock;
 use std::{
     collections::{HashMap, VecDeque},
@@ -193,52 +194,51 @@ impl TransParams {
 
     fn check_boolean_field_condition(
         &self,
-        event: &HashMap<String, Option<String>>,
+        event: &HashMap<String, SmallVec<[String; 4]>>,
         field_name_opt: &Option<String>,
     ) -> bool {
         if let Some(field_name) = field_name_opt {
-            if let Some(Some(value)) = event.get(field_name) {
-                return value.eq_ignore_ascii_case("true");
+            if let Some(value) = event.get(field_name) {
+                return value.iter().all(|v| v.eq_ignore_ascii_case("true"));
             }
         }
         false
     }
 
-    fn matches_starts_with(&self, event: &HashMap<String, Option<String>>) -> bool {
-        let message = event
-            .get(FIELD_MESSAGE)
-            .and_then(Option::as_ref)
-            .map_or("", |s| s.as_str());
+    fn matches_starts_with(&self, event: &HashMap<String, SmallVec<[String; 4]>>) -> bool {
+        let Some(message) = event.get(FIELD_MESSAGE) else {
+            return false;
+        };
 
         if let Some(s) = &self.starts_with {
-            if message.contains(s) {
+            if message.iter().any(|v| v.contains(s)) {
                 return true;
             }
         }
         if let Some(r) = &self.starts_with_regex {
-            if r.is_match(message) {
+            if message.iter().any(|v| r.is_match(v)) {
                 return true;
             }
         }
+        // Check ends_if_field condition
         if self.check_boolean_field_condition(event, &self.starts_if_field) {
             return true;
         }
         false
     }
 
-    fn matches_ends_with(&self, event: &HashMap<String, Option<String>>) -> bool {
-        let message = event
-            .get(FIELD_MESSAGE)
-            .and_then(Option::as_ref)
-            .map_or("", |s| s.as_str());
+    fn matches_ends_with(&self, event: &HashMap<String, SmallVec<[String; 4]>>) -> bool {
+        let Some(message) = event.get(FIELD_MESSAGE) else {
+            return false;
+        };
 
         if let Some(s) = &self.ends_with {
-            if message.contains(s) {
+            if message.iter().any(|v| v.contains(s)) {
                 return true;
             }
         }
         if let Some(r) = &self.ends_with_regex {
-            if r.is_match(message) {
+            if message.iter().any(|v| r.is_match(v)) {
                 return true;
             }
         }
@@ -253,10 +253,10 @@ impl TransParams {
 #[derive(Debug)]
 struct Transaction {
     field_names: Vec<String>,
-    fields: HashMap<String, Vec<String>>,
+    fields: HashMap<String, SmallVec<[String; 4]>>,
     start_time: Option<DateTime<Utc>>,
     end_time: Option<DateTime<Utc>>,
-    messages: VecDeque<String>,
+    messages: VecDeque<SmallVec<[String; 4]>>,
     event_count: u64,
     is_closed: bool,
 }
@@ -274,36 +274,35 @@ impl Transaction {
         }
     }
 
-    fn merge_event(&mut self, event: &HashMap<String, Option<String>>) {
-        if let Some(Some(message)) = event.get(FIELD_MESSAGE) {
+    fn merge_event(&mut self, event: &HashMap<String, SmallVec<[String; 4]>>) {
+        if let Some(message) = event.get(FIELD_MESSAGE) {
+            if message.is_empty() {
+                return;
+            }
             self.messages.push_front(message.clone());
         }
 
-        for (k, v_opt) in event {
+        for (k, v) in event {
             if TRANS_RESERVED_FIELDS.contains(&k.as_str()) {
                 continue;
             }
-
-            if let Some(v) = v_opt {
-                if self.field_names.contains(k) {
-                    self.fields.insert(k.clone(), vec![v.clone()]);
-                } else {
-                    let entry = self.fields.entry(k.clone()).or_default();
-                    if !entry.contains(v) {
-                        entry.push(v.clone());
-                    }
-                }
+            if self.field_names.contains(k) {
+                self.fields.insert(k.clone(), v.clone());
+            } else {
+                let entry = self.fields.entry(k.clone()).or_default();
+                entry.extend(v.clone());
             }
         }
     }
 
-    fn add_event(&mut self, event: &HashMap<String, Option<String>>) -> Result<()> {
+    fn add_event(&mut self, event: &HashMap<String, SmallVec<[String; 4]>>) -> Result<()> {
         let time_str = event
             .get(FIELD_TIME)
-            .and_then(Option::as_ref)
             .context("Event missing _time field or _time is null")?;
 
         let time = time_str
+            .first()
+            .context("No _time in transaction")?
             .parse::<i64>()
             .map(|ts| Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now))
             .context("Failed to parse _time as timestamp")?;
@@ -409,8 +408,10 @@ fn to_record_batch(
     // Messages array
     let mut messages_builder = ListBuilder::new(StringBuilder::new());
     for transaction in transactions {
-        for message in transaction.messages.iter() {
-            messages_builder.values().append_value(message);
+        for messages in transaction.messages.iter() {
+            for message in messages {
+                messages_builder.values().append_value(message);
+            }
         }
         messages_builder.append(true);
     }
@@ -441,8 +442,8 @@ fn to_record_batch(
                     continue;
                 };
                 let mut values = values.clone();
-                values.dedup();
                 values.sort_unstable();
+                values.dedup();
                 let Some(value) = values.first() else {
                     field_builder.append_null();
                     continue;
@@ -458,8 +459,8 @@ fn to_record_batch(
                     continue;
                 };
                 let mut values = values.clone();
-                values.dedup();
                 values.sort_unstable();
+                values.dedup();
                 if values.is_empty() {
                     field_builder.append_null();
                     continue;
@@ -500,11 +501,11 @@ impl TransactionPool {
         }
     }
 
-    fn is_valid_event(&self, event: &HashMap<String, Option<String>>) -> bool {
+    fn is_valid_event(&self, event: &HashMap<String, SmallVec<[String; 4]>>) -> bool {
         let Some(time_str) = event.get(FIELD_TIME) else {
             return false;
         };
-        let Some(time_str_val) = time_str else {
+        let Some(time_str_val) = time_str.first() else {
             return false;
         };
 
@@ -520,7 +521,7 @@ impl TransactionPool {
                 .params
                 .fields
                 .iter()
-                .any(|f| event.get(f).is_some() && event.get(f).unwrap().is_some());
+                .any(|f| event.get(f).is_some() && !event.get(f).unwrap().is_empty());
             if !has_at_least_one_field {
                 return false;
             }
@@ -557,25 +558,27 @@ impl TransactionPool {
         }
     }
 
-    fn make_trans_key(&self, event: &HashMap<String, Option<String>>) -> TransKey {
+    fn make_trans_key(&self, event: &HashMap<String, SmallVec<[String; 4]>>) -> TransKey {
         self.params
             .fields
             .iter()
             .map(|f| {
                 event
                     .get(f)
-                    .and_then(|v_opt| v_opt.as_ref().map(|s| s.to_string()))
+                    .and_then(|v_opt| v_opt.first().as_ref().map(|s| s.to_string()))
             })
             .collect()
     }
 
-    fn add_event(&mut self, event: HashMap<String, Option<String>>) -> Result<()> {
+    fn add_event(&mut self, event: HashMap<String, SmallVec<[String; 4]>>) -> Result<()> {
         if !self.is_valid_event(&event) {
             return Ok(());
         }
 
-        let time_str = event.get(FIELD_TIME).and_then(Option::as_ref).unwrap();
+        let time_str = event.get(FIELD_TIME).unwrap();
         let time = time_str
+            .first()
+            .context("No _time field")?
             .parse::<i64>()
             .map(|ts| Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now))
             .context("Failed to parse _time as timestamp")?;
@@ -670,6 +673,55 @@ impl TransFunction {
     }
 }
 
+fn scalar_to_string(array: ArrayRef, row_idx: usize) -> Option<String> {
+    match array.data_type() {
+        DataType::Utf8 => Some(array.as_string::<i32>().value(row_idx).to_string()),
+        DataType::Int64 => Some(array.as_primitive::<Int64Type>().value(row_idx).to_string()),
+        DataType::Float64 => Some(
+            array
+                .as_primitive::<Float64Type>()
+                .value(row_idx)
+                .to_string(),
+        ),
+        DataType::Boolean => Some(array.as_boolean().value(row_idx).to_string()),
+        DataType::Timestamp(_, _) => Some(
+            array
+                .as_primitive::<TimestampMicrosecondType>()
+                .value(row_idx)
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn array_to_strings(array: ArrayRef, row_idx: usize) -> SmallVec<[String; 4]> {
+    match array.data_type() {
+        DataType::Utf8 => smallvec![scalar_to_string(array, row_idx).expect("utf8 must be scalar")],
+        DataType::Int64 => {
+            smallvec![scalar_to_string(array, row_idx).expect("int64 must be scalar")]
+        }
+        DataType::Float64 => {
+            smallvec![scalar_to_string(array, row_idx).expect("float64 must be scalar")]
+        }
+        DataType::Boolean => {
+            smallvec![scalar_to_string(array, row_idx).expect("boolean must be scalar")]
+        }
+        DataType::Timestamp(_, _) => {
+            smallvec![scalar_to_string(array, row_idx).expect("timestamp must be scalar")]
+        }
+        DataType::List(_inner_field) => {
+            let nested_list = array.as_list::<i32>().value(row_idx);
+            let mut small_vec: SmallVec<[String; 4]> = smallvec![];
+            for i in 0..nested_list.len() {
+                let inner = array_to_strings(Arc::clone(&nested_list), i);
+                small_vec.extend(inner);
+            }
+            small_vec
+        }
+        _ => smallvec![],
+    }
+}
+
 impl TableFunction for TransFunction {
     fn process(&mut self, input: RecordBatch) -> Result<Option<RecordBatch>> {
         let _lock = self.mutex.lock();
@@ -679,34 +731,18 @@ impl TableFunction for TransFunction {
             .context("TransPool not initialized")?;
 
         let schema = input.schema();
-        let mut events: Vec<HashMap<String, Option<String>>> = Vec::with_capacity(input.num_rows());
+        let mut events: Vec<HashMap<String, SmallVec<[String; 4]>>> =
+            Vec::with_capacity(input.num_rows());
 
         for row_idx in 0..input.num_rows() {
-            let mut event = HashMap::new();
+            let mut event: HashMap<String, SmallVec<[String; 4]>> = HashMap::new();
             for col_idx in 0..input.num_columns() {
                 let field = schema.field(col_idx);
-                let array = input.column(col_idx);
-                let value_str = if array.is_null(row_idx) {
-                    None
-                } else {
-                    Some(match array.data_type() {
-                        DataType::Utf8 => array.as_string::<i32>().value(row_idx).to_string(),
-                        DataType::Int64 => {
-                            array.as_primitive::<Int64Type>().value(row_idx).to_string()
-                        }
-                        DataType::Float64 => array
-                            .as_primitive::<Float64Type>()
-                            .value(row_idx)
-                            .to_string(),
-                        DataType::Boolean => array.as_boolean().value(row_idx).to_string(),
-                        DataType::Timestamp(_, _) => array
-                            .as_primitive::<TimestampMicrosecondType>()
-                            .value(row_idx)
-                            .to_string(),
-                        _ => continue,
-                    })
-                };
-                event.insert(field.name().clone(), value_str);
+                let array = Arc::clone(input.column(col_idx));
+                if array.is_null(row_idx) {
+                    continue;
+                }
+                event.insert(field.name().clone(), array_to_strings(array, row_idx));
             }
             events.push(event);
         }
@@ -746,12 +782,12 @@ mod tests {
         time_micros: i64,
         message: &str,
         other_fields: &[(&str, &str)],
-    ) -> HashMap<String, Option<String>> {
+    ) -> HashMap<String, SmallVec<[String; 4]>> {
         let mut event = HashMap::new();
-        event.insert(FIELD_TIME.to_string(), Some(time_micros.to_string()));
-        event.insert(FIELD_MESSAGE.to_string(), Some(message.to_string()));
+        event.insert(FIELD_TIME.to_string(), smallvec![time_micros.to_string()]);
+        event.insert(FIELD_MESSAGE.to_string(), smallvec![message.to_string()]);
         for (k, v) in other_fields {
-            event.insert(k.to_string(), Some(v.to_string()));
+            event.insert(k.to_string(), smallvec![v.to_string()]);
         }
         event
     }
@@ -867,13 +903,21 @@ mod tests {
 
         assert_eq!(trans.get_event_count(), 3);
         assert_eq!(trans.messages.len(), 3);
-        assert_eq!(trans.messages.front().unwrap(), "message three");
-        assert_eq!(trans.messages.back().unwrap(), "message one");
+        assert_eq!(
+            trans.messages.front().unwrap().first().unwrap(),
+            "message three"
+        );
+        assert_eq!(
+            trans.messages.back().unwrap().first().unwrap(),
+            "message one"
+        );
 
-        assert_eq!(trans.fields["user_id"], vec!["user1"]);
+        let expected: SmallVec<[&str; 4]> = smallvec!["user1"];
+        assert_eq!(trans.fields["user_id"], expected);
         assert!(trans.fields["status"].contains(&"success".to_string()));
         assert!(trans.fields["status"].contains(&"fail".to_string()));
-        assert_eq!(trans.fields["data"], vec!["abc"]);
+        let expected: SmallVec<[&str; 4]> = smallvec!["abc"];
+        assert_eq!(trans.fields["data"], expected);
 
         let expected_duration = ((now - ChronoDuration::seconds(10)).timestamp_micros()
             - (now - ChronoDuration::seconds(30)).timestamp_micros())
@@ -1260,7 +1304,13 @@ mod tests {
         assert_eq!(pool.live_trans.len(), 1);
         assert_eq!(pool.frozen_trans.len(), 5);
         assert_eq!(
-            pool.frozen_trans.last().unwrap().messages,
+            pool.frozen_trans
+                .last()
+                .unwrap()
+                .messages
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>(),
             vec!["event_C3", "event_C2"]
         );
     }

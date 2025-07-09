@@ -1043,6 +1043,7 @@ dependencies = [
  "rust-tvtf-api",
  "serde",
  "serde_json",
+ "smallvec",
  "tempfile",
  "zngur",
 ]
