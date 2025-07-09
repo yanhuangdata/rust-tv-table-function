@@ -325,10 +325,13 @@ impl Transaction {
     }
 
     fn get_duration(&self) -> Option<f64> {
-        if let (Some(start), Some(end)) = (self.start_time, self.end_time) {
-            Some((end - start).num_seconds() as f64)
+        let (Some(start), Some(end)) = (self.start_time, self.end_time) else {
+            return None;
+        };
+        if let Some(microsecond) = (end - start).num_microseconds() {
+            Some(microsecond as f64 / 1000000.0)
         } else {
-            None
+            Some((end - start).num_milliseconds() as f64 / 1000.0)
         }
     }
 
@@ -433,27 +436,36 @@ fn to_record_batch(
         if params.fields.contains(field_name) {
             let mut field_builder = StringBuilder::new();
             for transaction in transactions.iter() {
-                if let Some(values) = transaction.fields.get(field_name) {
-                    let mut values = values.clone();
-                    values.dedup();
-                    values.sort_unstable();
-                    let Some(value) = values.first() else {
-                        continue;
-                    };
-                    field_builder.append_value(value);
-                }
+                let Some(values) = transaction.fields.get(field_name) else {
+                    field_builder.append_null();
+                    continue;
+                };
+                let mut values = values.clone();
+                values.dedup();
+                values.sort_unstable();
+                let Some(value) = values.first() else {
+                    field_builder.append_null();
+                    continue;
+                };
+                field_builder.append_value(value);
             }
             arrays.push(Arc::new(field_builder.finish()));
         } else {
             let mut field_builder = ListBuilder::new(StringBuilder::new());
             for transaction in transactions.iter() {
-                if let Some(values) = transaction.fields.get(field_name) {
-                    let mut values = values.clone();
-                    values.dedup();
-                    values.sort_unstable();
-                    for value in values {
-                        field_builder.values().append_value(value);
-                    }
+                let Some(values) = transaction.fields.get(field_name) else {
+                    field_builder.append_null();
+                    continue;
+                };
+                let mut values = values.clone();
+                values.dedup();
+                values.sort_unstable();
+                if values.is_empty() {
+                    field_builder.append_null();
+                    continue;
+                }
+                for value in values {
+                    field_builder.values().append_value(value);
                 }
                 field_builder.append(true);
             }
