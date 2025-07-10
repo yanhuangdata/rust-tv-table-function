@@ -19,5 +19,5 @@ git = "https://github.com/yanhuangdata/zngur.git"
 rev = "841523fe905330c0cd9259e3d348e76b8ae080a0"
 
 [profile.release]
-debug = "full"
+debug = "line-tables-only"
 lto = "thin"
