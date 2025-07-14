@@ -246,3 +246,7 @@ pub unsafe fn finalize_raw(func: &mut Box<dyn TableFunction>) -> anyhow::Result<
     ])));
     Ok(Box::into_raw(boxed) as i64)
 }
+
+pub fn anyhow_error_to_string(error: &anyhow::Error) -> String {
+    format!("{:?}", error)
+}

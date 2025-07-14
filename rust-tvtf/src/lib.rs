@@ -50,6 +50,6 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
                     .context("Failed to build signature parameters")?,
             )
             .build()
-            .context("create `output_csv` registry failed")?,
+            .context("create `transaction` registry failed")?,
     ])
 }

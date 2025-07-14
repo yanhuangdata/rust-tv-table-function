@@ -20,6 +20,12 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
             .signature(Signature::empty())
             .signature(vec![ArgType::Int])
             .build()
-            .context("create `addtotals` registry failed")?,
+            .context("create `count_column` registry failed")?,
+        FunctionRegistry::builder()
+            .name("error_producer")
+            .init(Arc::new(|_ctx| Ok(Box::new(ErrorProducer {}))))
+            .signature(Signature::empty())
+            .build()
+            .context("create `error_producer` registry failed")?,
     ])
 }
