@@ -1,16 +1,18 @@
-use crate::TableFunction;
+use crate::{PathTrav, TableFunction, get_external_dir};
 use anyhow::{Context, anyhow};
 use arrow::{
     array::{StringArray, UInt64Array},
     csv::Writer,
     record_batch::RecordBatch,
 };
+use arrow_csv::WriterBuilder;
 use arrow_schema::{DataType, Field, Schema};
 use parking_lot::Mutex;
 use rust_tvtf_api::arg::{Arg, Args};
 use std::{
     fs::File,
     io::BufWriter,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -19,15 +21,16 @@ use std::{
 
 #[derive(Debug)]
 pub struct OutputCsv {
-    pub target_path: String,
+    pub target_path: PathBuf,
     pub tee: bool,
+    pub append: bool,
     writer: Mutex<Writer<BufWriter<File>>>,
     rows_written: AtomicU64,
 }
 
 impl OutputCsv {
-    pub fn new(params: Option<Args>) -> anyhow::Result<OutputCsv> {
-        let Some(params) = params else {
+    pub fn new(args: Option<Args>, named_args: Vec<(String, Arg)>) -> anyhow::Result<OutputCsv> {
+        let Some(params) = args else {
             return Err(anyhow::anyhow!(
                 "`output_csv` requires at least a `target_path` parameter."
             ));
@@ -47,32 +50,95 @@ impl OutputCsv {
             };
             Ok(target_path)
         };
-        // arg 1
-        let tee = || {
-            let tee = scalars.get(1).context("No `tee` parameter provided.")?;
-            let Arg::Bool(tee) = tee else {
-                return Err(anyhow::anyhow!("`tee` must be a bool."));
-            };
-            Ok(*tee)
-        };
-        let init = |tee: bool| {
-            let target_path = target_path()?;
-            let file = File::create(target_path)
-                .context(format!("Failed to create/open file at: {}", target_path))?;
-            Ok(OutputCsv {
-                target_path: target_path.clone(),
-                writer: Writer::new(BufWriter::new(file)).into(),
-                tee,
-                rows_written: 0.into(),
-            })
-        };
-        match scalars.len() {
-            1 => init(false),
-            2 => init(tee()?),
-            n => Err(anyhow!(
-                "Invalid arguments, there is no {n}-args constructor"
-            )),
+        let mut append = false;
+        let mut tee = false;
+        for (name, arg) in named_args {
+            match name.as_str() {
+                "append" => {
+                    let val = match arg {
+                        Arg::Bool(i) => i,
+                        _ => {
+                            return Err(anyhow!("Invalid type for {}. Expected boolean.", name));
+                        }
+                    };
+                    append = val;
+                }
+                "tee" => {
+                    let val = match arg {
+                        Arg::Bool(i) => i,
+                        _ => {
+                            return Err(anyhow!("Invalid type for {}. Expected boolean.", name));
+                        }
+                    };
+                    tee = val;
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "Invalid named parameter for trans table function: {}",
+                        name
+                    ));
+                }
+            }
         }
+
+        if scalars.len() != 1 {
+            return Err(anyhow!(
+                "Invalid arguments, there is no {}-args constructor",
+                scalars.len()
+            ));
+        }
+
+        let target_path = target_path()?;
+        let mut target_path = PathBuf::from(target_path);
+
+        if let Some(external_dir) = get_external_dir() {
+            if target_path.is_relative() {
+                target_path = external_dir.join(target_path);
+            }
+
+            if let Ok(false) = target_path.is_path_trav(&external_dir) {
+                return Err(anyhow!(
+                    "{} does not exist in {}",
+                    target_path.to_string_lossy(),
+                    external_dir.to_string_lossy()
+                ));
+            }
+        }
+
+        // Handle append vs create logic
+        let file = if append {
+            File::options()
+                .create(true)
+                .append(true)
+                .open(&target_path)
+                .context(format!(
+                    "Failed to create/open file in append mode at: {}",
+                    target_path.to_string_lossy()
+                ))?
+        } else {
+            File::create(&target_path).context(format!(
+                "Failed to create/open file at: {}",
+                target_path.to_string_lossy()
+            ))?
+        };
+
+        let should_write_headers = if append {
+            file.metadata().map(|meta| meta.len() == 0).unwrap_or(true) // Default to writing headers if we can't determine file size
+        } else {
+            true
+        };
+
+        let writer = WriterBuilder::new()
+            .with_header(should_write_headers)
+            .build(BufWriter::new(file));
+
+        Ok(OutputCsv {
+            target_path: target_path.to_path_buf(),
+            writer: writer.into(),
+            tee,
+            append,
+            rows_written: 0.into(),
+        })
     }
 }
 
@@ -102,7 +168,9 @@ impl TableFunction for OutputCsv {
             Field::new("rows_written", DataType::UInt64, false),
         ]));
 
-        let target_path_array = Arc::new(StringArray::from(vec![self.target_path.clone()]));
+        let target_path_array = Arc::new(StringArray::from(vec![
+            self.target_path.to_string_lossy().into_owned(),
+        ]));
         let status_array = Arc::new(StringArray::from(vec!["completed"]));
         let rows_written = self.rows_written.load(Ordering::Acquire);
         let rows_written_array = Arc::new(UInt64Array::from(vec![rows_written]));
@@ -125,7 +193,7 @@ mod tests {
         record_batch::RecordBatch,
     };
     use arrow_schema::{DataType, Field, Schema};
-    use std::{fs, sync::Arc};
+    use std::{fs, io::Write, sync::Arc};
     use tempfile::NamedTempFile;
 
     // Helper function to create a simple RecordBatch
@@ -150,7 +218,7 @@ mod tests {
         let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
         let path = temp_file.path().to_str().unwrap().to_string();
 
-        let mut output_csv = OutputCsv::new(Some(vec![Arg::String(path.clone())]))
+        let mut output_csv = OutputCsv::new(Some(vec![Arg::String(path.clone())]), vec![])
             .expect("Failed to create OutputCsv instance");
 
         let batch1 = create_sample_record_batch(2);
@@ -206,9 +274,101 @@ mod tests {
     }
 
     #[test]
+    fn test_output_csv_append_mode() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
+        let path = temp_file.path().to_str().unwrap().to_string();
+
+        // First, write some initial data
+        {
+            let mut output_csv = OutputCsv::new(Some(vec![Arg::String(path.clone())]), vec![])
+                .expect("Failed to create OutputCsv instance");
+
+            let batch = create_sample_record_batch(2);
+            output_csv.process(batch).expect("Processing failed");
+            output_csv.finalize().expect("Finalize failed");
+        }
+
+        // Now append more data
+        {
+            let mut output_csv = OutputCsv::new(
+                Some(vec![Arg::String(path.clone())]),
+                vec![("append".to_string(), Arg::Bool(true))],
+            )
+            .expect("Failed to create OutputCsv instance in append mode");
+
+            let batch = create_sample_record_batch(2);
+            output_csv.process(batch).expect("Processing failed");
+            let finalize_result = output_csv.finalize().expect("Finalize failed");
+
+            let status_batch = finalize_result.unwrap();
+            let rows_written = status_batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0);
+            assert_eq!(rows_written, 2); // Only the rows written in append mode
+        }
+
+        let file_content = fs::read_to_string(&path).expect("Failed to read CSV file");
+        // Should have headers once, then original data, then appended data
+        let expected_content = "id,name\n0,Name_0\n1,Name_1\n0,Name_0\n1,Name_1\n";
+        assert_eq!(file_content, expected_content);
+    }
+
+    #[test]
+    fn test_output_csv_append_to_empty_file() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
+        let path = temp_file.path().to_str().unwrap().to_string();
+
+        let mut output_csv = OutputCsv::new(
+            Some(vec![Arg::String(path.clone())]),
+            vec![("append".to_string(), Arg::Bool(true))],
+        )
+        .expect("Failed to create OutputCsv instance in append mode");
+
+        let batch = create_sample_record_batch(2);
+        output_csv.process(batch).expect("Processing failed");
+        output_csv.finalize().expect("Finalize failed");
+
+        let file_content = fs::read_to_string(&path).expect("Failed to read CSV file");
+        // Should include headers since file was empty
+        let expected_content = "id,name\n0,Name_0\n1,Name_1\n";
+        assert_eq!(file_content, expected_content);
+    }
+
+    #[test]
+    fn test_output_csv_append_to_existing_file_with_content() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
+        let path = temp_file.path().to_str().unwrap().to_string();
+
+        // Pre-populate the file with some CSV content
+        {
+            let mut file = File::create(&path).expect("Failed to create file");
+            writeln!(file, "id,name").expect("Failed to write header");
+            writeln!(file, "100,Existing_Name").expect("Failed to write data");
+        }
+
+        let mut output_csv = OutputCsv::new(
+            Some(vec![Arg::String(path.clone())]),
+            vec![("append".to_string(), Arg::Bool(true))],
+        )
+        .expect("Failed to create OutputCsv instance in append mode");
+
+        let batch = create_sample_record_batch(2);
+        output_csv.process(batch).expect("Processing failed");
+        output_csv.finalize().expect("Finalize failed");
+
+        let file_content = fs::read_to_string(&path).expect("Failed to read CSV file");
+        // Should not duplicate headers, just append data
+        let expected_content = "id,name\n100,Existing_Name\n0,Name_0\n1,Name_1\n";
+        assert_eq!(file_content, expected_content);
+    }
+
+    #[test]
     fn test_output_csv_new_invalid_path() {
         let invalid_path = "/nonexistent_dir/invalid/file.csv";
-        let result = OutputCsv::new(Some(vec![Arg::String(invalid_path.to_string())]));
+        let result = OutputCsv::new(Some(vec![Arg::String(invalid_path.to_string())]), vec![]);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -223,7 +383,7 @@ mod tests {
 
     #[test]
     fn test_output_csv_new_no_params() {
-        let result = OutputCsv::new(None);
+        let result = OutputCsv::new(None, vec![]);
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
@@ -234,7 +394,7 @@ mod tests {
     #[test]
     fn test_output_csv_new_incorrect_param_type() {
         let params = vec![Arg::Int(123)];
-        let result = OutputCsv::new(Some(params));
+        let result = OutputCsv::new(Some(params), vec![]);
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
@@ -247,7 +407,7 @@ mod tests {
         let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
         let path = temp_file.path().to_str().unwrap().to_string();
 
-        let mut output_csv = OutputCsv::new(Some(vec![Arg::String(path.clone())]))
+        let mut output_csv = OutputCsv::new(Some(vec![Arg::String(path.clone())]), vec![])
             .expect("Failed to create OutputCsv instance");
 
         let schema = Arc::new(Schema::new(vec![
@@ -285,7 +445,7 @@ mod tests {
         let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
         let path = temp_file.path().to_str().unwrap().to_string();
 
-        let mut output_csv = OutputCsv::new(Some(vec![Arg::String(path.clone())]))
+        let mut output_csv = OutputCsv::new(Some(vec![Arg::String(path.clone())]), vec![])
             .expect("Failed to create OutputCsv instance");
 
         {
