@@ -279,4 +279,51 @@ mod tests {
         let expected_content = "col_str,col_bool\napple,true\nbanana,false\n";
         assert_eq!(file_content, expected_content);
     }
+
+    #[test]
+    fn test_output_csv_different_schema_in_input() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
+        let path = temp_file.path().to_str().unwrap().to_string();
+
+        let mut output_csv = OutputCsv::new(Some(vec![Arg::String(path.clone())]))
+            .expect("Failed to create OutputCsv instance");
+
+        {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("col_str", DataType::Utf8, false),
+                Field::new("col_bool", DataType::Boolean, false),
+            ]));
+            let col_str = Arc::new(StringArray::from(vec!["apple", "banana"]))
+                as Arc<dyn arrow::array::Array>;
+            let col_bool = Arc::new(arrow::array::BooleanArray::from(vec![true, false]))
+                as Arc<dyn arrow::array::Array>;
+            let input_batch = RecordBatch::try_new(schema, vec![col_str, col_bool])
+                .expect("Failed to create record batch");
+
+            let result = output_csv.process(input_batch);
+            assert!(result.is_ok())
+        }
+        {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("col_int", DataType::Int32, false),
+                Field::new("col_bool", DataType::Boolean, false),
+                Field::new("col_str", DataType::Utf8, false),
+            ]));
+            let col_int = Arc::new(Int32Array::from(vec![1, 2])) as Arc<dyn arrow::array::Array>;
+            let col_bool = Arc::new(arrow::array::BooleanArray::from(vec![true, false]))
+                as Arc<dyn arrow::array::Array>;
+            let col_str = Arc::new(arrow::array::StringArray::from(vec!["Foo", "Bar"]))
+                as Arc<dyn arrow::array::Array>;
+            let input_batch = RecordBatch::try_new(schema, vec![col_int, col_bool, col_str])
+                .expect("Failed to create record batch");
+
+            let result = output_csv.process(input_batch);
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Encountered unequal lengths between records on CSV file.")
+            );
+        }
+    }
 }
