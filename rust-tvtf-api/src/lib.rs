@@ -248,5 +248,5 @@ pub unsafe fn finalize_raw(func: &mut Box<dyn TableFunction>) -> anyhow::Result<
 }
 
 pub fn anyhow_error_to_string(error: &anyhow::Error) -> String {
-    format!("{:?}", error)
+    format!("{error:?}")
 }

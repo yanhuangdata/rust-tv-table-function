@@ -97,7 +97,8 @@ impl Iterator for DynamicArrowArrayStreamReader {
             let result = unsafe {
                 from_ffi_and_data_type(array, DataType::Struct(self.schema().fields().clone()))
             };
-            let batch_with_schema_result = result.map(|data| {
+            let batch_with_schema_result = result.map(|mut data| {
+                data.align_buffers();
                 RecordBatch::from(StructArray::from(data)).with_schema(self.schema.clone())
             });
             match batch_with_schema_result {

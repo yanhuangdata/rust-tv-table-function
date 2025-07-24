@@ -3,9 +3,9 @@ resolver = "3"
 members = ["rust-tvtf-api", "rust-tvtf", "rust-tvtf-example"]
 
 [workspace.dependencies]
-arrow = { version = "=54.2.1", features = ["chrono-tz", "ffi"] }
-arrow-csv = "=54.2.1"
-arrow-schema = { version = "=54.2.1" }
+arrow = { version = "=55.2.0", features = ["chrono-tz", "ffi"] }
+arrow-csv = "=55.2.0"
+arrow-schema = { version = "=55.2.0" }
 anyhow = "1.0.98"
 derive_builder =  "0.20"
 serde = { version = "1.0.219", features = ["derive"] }
