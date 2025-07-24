@@ -304,7 +304,7 @@ mod tests {
         ]));
 
         let ids: Vec<Option<i32>> = (0..rows).map(|i| Some(i as i32)).collect();
-        let names: Vec<Option<String>> = (0..rows).map(|i| Some(format!("Name_{}", i))).collect();
+        let names: Vec<Option<String>> = (0..rows).map(|i| Some(format!("Name_{i}"))).collect();
 
         let id_array = Arc::new(Int32Array::from(ids)) as Arc<dyn arrow::array::Array>;
         let name_array = Arc::new(StringArray::from(names)) as Arc<dyn arrow::array::Array>;
@@ -656,7 +656,7 @@ mod tests {
         output_csv.finalize().expect("Finalize failed");
 
         let file_content = fs::read_to_string(&path).expect("Failed to read CSV file");
-        println!("File content:\n{}", file_content);
+        println!("File content:\n{file_content}");
 
         // Verify the CSV structure is maintained with proper empty field handling
         let lines: Vec<&str> = file_content.lines().collect();
@@ -726,7 +726,7 @@ mod tests {
         output_csv.finalize().expect("Finalize failed");
 
         let file_content = fs::read_to_string(&path).expect("Failed to read CSV file");
-        println!("Timestamp CSV content:\n{}", file_content);
+        println!("Timestamp CSV content:\n{file_content}");
 
         let lines: Vec<&str> = file_content.lines().collect();
         assert_eq!(lines.len(), 4); // header + 3 data rows
@@ -804,7 +804,7 @@ mod tests {
         output_csv.finalize().expect("Finalize failed");
 
         let file_content = fs::read_to_string(&path).expect("Failed to read CSV file");
-        println!("Timezone CSV content:\n{}", file_content);
+        println!("Timezone CSV content:\n{file_content}");
 
         let lines: Vec<&str> = file_content.lines().collect();
         assert_eq!(lines.len(), 3); // header + 2 data rows
@@ -885,7 +885,7 @@ mod tests {
         output_csv.finalize().expect("Finalize failed");
 
         let file_content = fs::read_to_string(&path).expect("Failed to read CSV file");
-        println!("Mixed timestamp CSV content:\n{}", file_content);
+        println!("Mixed timestamp CSV content:\n{file_content}");
 
         let lines: Vec<&str> = file_content.lines().collect();
         assert_eq!(lines.len(), 4); // header + 3 data rows

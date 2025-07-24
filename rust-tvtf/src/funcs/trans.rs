@@ -105,7 +105,7 @@ impl TransParams {
                         continue;
                     }
                     parsed_params.starts_with_regex =
-                        Some(Regex::new(&s).context(format!("Invalid regex for {}: {}", name, s))?);
+                        Some(Regex::new(&s).context(format!("Invalid regex for {name}: {s}"))?);
                 }
                 "starts_if_field" => {
                     let Arg::String(s) = arg else {
@@ -133,7 +133,7 @@ impl TransParams {
                         continue;
                     }
                     parsed_params.ends_with_regex =
-                        Some(Regex::new(&s).context(format!("Invalid regex for {}: {}", name, s))?);
+                        Some(Regex::new(&s).context(format!("Invalid regex for {name}: {s}"))?);
                 }
                 "ends_if_field" => {
                     let Arg::String(s) = arg else {
