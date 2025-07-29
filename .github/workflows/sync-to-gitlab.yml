@@ -1,0 +1,265 @@
+name: Sync Release to JihuLab
+
+on:
+  release:
+    types: [ published ]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: '要同步的 Release Tag (例如: v1.0.0)。留空则同步最新的 Release。'
+        required: false
+        default: ''
+      force_overwrite:
+        description: '如果极狐GitLab上已存在同名 Release，是否强制覆盖。'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  sync-to-jihulab:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine release information
+        id: release_info
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # --- 手动触发 ---
+            if [[ -n "${{ github.event.inputs.tag_name }}" ]]; then
+              TAG_NAME="${{ github.event.inputs.tag_name }}"
+              echo "Using specified tag from manual dispatch: $TAG_NAME"
+            else
+              echo "No tag specified, fetching the latest release from GitHub API..."
+              LATEST_RELEASE_DATA=$(curl -s -f -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                "https://api.github.com/repos/${{ github.repository }}/releases/latest")
+              if [ $? -ne 0 ]; then
+                echo "::error::Failed to fetch latest release from GitHub."
+                exit 1
+              fi
+              TAG_NAME=$(echo "$LATEST_RELEASE_DATA" | jq -r '.tag_name')
+              echo "Using latest release tag: $TAG_NAME"
+            fi
+            FORCE_OVERWRITE="${{ github.event.inputs.force_overwrite }}"
+          else
+            # --- Release 事件自动触发 ---
+            TAG_NAME="${{ github.event.release.tag_name }}"
+            FORCE_OVERWRITE="false" # 自动触发时，默认不覆盖
+            echo "Using tag from release event: $TAG_NAME"
+          fi
+          
+          # 将结果输出给后续步骤使用
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "force_overwrite=$FORCE_OVERWRITE" >> $GITHUB_OUTPUT
+          echo "Selected Tag: $TAG_NAME, Force Overwrite: $FORCE_OVERWRITE"
+
+      - name: Get GitHub release data
+        id: release_data
+        run: |
+          TAG_NAME="${{ steps.release_info.outputs.tag_name }}"
+          echo "Fetching release data for tag: $TAG_NAME"
+          
+          RELEASE_DATA=$(curl -s -f -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG_NAME")
+          
+          if [ $? -ne 0 ]; then
+            echo "::error::Release with tag '$TAG_NAME' not found on GitHub."
+            exit 1
+          fi
+          
+          # 提取 Release 名称, 描述和 assets 的下载链接
+          RELEASE_NAME=$(echo "$RELEASE_DATA" | jq -r '.name')
+          RELEASE_BODY=$(echo "$RELEASE_DATA" | jq -r '.body')
+          ASSET_URLS=$(echo "$RELEASE_DATA" | jq -r '.assets[].browser_download_url')
+          
+          # 正确处理多行字符串输出
+          # 使用特殊的分隔符来存储多行内容
+          {
+            echo "release_name=$RELEASE_NAME"
+            echo 'release_body<<EOF'
+            echo "$RELEASE_BODY"
+            echo 'EOF'
+            echo 'asset_urls<<EOF'
+            echo "$ASSET_URLS"
+            echo 'EOF'
+          } >> $GITHUB_OUTPUT
+          
+          echo "Release Name: $RELEASE_NAME"
+          echo "Assets to download:"
+          echo "$ASSET_URLS"
+
+      # 步骤 4: 下载所有 Release assets
+      - name: Download release assets
+        run: |
+          mkdir -p assets
+          echo "${{ steps.release_data.outputs.asset_urls }}" | while read url; do
+            if [[ -n "$url" ]]; then
+              filename=$(basename "$url")
+              echo "Downloading $filename..."
+              curl -L -o "assets/$filename" "$url"
+            fi
+          done
+          
+          echo "Downloaded files:"
+          ls -la assets/ || echo "No assets were downloaded."
+
+      # 步骤 5: 检查极狐GitLab上是否已存在该 Release
+      - name: Check if JihuLab release exists
+        id: check_jihulab_release
+        run: |
+          TAG_NAME="${{ steps.release_info.outputs.tag_name }}"
+          
+          echo "Checking if release $TAG_NAME exists in JihuLab..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "PRIVATE-TOKEN: ${{ secrets.JIHULAB_TOKEN }}" \
+            "https://jihulab.com/api/v4/projects/${{ secrets.JIHULAB_PROJECT_ID }}/releases/$TAG_NAME")
+          
+          echo "JihuLab API returned HTTP status: $HTTP_STATUS"
+          
+          if [[ "$HTTP_STATUS" == "200" ]]; then
+            echo "Release '$TAG_NAME' already exists in JihuLab."
+            if [[ "${{ steps.release_info.outputs.force_overwrite }}" == "true" ]]; then
+              echo "Force overwrite is enabled. The existing release will be deleted and recreated."
+              echo "should_run=true" >> $GITHUB_OUTPUT
+              echo "should_delete=true" >> $GITHUB_OUTPUT
+            else
+              echo "Skipping sync because the release already exists and force_overwrite is false."
+              echo "should_run=false" >> $GITHUB_OUTPUT
+              echo "should_delete=false" >> $GITHUB_OUTPUT
+            fi
+          elif [[ "$HTTP_STATUS" == "404" ]]; then
+            echo "Release '$TAG_NAME' does not exist in JihuLab. A new one will be created."
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "should_delete=false" >> $GITHUB_OUTPUT
+          else
+            echo "::error::Failed to check JihuLab release. API returned HTTP status $HTTP_STATUS."
+            exit 1
+          fi
+
+      # 步骤 6: 如果需要，删除已存在的极狐GitLab Release
+      - name: Delete existing JihuLab release
+        if: steps.check_jihulab_release.outputs.should_delete == 'true'
+        run: |
+          TAG_NAME="${{ steps.release_info.outputs.tag_name }}"
+          echo "Deleting existing release $TAG_NAME from JihuLab..."
+          
+          curl -X DELETE -f -s \
+            -H "PRIVATE-TOKEN: ${{ secrets.JIHULAB_TOKEN }}" \
+            "https://jihulab.com/api/v4/projects/${{ secrets.JIHULAB_PROJECT_ID }}/releases/$TAG_NAME"
+          
+          if [ $? -ne 0 ]; then
+              echo "::warning::Failed to delete existing release. This might cause the next step to fail if the tag is still locked."
+          else
+              echo "Existing release deleted successfully."
+          fi
+          echo "Waiting for 3 seconds for cleanup..."
+          sleep 3
+
+      # 步骤 7: 上传 Assets 并创建/更新 JihuLab Release
+      - name: Create JihuLab Release and Upload Assets
+        if: steps.check_jihulab_release.outputs.should_run == 'true'
+        run: |
+          TAG_NAME="${{ steps.release_info.outputs.tag_name }}"
+          RELEASE_NAME="${{ steps.release_data.outputs.release_name }}"
+          RELEASE_BODY="${{ steps.release_data.outputs.release_body }}"
+          
+          # --- 上传所有 assets 并收集链接信息 ---
+          echo "Uploading assets to JihuLab project..."
+          ASSET_LINKS_JSON=""
+          for file in assets/*; do
+            if [[ -f "$file" ]]; then
+              filename=$(basename "$file")
+              echo "Uploading: $filename"
+          
+              UPLOAD_RESPONSE=$(curl -X POST -f -s \
+                -H "PRIVATE-TOKEN: ${{ secrets.JIHULAB_TOKEN }}" \
+                -F "file=@$file" \
+                "https://jihulab.com/api/v4/projects/${{ secrets.JIHULAB_PROJECT_ID }}/uploads")
+          
+              if [ $? -ne 0 ]; then
+                  echo "::error::Failed to upload asset '$filename'."
+                  exit 1
+              fi
+          
+              echo "Upload response for $filename:"
+              echo "$UPLOAD_RESPONSE" | jq .
+          
+              # 从响应中提取信息并构建 assets.links 的 JSON 对象
+              FILE_URL=$(echo "$UPLOAD_RESPONSE" | jq -r '.url')
+              LINK_JSON=$(jq -n \
+                --arg name "$filename" \
+                --arg url "https://jihulab.com/${{ secrets.JIHULAB_PROJECT_PATH }}${FILE_URL}" \
+                '{name: $name, url: $url, link_type: "other"}')
+          
+              ASSET_LINKS_JSON="${ASSET_LINKS_JSON}${LINK_JSON},"
+            fi
+          done
+          
+          ASSET_LINKS_JSON="[${ASSET_LINKS_JSON%,}]"
+          echo "Constructed Asset Links JSON: $ASSET_LINKS_JSON"
+          
+          # --- 创建 Release 并附带 Assets ---
+          echo "Creating JihuLab release: $TAG_NAME"
+          
+          # 准备创建 Release 的 JSON payload
+          # 将 assets.links 直接包含在内
+          RELEASE_PAYLOAD=$(jq -n \
+            --arg tag "$TAG_NAME" \
+            --arg name "$RELEASE_NAME" \
+            --arg description "$RELEASE_BODY" \
+            --argjson assets_links "$ASSET_LINKS_JSON" \
+            '{
+              tag_name: $tag,
+              name: $name,
+              description: $description,
+              assets: {
+                links: $assets_links
+              }
+            }')
+          
+          echo "Release creation payload:"
+          echo "$RELEASE_PAYLOAD" | jq .
+          
+          # 发送创建 Release 的请求
+          CREATE_RESPONSE=$(curl -X POST -f -s \
+            -H "PRIVATE-TOKEN: ${{ secrets.JIHULAB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$RELEASE_PAYLOAD" \
+            "https://jihulab.com/api/v4/projects/${{ secrets.JIHULAB_PROJECT_ID }}/releases")
+          
+          if [ $? -ne 0 ]; then
+              echo "::error::Failed to create JihuLab release. The API call failed."
+              # 尝试输出 API 返回的错误信息
+              curl -X POST -s \
+                -H "PRIVATE-TOKEN: ${{ secrets.JIHULAB_TOKEN }}" \
+                -H "Content-Type: application/json" \
+                -d "$RELEASE_PAYLOAD" \
+                "https://jihulab.com/api/v4/projects/${{ secrets.JIHULAB_PROJECT_ID }}/releases" | jq .
+              exit 1
+          fi
+          
+          echo "✅ JihuLab release created successfully!"
+          echo "Response:"
+          echo "$CREATE_RESPONSE" | jq .
+
+      # 步骤 8: 输出总结信息
+      - name: Final Summary
+        if: always() # 无论成功失败都执行
+        run: |
+          echo "## 📋 Sync to JihuLab Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **GitHub Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release Tag**: ${{ steps.release_info.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered by**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ steps.check_jihulab_release.outputs.should_run }}" == "true" ]]; then
+            echo "- **Status**: ✅ **Success**" >> $GITHUB_STEP_SUMMARY
+            echo "- **JihuLab Release URL**: https://jihulab.com/${{ secrets.JIHULAB_PROJECT_PATH }}/-/releases/${{ steps.release_info.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ job.status }}" == "success" ]]; then
+            echo "- **Status**: ⏭️ **Skipped**" >> $GITHUB_STEP_SUMMARY
+            echo "- **Reason**: Release already exists in JihuLab and 'force_overwrite' was not enabled." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status**: ❌ **Failed**" >> $GITHUB_STEP_SUMMARY
+            echo "- **Reason**: The workflow encountered an error. Please check the logs above for details." >> $GITHUB_STEP_SUMMARY
+          fi
