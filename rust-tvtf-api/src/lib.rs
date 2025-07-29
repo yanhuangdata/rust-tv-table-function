@@ -87,13 +87,15 @@ pub fn create(
 type TableFunctionInitialize =
     Arc<dyn Fn(FunctionContext) -> anyhow::Result<Box<dyn TableFunction>>>;
 
-#[derive(Builder)]
+#[derive(Builder, Clone)]
 pub struct FunctionRegistry {
     #[builder(setter(into))]
     name: &'static str,
     init: TableFunctionInitialize,
     #[builder(setter(strip_option, each(name = "signature", into)))]
     signatures: Option<Vec<Signature>>,
+    #[builder(default = false)]
+    require_ordered: bool,
 }
 
 impl std::fmt::Debug for FunctionRegistry {
@@ -102,6 +104,7 @@ impl std::fmt::Debug for FunctionRegistry {
             .field("name", &self.name)
             .field("init", &Arc::as_ptr(&self.init))
             .field("signatures", &self.signatures)
+            .field("require_ordered", &self.require_ordered)
             .finish()
     }
 }
@@ -109,6 +112,10 @@ impl std::fmt::Debug for FunctionRegistry {
 impl FunctionRegistry {
     pub fn name(&self) -> &'static str {
         self.name
+    }
+
+    pub fn require_ordered(&self) -> bool {
+        self.require_ordered
     }
 
     pub fn signatures(&self) -> anyhow::Result<String> {

@@ -43,6 +43,8 @@ TEST_CASE("call rust") {
     auto sig = sig_result.unwrap(&api);
     auto sig_view = std::string_view{reinterpret_cast<const char *>(sig.as_str(&api).as_ptr(&api)),
                                      sig.as_str(&api).len(&api)};
+    auto require_ordered = registry.require_ordered(&api);
+    REQUIRE(require_ordered == false);
     REQUIRE(
         sig_view ==
         R"([{"parameters":[]},{"parameters":[{"name":null,"default":null,"arg_type":"INT"}]}])");

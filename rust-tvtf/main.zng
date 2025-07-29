@@ -99,9 +99,11 @@ type bool {
 
 mod rust_tvtf_api {
     type FunctionRegistry {
-        #layout(size = 56, align = 8);
+        #layout(size = 64, align = 8);
         fn name(&self) -> &str;
         fn signatures(&self) -> ::std::result::Result::<::std::string::String, ::anyhow::Error>;
+        fn require_ordered(&self) -> bool;
+        fn clone(&self) -> FunctionRegistry;
     }
 
     fn create_raw(&::rust_tvtf_api::FunctionRegistry, *const i8, *const i8, *const i8) -> ::std::result::Result::<Box<dyn ::rust_tvtf_api::TableFunction>, ::anyhow::Error>;
