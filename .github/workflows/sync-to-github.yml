@@ -1,0 +1,97 @@
+name: Sync Release to GitLab
+
+on:
+  release:
+    types: [ published ]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: '要同步的 Release Tag (例如: 0.2.13)。留空则同步最新的 Release。'
+        required: false
+        default: ''
+
+jobs:
+  sync-to-jihulab:
+    runs-on: ubuntu-latest
+    env:
+      GITLAB_PROJECT_ID: ${{ secrets.GITLAB_PROJECT_ID }}
+      GITLAB_PRIVATE_TOKEN: ${{ secrets.GITLAB_PRIVATE_TOKEN }}
+      GITLAB_API_URL: "https://gitlab.com/api/v4"
+      GITLAB_PACKAGE_NAME: "librust_tvtf"
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine Release Information
+        id: release_info
+        run: |
+          TAG_NAME=""
+          FORCE_OVERWRITE="false"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "Workflow triggered manually."
+            FORCE_OVERWRITE="${{ github.event.inputs.force_overwrite }}"
+            if [[ -n "${{ github.event.inputs.tag_name }}" ]]; then
+              TAG_NAME="${{ github.event.inputs.tag_name }}"
+              echo "Using specified tag from input: $TAG_NAME"
+            else
+              echo "No tag specified, fetching the latest release from GitHub..."
+              TAG_NAME=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+              if [[ -z "$TAG_NAME" ]]; then
+                echo "::error::Failed to fetch the latest release tag."
+                exit 1
+              fi
+              echo "Using latest release tag: $TAG_NAME"
+            fi
+          else
+            echo "Workflow triggered by a new release publish event."
+            TAG_NAME="${{ github.event.release.tag_name }}"
+            echo "Using tag from release event: $TAG_NAME"
+          fi
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "force_overwrite=$FORCE_OVERWRITE" >> $GITHUB_OUTPUT
+          echo "Final Decision -> Tag: $TAG_NAME, Force Overwrite: $FORCE_OVERWRITE"
+      - name: Sync Release to JihuLab
+        run: |
+          TAG_NAME="${{ steps.release_info.outputs.tag_name }}"
+          FORCE_OVERWRITE="${{ steps.release_info.outputs.force_overwrite }}"
+          GITLAB_RELEASES_URL="${GITLAB_API_URL}/projects/${GITLAB_PROJECT_ID}/releases/${TAG_NAME}"
+          
+          # 检查极狐GitLab上是否已存在同名Release
+          echo "Checking for existing release with tag '$TAG_NAME' on JihuLab..."
+          http_status=$(curl -s -o /dev/null -w "%{http_code}" --head --header "PRIVATE-TOKEN: ${GITLAB_PRIVATE_TOKEN}" "${GITLAB_RELEASES_URL}")
+          if [[ "$http_status" -eq 200 ]]; then
+            echo "Release '$TAG_NAME' already exists on JihuLab."
+          elif [[ "$http_status" -eq 404 ]]; then
+            echo "No existing release found on JihuLab. Proceeding with sync."
+          else
+            echo "::error::Failed to check JihuLab release. HTTP status: $http_status"
+            exit 1
+          fi
+
+          # 获取 GitHub Release 的详细信息 (附件列表和描述)
+          echo "Fetching details for GitHub release '$TAG_NAME'..."
+          GH_RELEASE_DATA=$(gh release view "$TAG_NAME" --json assets,body)
+          RELEASE_BODY=$(echo "$GH_RELEASE_DATA" | jq -r .body)
+          ASSETS_JSON=$(echo "$GH_RELEASE_DATA" | jq -c '.assets[]')
+          mkdir -p assets
+          echo "Downloading assets from GitHub releases"
+          gh release download "$TAG_NAME" -p '*' --dir ./assets
+          
+          ASSETS_LINKS_DATA="{}"
+          
+          find "./assets" -type f -print0 | while IFS= read -r -d $'\0' ASSET_PATH; do
+          
+            # Construct the JihuLab Package Asset URL
+            # This URL points to where the asset will be stored in the generic package registry
+            GITLAB_PACKAGE_ASSET_URL="${GITLAB_API_URL}/projects/${GITLAB_PROJECT_ID}/packages/generic/${GITLAB_PACKAGE_NAME}/${TAG_NAME}/${ASSET_NAME}"
+            
+            echo "Uploading asset: $ASSET_PATH"
+            echo "Target URL: $GITLAB_PACKAGE_ASSET_URL"
+            UPLOAD_RESPONSE=$(curl --fail -s --header "PRIVATE-TOKEN: ${GITLAB_PRIVATE_TOKEN}" \
+              --upload-file "$ASSET_PATH" \
+              "${GITLAB_PACKAGE_ASSET_URL}")
+            echo "Upload Response: $UPLOAD_RESPONSE"
+            echo "Successfully uploaded: $ASSET_PATH"
+          done
