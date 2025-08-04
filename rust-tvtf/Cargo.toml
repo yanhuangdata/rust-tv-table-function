@@ -7,6 +7,8 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
+rust-tvtf-api = { path = "../rust-tvtf-api" }
+
 arrow = { workspace = true }
 arrow-csv = { workspace = true }
 arrow-schema = { workspace = true }
@@ -14,10 +16,10 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
-rust-tvtf-api = { path = "../rust-tvtf-api" }
-chrono = "0.4.39"
-regex = "1.11.1"
-smallvec = "1.15.1"
+chrono = { workspace = true }
+regex = { workspace = true }
+smallvec = { workspace = true }
+hashbrown = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

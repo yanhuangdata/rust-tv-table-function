@@ -7,17 +7,14 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use chrono::{DateTime, TimeZone, Utc};
+use hashbrown::HashMap;
 use parking_lot::Mutex;
 use regex::Regex;
 use rust_tvtf_api::TableFunction;
 use rust_tvtf_api::arg::{Arg, Args};
 use smallvec::{SmallVec, smallvec};
 use std::sync::LazyLock;
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 // Reserved field names for transaction events and raw events
 const FIELD_TIME: &str = "_time";
@@ -37,7 +34,7 @@ const TRANS_RESERVED_FIELDS: [&str; 5] = [
 
 #[derive(Debug, Clone)]
 pub struct TransParams {
-    pub fields: Vec<String>,
+    pub fields: SmallVec<[String; 4]>,
     pub allow_nulls: bool,
     pub starts_with: Option<String>,
     pub starts_with_regex: Option<Regex>,
@@ -254,7 +251,7 @@ impl TransParams {
 
 #[derive(Debug, Clone)]
 struct Transaction {
-    field_names: Vec<String>,
+    field_names: SmallVec<[String; 4]>,
     fields: HashMap<String, SmallVec<[String; 4]>>,
     start_time: Option<DateTime<Utc>>,
     end_time: Option<DateTime<Utc>>,
@@ -264,7 +261,7 @@ struct Transaction {
 }
 
 impl Transaction {
-    fn new(field_names: Vec<String>) -> Self {
+    fn new(field_names: SmallVec<[String; 4]>) -> Self {
         Transaction {
             field_names,
             fields: HashMap::new(),
@@ -482,7 +479,7 @@ fn to_record_batch(
     ))
 }
 
-type TransKey = Vec<Option<String>>;
+type TransKey = SmallVec<[Option<String>; 4]>;
 
 #[derive(Clone, Debug)]
 struct TransactionPool {
@@ -674,7 +671,7 @@ impl TransactionPool {
 #[derive(Default)]
 pub struct TransFunction {
     trans_pool: Option<TransactionPool>,
-    mutex: parking_lot::Mutex<()>,
+    mutex: Mutex<()>,
 }
 
 impl TransFunction {
@@ -864,7 +861,7 @@ mod tests {
 
         let params = TransParams::new(params_args, named_args).unwrap();
 
-        assert_eq!(params.fields, vec!["client_ip", "session_id"]);
+        assert_eq!(params.fields.to_vec(), vec!["client_ip", "session_id"]);
         assert_eq!(params.starts_with, Some("login".to_string()));
         assert!(params.starts_with_regex.is_none());
         assert_eq!(params.starts_if_field, Some("is_start_event".to_string()));
@@ -910,7 +907,7 @@ mod tests {
 
     #[test]
     fn test_transaction_add_event_and_merge() {
-        let mut trans = Transaction::new(vec!["user_id".to_string()]);
+        let mut trans = Transaction::new(smallvec!["user_id".to_string()]);
         let now = Utc::now();
 
         let event1 = create_event(
@@ -963,7 +960,7 @@ mod tests {
 
     #[test]
     fn test_transaction_to_record_batch() {
-        let mut trans = Transaction::new(vec!["user_id".to_string()]);
+        let mut trans = Transaction::new(smallvec!["user_id".to_string()]);
         let now = Utc::now();
         let event1_time = now - ChronoDuration::seconds(20);
         let event2_time = now - ChronoDuration::seconds(10);
@@ -1094,14 +1091,14 @@ mod tests {
         assert_eq!(pool.frozen_trans.len(), 0);
         assert_eq!(
             pool.live_trans
-                .get(&vec![Some("user1".to_string())])
+                .get(&smallvec![Some("user1".to_string())])
                 .unwrap()
                 .get_event_count(),
             3
         );
         assert_eq!(
             pool.live_trans
-                .get(&vec![Some("user2".to_string())])
+                .get(&smallvec![Some("user2".to_string())])
                 .unwrap()
                 .get_event_count(),
             1
@@ -1227,7 +1224,7 @@ mod tests {
         );
         pool.add_event(event1).unwrap();
         assert_eq!(pool.live_trans.len(), 1);
-        let key1 = vec![Some("1.1.1.1".to_string()), Some("200".to_string())];
+        let key1 = smallvec![Some("1.1.1.1".to_string()), Some("200".to_string())];
         assert!(pool.live_trans.contains_key(&key1));
 
         // Event 2 (same client_ip, different status) -> new transaction
@@ -1238,7 +1235,7 @@ mod tests {
         );
         pool.add_event(event2).unwrap();
         assert_eq!(pool.live_trans.len(), 2); // Two live transactions
-        let key2 = vec![Some("1.1.1.1".to_string()), Some("404".to_string())];
+        let key2 = smallvec![Some("1.1.1.1".to_string()), Some("404".to_string())];
         assert!(pool.live_trans.contains_key(&key2));
         assert_eq!(pool.live_trans.get(&key1).unwrap().get_event_count(), 1);
         assert_eq!(pool.live_trans.get(&key2).unwrap().get_event_count(), 1);
@@ -1251,7 +1248,7 @@ mod tests {
         );
         pool.add_event(event3).unwrap();
         assert_eq!(pool.live_trans.len(), 3); // Three live transactions
-        let key3 = vec![Some("2.2.2.2".to_string()), Some("200".to_string())];
+        let key3 = smallvec![Some("2.2.2.2".to_string()), Some("200".to_string())];
         assert!(pool.live_trans.contains_key(&key3));
 
         // Event 4 (same as Event 1 key) -> merges with key1 transaction

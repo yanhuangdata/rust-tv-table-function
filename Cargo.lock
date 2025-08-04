@@ -972,6 +972,7 @@ dependencies = [
  "arrow-csv",
  "arrow-schema",
  "chrono",
+ "hashbrown",
  "parking_lot",
  "regex",
  "rust-tvtf-api",
