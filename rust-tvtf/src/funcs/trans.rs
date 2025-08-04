@@ -35,9 +35,10 @@ const TRANS_RESERVED_FIELDS: [&str; 5] = [
     FIELD_IS_CLOSED,
 ];
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TransParams {
     pub fields: Vec<String>,
+    pub allow_nulls: bool,
     pub starts_with: Option<String>,
     pub starts_with_regex: Option<Regex>,
     pub starts_if_field: Option<String>,
@@ -60,6 +61,7 @@ impl Default for TransParams {
             ends_if_field: Default::default(),
             max_span: Default::default(),
             max_events: 1000,
+            allow_nulls: false,
         }
     }
 }
@@ -250,7 +252,7 @@ impl TransParams {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Transaction {
     field_names: Vec<String>,
     fields: HashMap<String, SmallVec<[String; 4]>>,
@@ -482,6 +484,7 @@ fn to_record_batch(
 
 type TransKey = Vec<Option<String>>;
 
+#[derive(Clone, Debug)]
 struct TransactionPool {
     params: TransParams,
     frozen_trans: Vec<Transaction>,
@@ -516,13 +519,24 @@ impl TransactionPool {
             return false;
         };
 
-        if !self.params.fields.is_empty() {
+        if !self.params.fields.is_empty() && self.params.allow_nulls {
             let has_at_least_one_field = self
                 .params
                 .fields
                 .iter()
-                .any(|f| event.get(f).is_some() && !event.get(f).unwrap().is_empty());
+                .any(|f| event.get(f).is_some_and(|v| !v.is_empty()));
             if !has_at_least_one_field {
+                return false;
+            }
+        }
+
+        if !self.params.fields.is_empty() && !self.params.allow_nulls {
+            let has_all_fields = self
+                .params
+                .fields
+                .iter()
+                .all(|f| event.get(f).is_some_and(|v| !v.is_empty()));
+            if !has_all_fields {
                 return false;
             }
         }
@@ -788,6 +802,24 @@ mod tests {
         event.insert(FIELD_MESSAGE.to_string(), smallvec![message.to_string()]);
         for (k, v) in other_fields {
             event.insert(k.to_string(), smallvec![v.to_string()]);
+        }
+        event
+    }
+
+    fn create_event_nullable(
+        time_micros: i64,
+        message: &str,
+        other_fields: &[(&str, Option<&str>)],
+    ) -> HashMap<String, SmallVec<[String; 4]>> {
+        let mut event = HashMap::new();
+        event.insert(FIELD_TIME.to_string(), smallvec![time_micros.to_string()]);
+        event.insert(FIELD_MESSAGE.to_string(), smallvec![message.to_string()]);
+        for (k, v) in other_fields {
+            if let Some(v) = *v {
+                event.insert(k.to_string(), smallvec![v.to_string()]);
+            } else {
+                event.insert(k.to_string(), smallvec![]);
+            }
         }
         event
     }
@@ -1313,5 +1345,54 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["event_C3", "event_C2"]
         );
+    }
+
+    #[test]
+    fn test_trans_pool_do_not_allow_nulls() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![(
+                "fields".to_string(),
+                Arg::String("session_id,host".to_string()),
+            )],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        let now = Utc::now();
+
+        let events = vec![
+            create_event_nullable(
+                now.timestamp_micros(),
+                "a",
+                &[("session_id", Some("A")), ("host", None)],
+            ),
+            create_event(
+                now.timestamp_micros(),
+                "b",
+                &[("session_id", "A"), ("host", "localhost")],
+            ),
+            create_event(
+                now.timestamp_micros(),
+                "c",
+                &[("session_id", "B"), ("host", "localhost")],
+            ),
+            create_event(
+                now.timestamp_micros(),
+                "d",
+                &[("session_id", "B"), ("host", "localhost")],
+            ),
+        ];
+
+        for ev in events {
+            pool.add_event(ev).unwrap();
+        }
+
+        let mut events = pool
+            .live_trans
+            .iter()
+            .flat_map(|i| i.1.messages.iter().flatten())
+            .collect::<Vec<_>>();
+        events.sort_unstable();
+        assert_eq!(events, vec!["b", "c", "d"]);
     }
 }
