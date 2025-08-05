@@ -12,7 +12,7 @@ use rust_tvtf_api::arg::{Arg, Args};
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::{BufRead, BufReader, BufWriter},
+    io::{BufRead, BufReader, BufWriter, Read, Seek, Write},
     path::PathBuf,
     sync::{
         Arc,
@@ -45,11 +45,8 @@ impl OutputCsv {
             return Ok(None); // Empty file
         }
 
-        let headers: Vec<String> = first_line
-            .trim()
-            .split(',')
-            .map(|h| h.trim().to_string())
-            .collect();
+        let mut reader = csv::Reader::from_reader(first_line.as_bytes());
+        let headers = reader.headers().context("Failed to parse headers")?;
 
         if headers.is_empty() {
             return Ok(None);
@@ -58,7 +55,7 @@ impl OutputCsv {
             .into_iter()
             .map(|name| {
                 let data_type = actual_first_schema
-                    .field_with_name(&name)
+                    .field_with_name(name)
                     .map(|x| x.data_type())
                     .unwrap_or(&DataType::Utf8);
                 Field::new(name, data_type.clone(), true)
@@ -181,10 +178,11 @@ impl OutputCsv {
         }
 
         // Handle append vs create logic
-        let file = if append {
+        let mut file = if append {
             File::options()
                 .create(true)
                 .append(true)
+                .read(true)
                 .open(&target_path)
                 .context(format!(
                     "Failed to create/open file in append mode at: {}",
@@ -197,11 +195,22 @@ impl OutputCsv {
             ))?
         };
 
-        let should_write_headers = if append {
-            file.metadata().map(|meta| meta.len() == 0).unwrap_or(true) // Default to writing headers if we can't determine file size
-        } else {
-            true
-        };
+        let empty_file = file.metadata().map(|meta| meta.len() == 0).unwrap_or(true);
+        if append && !empty_file {
+            file.seek(std::io::SeekFrom::End(-1))
+                .context("Failed to seek last byte")?;
+            let mut buf = [0u8; 1];
+            file.read_exact(&mut buf)
+                .context("Failed to read last byte")?;
+            if buf[0] != b'\n' {
+                file.write_all(b"\n")
+                    .context("failed to insert last new line")?;
+            }
+            file.seek(std::io::SeekFrom::Start(0))
+                .context("Failed to seek first byte")?;
+        }
+
+        let should_write_headers = if append { empty_file } else { true };
 
         let writer = WriterBuilder::new()
             .with_header(should_write_headers)

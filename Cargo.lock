@@ -972,6 +972,7 @@ dependencies = [
  "arrow-csv",
  "arrow-schema",
  "chrono",
+ "csv",
  "hashbrown",
  "parking_lot",
  "regex",
