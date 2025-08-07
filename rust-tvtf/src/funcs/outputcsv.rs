@@ -239,7 +239,6 @@ impl TableFunction for OutputCsv {
         } else if self.append && !self.should_write_headers {
             let parsed = Self::parse_existing_header(&self.target_path, &input.schema())?
                 .context("Failed to parse header")?;
-            dbg!(&parsed);
             *expected_schema_guard = Some(parsed.clone());
             parsed
         } else {
