@@ -168,7 +168,7 @@ impl TableFunction for Flatten {
                         }
                     }
                 }
-                let flattened_array = build_array_from_slices(flattened_values, &inner_type)?;
+                let flattened_array = build_array_from_slices(flattened_values, inner_type)?;
                 new_columns.push(flattened_array);
             } else {
                 let mut indices = Vec::with_capacity(total_rows);
