@@ -1,0 +1,498 @@
+use std::sync::Arc;
+
+use anyhow::Context;
+use arrow::{
+    array::{Array, ArrayRef, AsArray, RecordBatch},
+    compute::take,
+};
+use arrow_schema::{DataType, Field, Schema};
+
+use crate::TableFunction;
+use rust_tvtf_api::arg::{Arg, Args};
+
+#[derive(Debug)]
+pub struct Flatten {
+    column_names: Vec<String>,
+}
+
+impl Flatten {
+    pub fn new(params: Option<Args>) -> anyhow::Result<Flatten> {
+        let Some(params) = params else {
+            return Err(anyhow::anyhow!("Column names parameter is required"));
+        };
+
+        let scalars = params
+            .into_iter()
+            .filter(|p| p.is_scalar())
+            .collect::<Vec<_>>();
+
+        if scalars.is_empty() {
+            return Err(anyhow::anyhow!("At least one column name must be provided"));
+        }
+
+        let arg0 = scalars
+            .first()
+            .context("No column names parameter provided")?;
+
+        let Arg::String(column_names_str) = arg0 else {
+            return Err(anyhow::anyhow!("Column names must be a string"));
+        };
+
+        // Parse comma-separated column names
+        let column_names: Vec<String> = column_names_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if column_names.is_empty() {
+            return Err(anyhow::anyhow!("At least one column name must be provided"));
+        }
+
+        Ok(Flatten { column_names })
+    }
+}
+
+impl TableFunction for Flatten {
+    fn process(&mut self, input: RecordBatch) -> anyhow::Result<Option<RecordBatch>> {
+        // Find the columns to flatten
+        let schema = input.schema();
+        let mut list_columns_info: Vec<(usize, Arc<dyn Array>)> = Vec::new();
+
+        for column_name in &self.column_names {
+            let Some((column_index, field)) = schema.column_with_name(column_name) else {
+                return Err(anyhow::anyhow!("Column '{}' not found", column_name));
+            };
+
+            if !matches!(field.data_type(), DataType::List(_)) {
+                return Err(anyhow::anyhow!(
+                    "Column '{}' is not a list type, got {:?}",
+                    column_name,
+                    field.data_type()
+                ));
+            }
+            list_columns_info.push((column_index, Arc::clone(input.column(column_index))));
+        }
+
+        if list_columns_info.is_empty() {
+            return Ok(Some(input));
+        }
+
+        let mut list_lengths: Vec<Vec<usize>> = Vec::new();
+        for (_, column) in &list_columns_info {
+            let list_array = column
+                .as_list_opt::<i32>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast column to a ListArray"))?;
+
+            let lengths = (0..list_array.len())
+                .map(|i| {
+                    if list_array.is_valid(i) {
+                        list_array.value(i).len()
+                    } else {
+                        1
+                    }
+                }) // Treat null list as a single null element
+                .collect();
+            list_lengths.push(lengths);
+        }
+
+        // Calculate the product of list lengths for each row (size of Cartesian product per row)
+        let row_products: Vec<usize> = (0..input.num_rows())
+            .map(|row_idx| {
+                list_lengths
+                    .iter()
+                    .map(|lengths| lengths[row_idx].max(1))
+                    .product() // Use max(1) to handle empty lists correctly
+            })
+            .collect();
+
+        let total_rows: usize = row_products.iter().sum();
+
+        if total_rows == 0 {
+            return Ok(Some(RecordBatch::new_empty(schema)));
+        }
+
+        let mut new_columns: Vec<ArrayRef> = Vec::new();
+        for (col_idx, field) in schema.fields().iter().enumerate() {
+            let column = input.column(col_idx);
+
+            if let Some(list_col_pos) = list_columns_info
+                .iter()
+                .position(|(idx, _)| *idx == col_idx)
+            {
+                let inner_type = match field.data_type() {
+                    DataType::List(inner_field) | DataType::LargeList(inner_field) => {
+                        inner_field.data_type()
+                    }
+                    _ => unreachable!(),
+                };
+
+                let mut flattened_values = Vec::new();
+
+                let list_array = column.as_list_opt::<i32>().unwrap();
+
+                for row_idx in 0..input.num_rows() {
+                    if row_products[row_idx] == 0 {
+                        continue;
+                    }
+
+                    let list_values = list_array.value(row_idx);
+
+                    let outer_repeat = list_lengths[..list_col_pos]
+                        .iter()
+                        .map(|lens| lens[row_idx].max(1))
+                        .product::<usize>();
+
+                    let inner_repeat = list_lengths[list_col_pos + 1..]
+                        .iter()
+                        .map(|lens| lens[row_idx].max(1))
+                        .product::<usize>();
+
+                    if list_array.is_null(row_idx) {
+                        for _ in 0..row_products[row_idx] {
+                            flattened_values.push(None);
+                        }
+                    } else {
+                        // Apply the Cartesian product pattern
+                        for _ in 0..outer_repeat {
+                            for elem_idx in 0..list_values.len() {
+                                for _ in 0..inner_repeat {
+                                    if list_values.is_null(elem_idx) {
+                                        flattened_values.push(None);
+                                    } else {
+                                        // This is a generic way to append a value from one array to a builder
+                                        flattened_values.push(Some(list_values.slice(elem_idx, 1)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let flattened_array = build_array_from_slices(flattened_values, &inner_type)?;
+                new_columns.push(flattened_array);
+            } else {
+                let mut indices = Vec::with_capacity(total_rows);
+                for (row_idx, &product) in row_products.iter().enumerate() {
+                    indices.resize(indices.len() + product, row_idx as u32);
+                }
+                let indices_array = arrow::array::UInt32Array::from(indices);
+                let repeated_column = take(column.as_ref(), &indices_array, None)?;
+                new_columns.push(repeated_column);
+            }
+        }
+
+        // Update the schema for the flattened columns
+        let mut new_fields = schema.fields().to_vec();
+        for (col_idx, _) in &list_columns_info {
+            let original_field = &new_fields[*col_idx];
+            let inner_type = match original_field.data_type() {
+                DataType::List(f) | DataType::LargeList(f) => f.data_type().clone(),
+                _ => unreachable!(),
+            };
+            new_fields[*col_idx] = Arc::new(Field::new(
+                original_field.name(),
+                inner_type,
+                original_field.is_nullable(),
+            ));
+        }
+
+        let new_schema = Arc::new(Schema::new(new_fields));
+        let output = RecordBatch::try_new(new_schema, new_columns)
+            .context("Failed to create output RecordBatch")?;
+
+        Ok(Some(output))
+    }
+}
+
+fn build_array_from_slices(
+    slices: Vec<Option<ArrayRef>>,
+    data_type: &DataType,
+) -> anyhow::Result<ArrayRef> {
+    use arrow::array::*;
+
+    // Concatenate all non-null slices and track null positions
+    let mut arrays_to_concat = Vec::new();
+    let mut null_bitmap = Vec::new();
+
+    for slice_opt in slices {
+        if let Some(slice) = slice_opt {
+            arrays_to_concat.push(slice);
+            null_bitmap.push(true);
+        } else {
+            // Create a null array of the appropriate type
+            let null_array = new_null_array(data_type, 1);
+            arrays_to_concat.push(null_array);
+            null_bitmap.push(false);
+        }
+    }
+
+    if arrays_to_concat.is_empty() {
+        return Ok(new_null_array(data_type, 0));
+    }
+
+    // Concatenate arrays
+    let refs: Vec<&dyn Array> = arrays_to_concat.iter().map(|a| a.as_ref()).collect();
+    arrow::compute::concat(&refs).context("Failed to concatenate arrays")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, ListArray, StringArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow_schema::{Field, Schema};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_flatten_basic() {
+        // Create a list column: [[1,2], [3,4,5]]
+        let values = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]));
+        let offsets = OffsetBuffer::from_lengths([2, 3]);
+        let list_array = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            values,
+            None,
+        ));
+
+        // Create another regular column
+        let string_array = Arc::new(StringArray::from(vec!["a", "b"]));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "list_col",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            Field::new("str_col", DataType::Utf8, false),
+        ]));
+
+        let input_batch = RecordBatch::try_new(
+            schema,
+            vec![list_array as Arc<dyn Array>, string_array as Arc<dyn Array>],
+        )
+        .expect("Failed to create record batch");
+
+        let params = vec![Arg::String("list_col".to_string())];
+        let mut flatten = Flatten::new(Some(params)).expect("Failed to create Flatten");
+        let output_batch_option = flatten.process(input_batch).expect("Processing failed");
+        assert!(output_batch_option.is_some());
+        let output_batch = output_batch_option.unwrap();
+
+        // Should have 5 rows (2 + 3)
+        assert_eq!(output_batch.num_rows(), 5);
+        assert_eq!(output_batch.num_columns(), 2);
+
+        // Check flattened values
+        let flattened_col = output_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(flattened_col.values(), &[1, 2, 3, 4, 5]);
+
+        // Check repeated string values
+        let str_col = output_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(str_col.value(0), "a");
+        assert_eq!(str_col.value(1), "a");
+        assert_eq!(str_col.value(2), "b");
+        assert_eq!(str_col.value(3), "b");
+        assert_eq!(str_col.value(4), "b");
+    }
+
+    #[test]
+    fn test_flatten_multiple_columns() {
+        // Create first list column: [[1,2], [3]]
+        let values1 = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let offsets1 = OffsetBuffer::from_lengths([2, 1]);
+        let list_array1 = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets1,
+            values1,
+            None,
+        ));
+
+        // Create second list column: [[10,20], [30,40]]
+        let values2 = Arc::new(Int32Array::from(vec![10, 20, 30, 40]));
+        let offsets2 = OffsetBuffer::from_lengths([2, 2]);
+        let list_array2 = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets2,
+            values2,
+            None,
+        ));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "list1",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            Field::new(
+                "list2",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+        ]));
+
+        let input_batch = RecordBatch::try_new(
+            schema,
+            vec![list_array1 as Arc<dyn Array>, list_array2 as Arc<dyn Array>],
+        )
+        .expect("Failed to create record batch");
+
+        let params = vec![Arg::String("list1,list2".to_string())];
+        let mut flatten = Flatten::new(Some(params)).expect("Failed to create Flatten");
+        let output_batch_option = flatten.process(input_batch).expect("Processing failed");
+        assert!(output_batch_option.is_some());
+        let output_batch = output_batch_option.unwrap();
+
+        dbg!(&output_batch);
+
+        // Should have 6 rows (2*2 + 1*2)
+        assert_eq!(output_batch.num_rows(), 6);
+
+        // Check Cartesian product results
+        let col1 = output_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let col2 = output_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        // First row combinations: [1,2] x [10,20]
+        assert_eq!(col1.value(0), 1);
+        assert_eq!(col2.value(0), 10);
+        assert_eq!(col1.value(1), 1);
+        assert_eq!(col2.value(1), 20);
+        assert_eq!(col1.value(2), 2);
+        assert_eq!(col2.value(2), 10);
+        assert_eq!(col1.value(3), 2);
+        assert_eq!(col2.value(3), 20);
+
+        // Second row combinations: [3] x [30,40]
+        assert_eq!(col1.value(4), 3);
+        assert_eq!(col2.value(4), 30);
+        assert_eq!(col1.value(5), 3);
+        assert_eq!(col2.value(5), 40);
+    }
+
+    #[test]
+    fn test_flatten_empty_list() {
+        // Create a list column with an empty list: [[], [1,2]]
+        let values = Arc::new(Int32Array::from(vec![1, 2]));
+        let offsets = OffsetBuffer::from_lengths([0, 2]);
+        let list_array = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            values,
+            None,
+        ));
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "list_col",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        )]));
+
+        let input_batch = RecordBatch::try_new(schema, vec![list_array as Arc<dyn Array>])
+            .expect("Failed to create record batch");
+
+        let params = vec![Arg::String("list_col".to_string())];
+        let mut flatten = Flatten::new(Some(params)).expect("Failed to create Flatten");
+        let output_batch_option = flatten.process(input_batch).expect("Processing failed");
+        assert!(output_batch_option.is_some());
+        let output_batch = output_batch_option.unwrap();
+
+        // Should have 2 rows (0 + 2)
+        assert_eq!(output_batch.num_rows(), 2);
+
+        let flattened_col = output_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(flattened_col.values(), &[1, 2]);
+    }
+
+    #[test]
+    fn test_flatten_no_columns() {
+        let result = Flatten::new(None);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Column names parameter is required"
+        );
+    }
+
+    #[test]
+    fn test_flatten_invalid_column_type() {
+        let params = vec![Arg::Int(123)];
+        let result = Flatten::new(Some(params));
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Column names must be a string"
+        );
+    }
+
+    #[test]
+    fn test_flatten_non_list_column() {
+        let int_array = Arc::new(Int32Array::from(vec![1, 2, 3]));
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "int_col",
+            DataType::Int32,
+            false,
+        )]));
+
+        let input_batch = RecordBatch::try_new(schema, vec![int_array as Arc<dyn Array>])
+            .expect("Failed to create record batch");
+
+        let params = vec![Arg::String("int_col".to_string())];
+        let mut flatten = Flatten::new(Some(params)).expect("Failed to create Flatten");
+        let result = flatten.process(input_batch);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("is not a list type")
+        );
+    }
+
+    #[test]
+    fn test_flatten_column_not_found() {
+        let int_array = Arc::new(Int32Array::from(vec![1, 2, 3]));
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "int_col",
+            DataType::Int32,
+            false,
+        )]));
+
+        let input_batch = RecordBatch::try_new(schema, vec![int_array as Arc<dyn Array>])
+            .expect("Failed to create record batch");
+
+        let params = vec![Arg::String("nonexistent_col".to_string())];
+        let mut flatten = Flatten::new(Some(params)).expect("Failed to create Flatten");
+        let result = flatten.process(input_batch);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Column 'nonexistent_col' not found")
+        );
+    }
+}
