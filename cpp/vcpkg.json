@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
   "name": "rust-tv-table-function",
-  "version": "0.2.15",
+  "version": "0.2.16",
   "port-version": 0,
   "description": "rust-tv-table-function",
   "builtin-baseline": "8ea2dffddcc8dc78bffcb8c3952a31290bd01aa5",
