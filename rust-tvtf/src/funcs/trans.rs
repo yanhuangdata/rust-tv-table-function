@@ -249,6 +249,13 @@ impl TransParams {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum TransactionType {
+    Start,
+    End,
+    Normal,
+}
+
 #[derive(Debug, Clone)]
 struct Transaction {
     field_names: SmallVec<[String; 4]>,
@@ -258,10 +265,11 @@ struct Transaction {
     messages: VecDeque<SmallVec<[String; 4]>>,
     event_count: u64,
     is_closed: bool,
+    transaction_type: TransactionType,
 }
 
 impl Transaction {
-    fn new(field_names: SmallVec<[String; 4]>) -> Self {
+    fn new(field_names: SmallVec<[String; 4]>, transaction_type: TransactionType) -> Self {
         Transaction {
             field_names,
             fields: HashMap::new(),
@@ -270,6 +278,7 @@ impl Transaction {
             messages: VecDeque::new(),
             event_count: 0,
             is_closed: false,
+            transaction_type,
         }
     }
 
@@ -486,6 +495,7 @@ struct TransactionPool {
     params: TransParams,
     frozen_trans: Vec<Transaction>,
     live_trans: HashMap<TransKey, Transaction>,
+    pending_transactions: Vec<(TransKey, Transaction)>,
     earliest_event_timestamp: Option<DateTime<Utc>>,
     trans_complete_flag: HashMap<TransKey, bool>,
 }
@@ -496,6 +506,7 @@ impl TransactionPool {
             params,
             frozen_trans: Vec::new(),
             live_trans: HashMap::new(),
+            pending_transactions: Vec::new(),
             earliest_event_timestamp: None,
             trans_complete_flag: HashMap::new(),
         }
@@ -602,7 +613,15 @@ impl TransactionPool {
         let current_trans = self.live_trans.remove(&trans_key);
 
         if current_trans.is_none() {
-            let mut new_trans = Transaction::new(self.params.fields.clone());
+            let transaction_type = if self.params.matches_starts_with(&event) {
+                TransactionType::Start
+            } else if self.params.matches_ends_with(&event) {
+                TransactionType::End
+            } else {
+                TransactionType::Normal
+            };
+
+            let mut new_trans = Transaction::new(self.params.fields.clone(), transaction_type);
             new_trans.add_event(&event)?;
 
             if self.params.matches_ends_with(&event)
@@ -625,6 +644,7 @@ impl TransactionPool {
         } else {
             let mut trans = current_trans.unwrap();
             if self.params.matches_starts_with(&event) {
+                trans.transaction_type = TransactionType::Start;
                 trans.add_event(&event)?;
                 if self.trans_complete_flag.contains_key(&trans_key) {
                     trans.set_is_closed();
@@ -632,9 +652,11 @@ impl TransactionPool {
                 self.frozen_trans.push(trans);
                 self.trans_complete_flag.remove(&trans_key);
             } else if self.params.matches_ends_with(&event) {
+                trans.transaction_type = TransactionType::End;
                 self.frozen_trans.push(trans);
 
-                let mut new_trans = Transaction::new(self.params.fields.clone());
+                let mut new_trans =
+                    Transaction::new(self.params.fields.clone(), TransactionType::Normal);
                 new_trans.add_event(&event)?;
                 self.live_trans.insert(trans_key.clone(), new_trans);
                 self.trans_complete_flag.insert(trans_key.clone(), true);
@@ -655,13 +677,123 @@ impl TransactionPool {
         Ok(())
     }
 
+    /// Post-process transactions to implement bracket matching logic for all start/end conditions
+    fn post_process_transactions(&mut self) {
+        // Apply bracket matching if we're using any start/end conditions
+        let has_start_conditions = self.params.starts_with.is_some()
+            || self.params.starts_with_regex.is_some()
+            || self.params.starts_if_field.is_some();
+
+        let has_end_conditions = self.params.ends_with.is_some()
+            || self.params.ends_with_regex.is_some()
+            || self.params.ends_if_field.is_some();
+
+        if !has_start_conditions && !has_end_conditions {
+            return;
+        }
+
+        // Collect all transactions (frozen and live) for post-processing
+        let mut all_transactions: Vec<Transaction> = Vec::new();
+        all_transactions.append(&mut self.frozen_trans);
+        for (_, trans) in self.live_trans.drain() {
+            all_transactions.push(trans);
+        }
+        // Also drain pending transactions
+        for (_, trans) in self.pending_transactions.drain(..) {
+            all_transactions.push(trans);
+        }
+
+        // Separate start and end transactions based on their type
+        let mut start_transactions: Vec<(DateTime<Utc>, Transaction)> = Vec::new();
+        let mut end_transactions: Vec<(DateTime<Utc>, Transaction)> = Vec::new();
+        let mut other_transactions: Vec<Transaction> = Vec::new();
+
+        for trans in all_transactions {
+            let start_time = match trans.start_time {
+                Some(time) => time,
+                None => {
+                    other_transactions.push(trans);
+                    continue;
+                }
+            };
+
+            match trans.transaction_type {
+                TransactionType::Start => {
+                    start_transactions.push((start_time, trans));
+                }
+                TransactionType::End => {
+                    end_transactions.push((start_time, trans));
+                }
+                TransactionType::Normal => {
+                    other_transactions.push(trans);
+                }
+            }
+        }
+
+        // Sort by time (ascending order - oldest first)
+        start_transactions.sort_by(|a, b| a.0.cmp(&b.0));
+        end_transactions.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Implement bracket matching logic
+        // Process start transactions from oldest to newest
+        // Match each with the most recent unmatched end transaction
+        let mut unmatched_ends: VecDeque<(DateTime<Utc>, Transaction)> = end_transactions.into();
+        let mut matched_transactions: Vec<Transaction> = Vec::new();
+
+        for (_start_time, start_trans) in start_transactions {
+            // Look for the most recent unmatched end transaction
+            if let Some((_, end_trans)) = unmatched_ends.pop_back() {
+                // Merge the two transactions
+                let mut merged_trans = start_trans;
+                // Add all events from end_trans to start_trans
+                for message in end_trans.messages {
+                    merged_trans.messages.push_front(message);
+                }
+                for (field_name, field_values) in end_trans.fields {
+                    let entry = merged_trans.fields.entry(field_name).or_default();
+                    entry.extend(field_values);
+                }
+                merged_trans.event_count += end_trans.event_count;
+                if let Some(end_trans_end_time) = end_trans.end_time {
+                    if merged_trans.end_time.is_none()
+                        || end_trans_end_time > merged_trans.end_time.unwrap()
+                    {
+                        merged_trans.end_time = Some(end_trans_end_time);
+                    }
+                }
+                merged_trans.set_is_closed();
+                matched_transactions.push(merged_trans);
+            } else {
+                // No matching end, treat as standalone
+                matched_transactions.push(start_trans);
+            }
+        }
+
+        // Add remaining unmatched end transactions
+        for (_, end_trans) in unmatched_ends {
+            matched_transactions.push(end_trans);
+        }
+
+        // Add other transactions
+        matched_transactions.extend(other_transactions);
+
+        // Move all processed transactions back to frozen_trans
+        self.frozen_trans = matched_transactions;
+    }
+
     fn get_frozen_trans(&mut self) -> Vec<Transaction> {
+        self.post_process_transactions();
         std::mem::take(&mut self.frozen_trans)
     }
 
     fn get_live_trans(&mut self) -> Vec<Transaction> {
+        // For live transactions, we don't apply bracket matching
         let mut live_transactions: Vec<Transaction> = Vec::new();
         for (_, trans) in self.live_trans.drain() {
+            live_transactions.push(trans);
+        }
+        // Also drain pending transactions
+        for (_, trans) in self.pending_transactions.drain(..) {
             live_transactions.push(trans);
         }
         live_transactions
@@ -907,7 +1039,7 @@ mod tests {
 
     #[test]
     fn test_transaction_add_event_and_merge() {
-        let mut trans = Transaction::new(smallvec!["user_id".to_string()]);
+        let mut trans = Transaction::new(smallvec!["user_id".to_string()], TransactionType::Normal);
         let now = Utc::now();
 
         let event1 = create_event(
@@ -960,7 +1092,7 @@ mod tests {
 
     #[test]
     fn test_transaction_to_record_batch() {
-        let mut trans = Transaction::new(smallvec!["user_id".to_string()]);
+        let mut trans = Transaction::new(smallvec!["user_id".to_string()], TransactionType::Normal);
         let now = Utc::now();
         let event1_time = now - ChronoDuration::seconds(20);
         let event2_time = now - ChronoDuration::seconds(10);
@@ -1391,5 +1523,142 @@ mod tests {
             .collect::<Vec<_>>();
         events.sort_unstable();
         assert_eq!(events, vec!["b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_trans_pool_bracket_matching() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("session_id".to_string())),
+                (
+                    "starts_with".to_string(),
+                    Arg::String("starts_with".to_string()),
+                ),
+                (
+                    "ends_with".to_string(),
+                    Arg::String("ends_with".to_string()),
+                ),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        let now = Utc::now();
+
+        // Create events in the order described in the issue:
+        // 1. xxxxx ends_with xxxxx (session A)
+        // 2. yyyyy ends_with yyyyy (session A)
+        // 3. zzzzz starts_with zzzzz (session A)
+        // 4. wwwww starts_with wwwww (session A)
+
+        let event1 = create_event(
+            now.timestamp_micros(),
+            "xxxxx ends_with xxxxx",
+            &[("session_id", "A")],
+        );
+        let event2 = create_event(
+            (now - ChronoDuration::seconds(1)).timestamp_micros(),
+            "yyyyy ends_with yyyyy",
+            &[("session_id", "A")],
+        );
+        let event3 = create_event(
+            (now - ChronoDuration::seconds(2)).timestamp_micros(),
+            "zzzzz starts_with zzzzz",
+            &[("session_id", "A")],
+        );
+        let event4 = create_event(
+            (now - ChronoDuration::seconds(3)).timestamp_micros(),
+            "wwwww starts_with wwwww",
+            &[("session_id", "A")],
+        );
+
+        pool.add_event(event1).unwrap();
+        pool.add_event(event2).unwrap();
+        pool.add_event(event3).unwrap();
+        pool.add_event(event4).unwrap();
+
+        // With bracket matching logic:
+        // - event3 (starts_with) should match with event2 (ends_with) -> transaction 2-3
+        // - event4 (starts_with) should match with event1 (ends_with) -> transaction 1-4
+        // This should result in 2 closed transactions
+
+        // Apply post-processing
+        pool.post_process_transactions();
+
+        // Now we should have 2 transactions
+        assert_eq!(pool.frozen_trans.len(), 2);
+
+        // Check that both transactions are closed
+        assert!(pool.frozen_trans.iter().all(|t| t.get_is_closed()));
+
+        // Check that we have pending transactions for the unmatched starts_with events
+        assert_eq!(pool.pending_transactions.len(), 0); // All should be matched
+    }
+
+    #[test]
+    fn test_trans_pool_bracket_matching_with_field_conditions() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("session_id".to_string())),
+                (
+                    "starts_if_field".to_string(),
+                    Arg::String("is_start".to_string()),
+                ),
+                (
+                    "ends_if_field".to_string(),
+                    Arg::String("is_end".to_string()),
+                ),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        let now = Utc::now();
+
+        // Create events in the order described in the issue:
+        // 1. message1 (is_end=true) (session A)
+        // 2. message2 (is_end=true) (session A)
+        // 3. message3 (is_start=true) (session A)
+        // 4. message4 (is_start=true) (session A)
+
+        let event1 = create_event(
+            now.timestamp_micros(),
+            "message1",
+            &[("session_id", "A"), ("is_end", "true")],
+        );
+        let event2 = create_event(
+            (now - ChronoDuration::seconds(1)).timestamp_micros(),
+            "message2",
+            &[("session_id", "A"), ("is_end", "true")],
+        );
+        let event3 = create_event(
+            (now - ChronoDuration::seconds(2)).timestamp_micros(),
+            "message3",
+            &[("session_id", "A"), ("is_start", "true")],
+        );
+        let event4 = create_event(
+            (now - ChronoDuration::seconds(3)).timestamp_micros(),
+            "message4",
+            &[("session_id", "A"), ("is_start", "true")],
+        );
+
+        pool.add_event(event1).unwrap();
+        pool.add_event(event2).unwrap();
+        pool.add_event(event3).unwrap();
+        pool.add_event(event4).unwrap();
+
+        // With bracket matching logic:
+        // - event3 (is_start=true) should match with event2 (is_end=true) -> transaction 2-3
+        // - event4 (is_start=true) should match with event1 (is_end=true) -> transaction 1-4
+        // This should result in 2 closed transactions
+
+        // Apply post-processing
+        pool.post_process_transactions();
+
+        // Now we should have 2 transactions
+        assert_eq!(pool.frozen_trans.len(), 2);
+
+        // Check that both transactions are closed
+        assert!(pool.frozen_trans.iter().all(|t| t.get_is_closed()));
     }
 }
