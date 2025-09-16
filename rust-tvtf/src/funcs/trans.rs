@@ -527,17 +527,24 @@ impl TransactionPool {
             return false;
         };
 
-        // Check if we have transkey fields defined
-        if !self.params.fields.is_empty() {
-            // Check if all transkey fields are null/empty
-            let all_fields_null = self
+        if !self.params.fields.is_empty() && self.params.allow_nulls {
+            let has_at_least_one_field = self
                 .params
                 .fields
                 .iter()
-                .all(|f| event.get(f).is_none_or(|v| v.is_empty()));
+                .any(|f| event.get(f).is_some_and(|v| !v.is_empty()));
+            if !has_at_least_one_field {
+                return false;
+            }
+        }
 
-            // If all fields are null, discard the event
-            if all_fields_null {
+        if !self.params.fields.is_empty() && !self.params.allow_nulls {
+            let has_all_fields = self
+                .params
+                .fields
+                .iter()
+                .all(|f| event.get(f).is_some_and(|v| !v.is_empty()));
+            if !has_all_fields {
                 return false;
             }
         }
@@ -578,48 +585,11 @@ impl TransactionPool {
             .fields
             .iter()
             .map(|f| {
-                event.get(f).and_then(|v_opt| {
-                    // Check if the field value is empty (null/empty)
-                    if v_opt.is_empty() {
-                        // Return None to indicate null value
-                        None
-                    } else {
-                        // Get the first value
-                        v_opt.first().as_ref().map(|s| s.to_string())
-                    }
-                })
+                event
+                    .get(f)
+                    .and_then(|v_opt| v_opt.first().as_ref().map(|s| s.to_string()))
             })
             .collect()
-    }
-
-    /// Compare two transaction keys, ignoring null values in the comparison
-    /// Returns true if the keys match (considering nulls as wildcards)
-    fn trans_keys_match(key1: &TransKey, key2: &TransKey) -> bool {
-        if key1.len() != key2.len() {
-            return false;
-        }
-
-        for (val1, val2) in key1.iter().zip(key2.iter()) {
-            match (val1, val2) {
-                // If either value is None (null), they match
-                (None, _) | (_, None) => continue,
-                // If both are Some, they must be equal
-                (Some(v1), Some(v2)) => {
-                    if v1 != v2 {
-                        return false;
-                    }
-                }
-            }
-        }
-        true
-    }
-
-    /// Find a matching transaction key in the live transactions, considering null values as wildcards
-    fn find_matching_trans_key(&self, target_key: &TransKey) -> Option<TransKey> {
-        self.live_trans
-            .keys()
-            .find(|&key| Self::trans_keys_match(key, target_key))
-            .cloned()
     }
 
     fn add_event(&mut self, event: HashMap<String, SmallVec<[String; 4]>>) -> Result<()> {
@@ -640,11 +610,7 @@ impl TransactionPool {
 
         let trans_key = self.make_trans_key(&event);
 
-        // Find a matching transaction key, considering null values as wildcards
-        let matching_key = self.find_matching_trans_key(&trans_key);
-        let current_trans = matching_key
-            .as_ref()
-            .and_then(|key| self.live_trans.remove(key));
+        let current_trans = self.live_trans.remove(&trans_key);
 
         if current_trans.is_none() {
             let transaction_type = if self.params.matches_starts_with(&event) {
@@ -663,20 +629,16 @@ impl TransactionPool {
                     && self.params.ends_with_regex.is_none()
                     && self.params.ends_if_field.is_none())
             {
-                // Use the original trans_key for the flag, not the matching key
                 self.trans_complete_flag.insert(trans_key.clone(), true);
             }
 
             if self.params.matches_starts_with(&event) {
-                // Use the original trans_key for the flag, not the matching key
                 if self.trans_complete_flag.contains_key(&trans_key) {
                     new_trans.set_is_closed();
                 }
                 self.frozen_trans.push(new_trans);
-                // Use the original trans_key for the flag, not the matching key
                 self.trans_complete_flag.remove(&trans_key);
             } else {
-                // Insert with the original trans_key
                 self.live_trans.insert(trans_key.clone(), new_trans);
             }
         } else {
@@ -684,17 +646,11 @@ impl TransactionPool {
             if self.params.matches_starts_with(&event) {
                 trans.transaction_type = TransactionType::Start;
                 trans.add_event(&event)?;
-                // Use the matching key for the flag
-                if let Some(ref key) = matching_key {
-                    if self.trans_complete_flag.contains_key(key) {
-                        trans.set_is_closed();
-                    }
+                if self.trans_complete_flag.contains_key(&trans_key) {
+                    trans.set_is_closed();
                 }
                 self.frozen_trans.push(trans);
-                // Use the matching key for the flag
-                if let Some(ref key) = matching_key {
-                    self.trans_complete_flag.remove(key);
-                }
+                self.trans_complete_flag.remove(&trans_key);
             } else if self.params.matches_ends_with(&event) {
                 trans.transaction_type = TransactionType::End;
                 self.frozen_trans.push(trans);
@@ -702,13 +658,10 @@ impl TransactionPool {
                 let mut new_trans =
                     Transaction::new(self.params.fields.clone(), TransactionType::Normal);
                 new_trans.add_event(&event)?;
-                // Insert with the original trans_key
                 self.live_trans.insert(trans_key.clone(), new_trans);
-                // Use the original trans_key for the flag
                 self.trans_complete_flag.insert(trans_key.clone(), true);
             } else {
                 trans.add_event(&event)?;
-                // Insert with the original trans_key
                 self.live_trans.insert(trans_key.clone(), trans);
             }
         }
@@ -1028,7 +981,7 @@ mod tests {
             ),
             (
                 "ends_with_regex".to_string(),
-                Arg::String("logout_\\\\d+".to_string()),
+                Arg::String("logout_\\d+".to_string()),
             ),
             (
                 "ends_if_field".to_string(),
@@ -1044,7 +997,7 @@ mod tests {
         assert_eq!(params.starts_with, Some("login".to_string()));
         assert!(params.starts_with_regex.is_none());
         assert_eq!(params.starts_if_field, Some("is_start_event".to_string()));
-        assert_eq!(params.ends_with_regex.unwrap().as_str(), "logout_\\\\d+");
+        assert_eq!(params.ends_with_regex.unwrap().as_str(), "logout_\\d+");
         assert_eq!(params.ends_if_field, Some("is_end_event".to_string()));
         assert_eq!(params.max_span, Duration::from_secs(600));
         assert_eq!(params.max_events, 500);
@@ -1524,7 +1477,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trans_pool_ignore_nulls_in_key() {
+    fn test_trans_pool_do_not_allow_nulls() {
         let params = TransParams::new(
             Some(vec![]),
             vec![(
@@ -1569,8 +1522,7 @@ mod tests {
             .flat_map(|i| i.1.messages.iter().flatten())
             .collect::<Vec<_>>();
         events.sort_unstable();
-        // With the new behavior, event "a" should also be included
-        assert_eq!(events, vec!["a", "b", "c", "d"]);
+        assert_eq!(events, vec!["b", "c", "d"]);
     }
 
     #[test]
@@ -1708,130 +1660,5 @@ mod tests {
 
         // Check that both transactions are closed
         assert!(pool.frozen_trans.iter().all(|t| t.get_is_closed()));
-    }
-
-    #[test]
-    fn test_trans_pool_discard_all_nulls() {
-        let params = TransParams::new(
-            Some(vec![]),
-            vec![(
-                "fields".to_string(),
-                Arg::String("session_id,host".to_string()),
-            )],
-        )
-        .unwrap();
-        let mut pool = TransactionPool::new(params);
-        let now = Utc::now();
-
-        let events = vec![
-            // Event with all transkey fields null should be discarded
-            create_event_nullable(
-                now.timestamp_micros(),
-                "discarded",
-                &[("session_id", None), ("host", None)],
-            ),
-            // Event with some values should be included
-            create_event(
-                now.timestamp_micros(),
-                "included",
-                &[("session_id", "A"), ("host", "localhost")],
-            ),
-        ];
-
-        for ev in events {
-            pool.add_event(ev).unwrap();
-        }
-
-        // Get all messages from all transactions
-        let mut all_messages: Vec<String> = Vec::new();
-        for (_, trans) in &pool.live_trans {
-            for messages in &trans.messages {
-                for message in messages {
-                    all_messages.push(message.clone());
-                }
-            }
-        }
-
-        // Also get messages from frozen transactions
-        for trans in &pool.frozen_trans {
-            for messages in &trans.messages {
-                for message in messages {
-                    all_messages.push(message.clone());
-                }
-            }
-        }
-
-        // Only the "included" event should be present
-        assert_eq!(all_messages, vec!["included"]);
-
-        // Check that we have only 1 transaction (the "discarded" event should be ignored)
-        assert_eq!(pool.live_trans.len() + pool.frozen_trans.len(), 1);
-    }
-
-    #[test]
-    fn test_trans_pool_example_scenario() {
-        let params = TransParams::new(
-            Some(vec![]),
-            vec![("fields".to_string(), Arg::String("key,key2".to_string()))],
-        )
-        .unwrap();
-        let mut pool = TransactionPool::new(params);
-        let base_time = 1750844229000000i64;
-
-        // Create events as per the example:
-        // (1750844229000000, 'xxx', 'kkk', '1') -> should be one event
-        // (1750844228000000, 'xxx', 'jjj', '2') -> should be another event
-        // (1750844227000000, 'yyy', 'lll', '3') -> should be part of a transaction with the next two
-        // (1750844226000000, null, 'lll', '4') -> should be part of the same transaction as above
-        // (1750844225000000, null, 'lll', '5') -> should be part of the same transaction as above
-
-        let events = vec![
-            create_event(base_time, "1", &[("key", "xxx"), ("key2", "kkk")]),
-            create_event(base_time - 1000000, "2", &[("key", "xxx"), ("key2", "jjj")]),
-            create_event(base_time - 2000000, "3", &[("key", "yyy"), ("key2", "lll")]),
-            create_event_nullable(
-                base_time - 3000000,
-                "4",
-                &[("key", None), ("key2", Some("lll"))],
-            ),
-            create_event_nullable(
-                base_time - 4000000,
-                "5",
-                &[("key", None), ("key2", Some("lll"))],
-            ),
-        ];
-
-        for ev in events {
-            pool.add_event(ev).unwrap();
-        }
-
-        // Get all messages from all transactions
-        let mut all_messages: Vec<String> = Vec::new();
-        for (_, trans) in &pool.live_trans {
-            for messages in &trans.messages {
-                for message in messages {
-                    all_messages.push(message.clone());
-                }
-            }
-        }
-
-        // Also get messages from frozen transactions
-        for trans in &pool.frozen_trans {
-            for messages in &trans.messages {
-                for message in messages {
-                    all_messages.push(message.clone());
-                }
-            }
-        }
-
-        // All messages should be present
-        all_messages.sort_unstable();
-        assert_eq!(all_messages, vec!["1", "2", "3", "4", "5"]);
-
-        // Check that we have 3 transactions:
-        // 1. Event "1" (key=xxx, key2=kkk)
-        // 2. Event "2" (key=xxx, key2=jjj)
-        // 3. Events "3", "4", "5" (key2=lll) - should be grouped together because key2 matches
-        assert_eq!(pool.live_trans.len() + pool.frozen_trans.len(), 3);
     }
 }
