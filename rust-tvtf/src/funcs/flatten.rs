@@ -58,6 +58,8 @@ impl TableFunction for Flatten {
         // Find the columns to flatten
         let schema = input.schema();
         let mut list_columns_info: Vec<(usize, Arc<dyn Array>)> = Vec::new();
+        let mut processed_columns: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
 
         for column_name in &self.column_names {
             let Some((column_index, field)) = schema.column_with_name(column_name) else {
@@ -71,7 +73,11 @@ impl TableFunction for Flatten {
                     field.data_type()
                 ));
             }
-            list_columns_info.push((column_index, Arc::clone(input.column(column_index))));
+
+            if !processed_columns.contains(&column_index) {
+                list_columns_info.push((column_index, Arc::clone(input.column(column_index))));
+                processed_columns.insert(column_index);
+            }
         }
 
         if list_columns_info.is_empty() {
@@ -113,6 +119,9 @@ impl TableFunction for Flatten {
         }
 
         let mut new_columns: Vec<ArrayRef> = Vec::new();
+        let mut processed_columns: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+
         for (col_idx, field) in schema.fields().iter().enumerate() {
             let column = input.column(col_idx);
 
@@ -120,56 +129,60 @@ impl TableFunction for Flatten {
                 .iter()
                 .position(|(idx, _)| *idx == col_idx)
             {
-                let inner_type = match field.data_type() {
-                    DataType::List(inner_field) | DataType::LargeList(inner_field) => {
-                        inner_field.data_type()
-                    }
-                    _ => unreachable!(),
-                };
-
-                let mut flattened_values = Vec::new();
-
-                let list_array = column.as_list_opt::<i32>().unwrap();
-
-                for row_idx in 0..input.num_rows() {
-                    if row_products[row_idx] == 0 {
-                        continue;
-                    }
-
-                    let list_values = list_array.value(row_idx);
-
-                    let outer_repeat = list_lengths[..list_col_pos]
-                        .iter()
-                        .map(|lens| lens[row_idx].max(1))
-                        .product::<usize>();
-
-                    let inner_repeat = list_lengths[list_col_pos + 1..]
-                        .iter()
-                        .map(|lens| lens[row_idx].max(1))
-                        .product::<usize>();
-
-                    if list_array.is_null(row_idx) {
-                        for _ in 0..row_products[row_idx] {
-                            flattened_values.push(None);
+                if !processed_columns.contains(&col_idx) {
+                    let inner_type = match field.data_type() {
+                        DataType::List(inner_field) | DataType::LargeList(inner_field) => {
+                            inner_field.data_type()
                         }
-                    } else {
-                        // Apply the Cartesian product pattern
-                        for _ in 0..outer_repeat {
-                            for elem_idx in 0..list_values.len() {
-                                for _ in 0..inner_repeat {
-                                    if list_values.is_null(elem_idx) {
-                                        flattened_values.push(None);
-                                    } else {
-                                        // This is a generic way to append a value from one array to a builder
-                                        flattened_values.push(Some(list_values.slice(elem_idx, 1)));
+                        _ => unreachable!(),
+                    };
+
+                    let mut flattened_values = Vec::new();
+
+                    let list_array = column.as_list_opt::<i32>().unwrap();
+
+                    for row_idx in 0..input.num_rows() {
+                        if row_products[row_idx] == 0 {
+                            continue;
+                        }
+
+                        let list_values = list_array.value(row_idx);
+
+                        let outer_repeat = list_lengths[..list_col_pos]
+                            .iter()
+                            .map(|lens| lens[row_idx].max(1))
+                            .product::<usize>();
+
+                        let inner_repeat = list_lengths[list_col_pos + 1..]
+                            .iter()
+                            .map(|lens| lens[row_idx].max(1))
+                            .product::<usize>();
+
+                        if list_array.is_null(row_idx) {
+                            for _ in 0..row_products[row_idx] {
+                                flattened_values.push(None);
+                            }
+                        } else {
+                            // Apply the Cartesian product pattern
+                            for _ in 0..outer_repeat {
+                                for elem_idx in 0..list_values.len() {
+                                    for _ in 0..inner_repeat {
+                                        if list_values.is_null(elem_idx) {
+                                            flattened_values.push(None);
+                                        } else {
+                                            // This is a generic way to append a value from one array to a builder
+                                            flattened_values
+                                                .push(Some(list_values.slice(elem_idx, 1)));
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                    let flattened_array = build_array_from_slices(flattened_values, inner_type)?;
+                    new_columns.push(flattened_array);
+                    processed_columns.insert(col_idx);
                 }
-                let flattened_array = build_array_from_slices(flattened_values, inner_type)?;
-                new_columns.push(flattened_array);
             } else {
                 let mut indices = Vec::with_capacity(total_rows);
                 for (row_idx, &product) in row_products.iter().enumerate() {
@@ -183,17 +196,23 @@ impl TableFunction for Flatten {
 
         // Update the schema for the flattened columns
         let mut new_fields = schema.fields().to_vec();
+        let mut updated_columns: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+
         for (col_idx, _) in &list_columns_info {
-            let original_field = &new_fields[*col_idx];
-            let inner_type = match original_field.data_type() {
-                DataType::List(f) | DataType::LargeList(f) => f.data_type().clone(),
-                _ => unreachable!(),
-            };
-            new_fields[*col_idx] = Arc::new(Field::new(
-                original_field.name(),
-                inner_type,
-                original_field.is_nullable(),
-            ));
+            if !updated_columns.contains(col_idx) {
+                let original_field = &new_fields[*col_idx];
+                let inner_type = match original_field.data_type() {
+                    DataType::List(f) | DataType::LargeList(f) => f.data_type().clone(),
+                    _ => unreachable!(),
+                };
+                new_fields[*col_idx] = Arc::new(Field::new(
+                    original_field.name(),
+                    inner_type,
+                    original_field.is_nullable(),
+                ));
+                updated_columns.insert(*col_idx);
+            }
         }
 
         let new_schema = Arc::new(Schema::new(new_fields));
@@ -494,5 +513,46 @@ mod tests {
                 .to_string()
                 .contains("Column 'nonexistent_col' not found")
         );
+    }
+
+    #[test]
+    fn test_flatten_duplicate_columns() {
+        // Create a list column: [[1,2], [3,4]]
+        let values = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
+        let offsets = OffsetBuffer::from_lengths([2, 2]);
+        let list_array = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            values,
+            None,
+        ));
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "list_col",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        )]));
+
+        let input_batch = RecordBatch::try_new(schema, vec![list_array as Arc<dyn Array>])
+            .expect("Failed to create record batch");
+
+        // Test with duplicate column names
+        let params = vec![Arg::String("list_col,list_col".to_string())];
+        let mut flatten = Flatten::new(Some(params)).expect("Failed to create Flatten");
+        let output_batch_option = flatten.process(input_batch).expect("Processing failed");
+        assert!(output_batch_option.is_some());
+        let output_batch = output_batch_option.unwrap();
+
+        // Should have 4 rows (2 + 2)
+        assert_eq!(output_batch.num_rows(), 4);
+        assert_eq!(output_batch.num_columns(), 1);
+
+        // Check flattened values
+        let flattened_col = output_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(flattened_col.values(), &[1, 2, 3, 4]);
     }
 }
