@@ -750,26 +750,26 @@ impl TransactionPool {
             all_transactions.push(trans);
         }
 
-        // Separate start and end transactions based on their type
+        // Separate start and end transactions, keeping track of their times
         let mut start_transactions: Vec<(DateTime<Utc>, Transaction)> = Vec::new();
         let mut end_transactions: Vec<(DateTime<Utc>, Transaction)> = Vec::new();
         let mut other_transactions: Vec<Transaction> = Vec::new();
 
         for trans in all_transactions {
-            let start_time = match trans.start_time {
-                Some(time) => time,
-                None => {
-                    other_transactions.push(trans);
-                    continue;
-                }
-            };
+            // Skip already closed transactions
+            if trans.get_is_closed() {
+                other_transactions.push(trans);
+                continue;
+            }
+
+            let time = trans.start_time.unwrap_or_else(Utc::now);
 
             match trans.transaction_type {
                 TransactionType::Start => {
-                    start_transactions.push((start_time, trans));
+                    start_transactions.push((time, trans));
                 }
                 TransactionType::End => {
-                    end_transactions.push((start_time, trans));
+                    end_transactions.push((time, trans));
                 }
                 TransactionType::Normal => {
                     other_transactions.push(trans);
@@ -782,46 +782,80 @@ impl TransactionPool {
         end_transactions.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Implement bracket matching logic
-        // Process start transactions from oldest to newest
-        // Match each with the most recent unmatched end transaction
-        let mut unmatched_ends: VecDeque<(DateTime<Utc>, Transaction)> = end_transactions.into();
+        // For each start, find the earliest end that comes after it and is not yet matched
         let mut matched_transactions: Vec<Transaction> = Vec::new();
+        let mut unmatched_ends: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-        for (_start_time, start_trans) in start_transactions {
-            // Look for the most recent unmatched end transaction
-            if let Some((_, end_trans)) = unmatched_ends.pop_back() {
-                // Merge the two transactions
-                let mut merged_trans = start_trans;
-                // Add all events from end_trans to start_trans
-                for message in end_trans.messages {
-                    merged_trans.messages.push_front(message);
+        // Initialize all ends as unmatched
+        for i in 0..end_transactions.len() {
+            unmatched_ends.insert(i);
+        }
+
+        // For each start (in time order), match it with the earliest available end
+        for (start_time, mut start_trans) in start_transactions {
+            // Find the earliest unmatched end that comes after this start
+            let mut best_match: Option<usize> = None;
+            let mut best_time: Option<DateTime<Utc>> = None;
+
+            for (i, (end_time, _)) in end_transactions.iter().enumerate() {
+                if !unmatched_ends.contains(&i) {
+                    continue; // Already matched
                 }
-                for (field_name, field_values) in end_trans.fields {
-                    let entry = merged_trans.fields.entry(field_name).or_default();
-                    entry.extend(field_values);
-                }
-                merged_trans.event_count += end_trans.event_count;
-                if let Some(end_trans_end_time) = end_trans.end_time {
-                    if merged_trans.end_time.is_none()
-                        || end_trans_end_time > merged_trans.end_time.unwrap()
-                    {
-                        merged_trans.end_time = Some(end_trans_end_time);
+
+                if *end_time >= start_time {
+                    // This end comes after the start
+                    match best_time {
+                        None => {
+                            // First match found
+                            best_match = Some(i);
+                            best_time = Some(*end_time);
+                        }
+                        Some(current_best) => {
+                            if *end_time < current_best {
+                                // Found an earlier match
+                                best_match = Some(i);
+                                best_time = Some(*end_time);
+                            }
+                        }
                     }
                 }
-                merged_trans.set_is_closed();
-                matched_transactions.push(merged_trans);
+            }
+
+            // If we found a match, merge the transactions
+            if let Some(match_index) = best_match {
+                let (end_time, end_trans) = end_transactions[match_index].clone();
+                unmatched_ends.remove(&match_index);
+
+                // Merge the start with the end transaction
+                for message in end_trans.messages {
+                    // Add to the back to maintain time order
+                    start_trans.messages.push_back(message);
+                }
+                for (field_name, field_values) in end_trans.fields {
+                    let entry = start_trans.fields.entry(field_name).or_default();
+                    entry.extend(field_values);
+                }
+                start_trans.event_count += end_trans.event_count;
+
+                // Set the end time
+                start_trans.end_time = Some(end_time);
+
+                start_trans.set_is_closed();
+                matched_transactions.push(start_trans);
             } else {
-                // No matching end, treat as standalone
+                // No match found, keep the start transaction as is
                 matched_transactions.push(start_trans);
             }
         }
 
-        // Add remaining unmatched end transactions
-        for (_, end_trans) in unmatched_ends {
-            matched_transactions.push(end_trans);
+        // Add any remaining unmatched end transactions
+        for (i, (_time, transaction)) in end_transactions.iter().enumerate() {
+            if unmatched_ends.contains(&i) {
+                matched_transactions.push(transaction.clone());
+            }
         }
 
-        // Add other transactions
+        // Add other transactions (including already closed ones)
         matched_transactions.extend(other_transactions);
 
         // Move all processed transactions back to frozen_trans
