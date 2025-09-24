@@ -66,9 +66,9 @@ impl TableFunction for Flatten {
                 return Err(anyhow::anyhow!("Column '{}' not found", column_name));
             };
 
-            if !matches!(field.data_type(), DataType::List(_)) {
+            if !matches!(field.data_type(), DataType::List(_) | DataType::Null) {
                 return Err(anyhow::anyhow!(
-                    "Column '{}' is not a list type, got {:?}",
+                    "Column '{}' is not a list type or null type, got {:?}",
                     column_name,
                     field.data_type()
                 ));
@@ -85,20 +85,36 @@ impl TableFunction for Flatten {
         }
 
         let mut list_lengths: Vec<Vec<usize>> = Vec::new();
-        for (_, column) in &list_columns_info {
-            let list_array = column
-                .as_list_opt::<i32>()
-                .ok_or_else(|| anyhow::anyhow!("Failed to cast column to a ListArray"))?;
+        let mut null_type_columns: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
 
-            let lengths = (0..list_array.len())
-                .map(|i| {
-                    if list_array.is_valid(i) {
-                        list_array.value(i).len()
-                    } else {
-                        1
-                    }
-                }) // Treat null list as a single null element
-                .collect();
+        for (col_idx, column) in &list_columns_info {
+            let lengths = match column.data_type() {
+                DataType::Null => {
+                    // For null type columns, treat each row as an empty list (length 0)
+                    null_type_columns.insert(*col_idx);
+                    vec![0; column.len()]
+                }
+                DataType::List(_) => {
+                    let list_array = column
+                        .as_list_opt::<i32>()
+                        .ok_or_else(|| anyhow::anyhow!("Failed to cast column to a ListArray"))?;
+                    (0..list_array.len())
+                        .map(|i| {
+                            if list_array.is_valid(i) {
+                                list_array.value(i).len()
+                            } else {
+                                1
+                            }
+                        }) // Treat null list as a single null element
+                        .collect()
+                }
+                dt => {
+                    return Err(anyhow::anyhow!(
+                        "Unexpected data type in list_columns_info: {dt}"
+                    ));
+                }
+            };
             list_lengths.push(lengths);
         }
 
@@ -107,15 +123,49 @@ impl TableFunction for Flatten {
             .map(|row_idx| {
                 list_lengths
                     .iter()
-                    .map(|lengths| lengths[row_idx].max(1))
-                    .product() // Use max(1) to handle empty lists correctly
+                    .enumerate()
+                    .map(|(list_idx, lens)| {
+                        let col_idx = list_columns_info[list_idx].0;
+                        if null_type_columns.contains(&col_idx) {
+                            // For null type columns, don't apply max(1) - use actual length (0)
+                            lens[row_idx]
+                        } else {
+                            // For other list types, use max(1) to handle empty lists correctly
+                            lens[row_idx].max(1)
+                        }
+                    })
+                    .product()
             })
             .collect();
 
         let total_rows: usize = row_products.iter().sum();
 
+        // Update the schema for the flattened columns
+        let mut new_fields = schema.fields().to_vec();
+        let mut updated_columns: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+
+        for (col_idx, _) in &list_columns_info {
+            if !updated_columns.contains(col_idx) {
+                let original_field = &new_fields[*col_idx];
+                let inner_type = match original_field.data_type() {
+                    DataType::List(f) | DataType::LargeList(f) => f.data_type().clone(),
+                    DataType::Null => DataType::Null, // For null type, keep it as null
+                    _ => unreachable!(),
+                };
+                new_fields[*col_idx] = Arc::new(Field::new(
+                    original_field.name(),
+                    inner_type,
+                    original_field.is_nullable(),
+                ));
+                updated_columns.insert(*col_idx);
+            }
+        }
+
+        let new_schema = Arc::new(Schema::new(new_fields));
+
         if total_rows == 0 {
-            return Ok(Some(RecordBatch::new_empty(schema)));
+            return Ok(Some(RecordBatch::new_empty(new_schema)));
         }
 
         let mut new_columns: Vec<ArrayRef> = Vec::new();
@@ -134,45 +184,67 @@ impl TableFunction for Flatten {
                         DataType::List(inner_field) | DataType::LargeList(inner_field) => {
                             inner_field.data_type()
                         }
+                        DataType::Null => {
+                            // For null type, we need to determine the appropriate inner type
+                            // Since null arrays can be cast to any type, we'll use a generic approach
+                            // that treats null as a valid inner type
+                            &DataType::Null
+                        }
                         _ => unreachable!(),
                     };
 
                     let mut flattened_values = Vec::new();
 
-                    let list_array = column.as_list_opt::<i32>().unwrap();
+                    // Check if it's a null type field
+                    if matches!(field.data_type(), DataType::Null) {
+                        // For null type, we don't have actual values to flatten
+                        // Just add nulls based on the cartesian product counts
+                        for item in &row_products {
+                            if *item == 0 {
+                                continue;
+                            }
 
-                    for row_idx in 0..input.num_rows() {
-                        if row_products[row_idx] == 0 {
-                            continue;
-                        }
-
-                        let list_values = list_array.value(row_idx);
-
-                        let outer_repeat = list_lengths[..list_col_pos]
-                            .iter()
-                            .map(|lens| lens[row_idx].max(1))
-                            .product::<usize>();
-
-                        let inner_repeat = list_lengths[list_col_pos + 1..]
-                            .iter()
-                            .map(|lens| lens[row_idx].max(1))
-                            .product::<usize>();
-
-                        if list_array.is_null(row_idx) {
-                            for _ in 0..row_products[row_idx] {
+                            for _ in 0..*item {
                                 flattened_values.push(None);
                             }
-                        } else {
-                            // Apply the Cartesian product pattern
-                            for _ in 0..outer_repeat {
-                                for elem_idx in 0..list_values.len() {
-                                    for _ in 0..inner_repeat {
-                                        if list_values.is_null(elem_idx) {
-                                            flattened_values.push(None);
-                                        } else {
-                                            // This is a generic way to append a value from one array to a builder
-                                            flattened_values
-                                                .push(Some(list_values.slice(elem_idx, 1)));
+                        }
+                    } else {
+                        // For actual list types, use the existing logic
+                        let list_array = column.as_list_opt::<i32>().unwrap();
+
+                        for row_idx in 0..input.num_rows() {
+                            if row_products[row_idx] == 0 {
+                                continue;
+                            }
+
+                            let list_values = list_array.value(row_idx);
+
+                            let outer_repeat = list_lengths[..list_col_pos]
+                                .iter()
+                                .map(|lens| lens[row_idx].max(1))
+                                .product::<usize>();
+
+                            let inner_repeat = list_lengths[list_col_pos + 1..]
+                                .iter()
+                                .map(|lens| lens[row_idx].max(1))
+                                .product::<usize>();
+
+                            if list_array.is_null(row_idx) {
+                                for _ in 0..row_products[row_idx] {
+                                    flattened_values.push(None);
+                                }
+                            } else {
+                                // Apply the Cartesian product pattern
+                                for _ in 0..outer_repeat {
+                                    for elem_idx in 0..list_values.len() {
+                                        for _ in 0..inner_repeat {
+                                            if list_values.is_null(elem_idx) {
+                                                flattened_values.push(None);
+                                            } else {
+                                                // This is a generic way to append a value from one array to a builder
+                                                flattened_values
+                                                    .push(Some(list_values.slice(elem_idx, 1)));
+                                            }
                                         }
                                     }
                                 }
@@ -204,6 +276,7 @@ impl TableFunction for Flatten {
                 let original_field = &new_fields[*col_idx];
                 let inner_type = match original_field.data_type() {
                     DataType::List(f) | DataType::LargeList(f) => f.data_type().clone(),
+                    DataType::Null => DataType::Null, // For null type, keep it as null
                     _ => unreachable!(),
                 };
                 new_fields[*col_idx] = Arc::new(Field::new(
@@ -554,5 +627,34 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(flattened_col.values(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_flatten_null_type_as_empty() {
+        use arrow::array::NullArray;
+        // Create a null type column with 2 rows (should be treated as empty lists)
+        let null_array = Arc::new(NullArray::new(2));
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "null_col",
+            DataType::Null,
+            true,
+        )]));
+
+        let input_batch = RecordBatch::try_new(schema, vec![null_array as Arc<dyn Array>])
+            .expect("Failed to create record batch");
+
+        let params = vec![Arg::String("null_col".to_string())];
+        let mut flatten = Flatten::new(Some(params)).expect("Failed to create Flatten");
+        let output_batch_option = flatten.process(input_batch).expect("Processing failed");
+        assert!(output_batch_option.is_some());
+        let output_batch = output_batch_option.unwrap();
+
+        // Should have 0 rows because null type is treated as empty lists
+        assert_eq!(output_batch.num_rows(), 0);
+        assert_eq!(output_batch.num_columns(), 1);
+
+        // Check that the output column also has null type
+        assert_eq!(output_batch.schema().field(0).data_type(), &DataType::Null);
     }
 }
