@@ -195,10 +195,10 @@ impl TransParams {
         event: &HashMap<String, SmallVec<[String; 4]>>,
         field_name_opt: &Option<String>,
     ) -> bool {
-        if let Some(field_name) = field_name_opt {
-            if let Some(value) = event.get(field_name) {
-                return value.iter().all(|v| v.eq_ignore_ascii_case("true"));
-            }
+        if let Some(field_name) = field_name_opt
+            && let Some(value) = event.get(field_name)
+        {
+            return value.iter().all(|v| v.eq_ignore_ascii_case("true"));
         }
         false
     }
@@ -208,15 +208,15 @@ impl TransParams {
             return false;
         };
 
-        if let Some(s) = &self.starts_with {
-            if message.iter().any(|v| v.contains(s)) {
-                return true;
-            }
+        if let Some(s) = &self.starts_with
+            && message.iter().any(|v| v.contains(s))
+        {
+            return true;
         }
-        if let Some(r) = &self.starts_with_regex {
-            if message.iter().any(|v| r.is_match(v)) {
-                return true;
-            }
+        if let Some(r) = &self.starts_with_regex
+            && message.iter().any(|v| r.is_match(v))
+        {
+            return true;
         }
         // Check ends_if_field condition
         if self.check_boolean_field_condition(event, &self.starts_if_field) {
@@ -230,15 +230,15 @@ impl TransParams {
             return false;
         };
 
-        if let Some(s) = &self.ends_with {
-            if message.iter().any(|v| v.contains(s)) {
-                return true;
-            }
+        if let Some(s) = &self.ends_with
+            && message.iter().any(|v| v.contains(s))
+        {
+            return true;
         }
-        if let Some(r) = &self.ends_with_regex {
-            if message.iter().any(|v| r.is_match(v)) {
-                return true;
-            }
+        if let Some(r) = &self.ends_with_regex
+            && message.iter().any(|v| r.is_match(v))
+        {
+            return true;
         }
         // Check ends_if_field condition
         if self.check_boolean_field_condition(event, &self.ends_if_field) {
@@ -541,10 +541,10 @@ impl TransactionPool {
             }
         }
 
-        if let Some(earliest_ts) = self.earliest_event_timestamp {
-            if time > earliest_ts {
-                return false;
-            }
+        if let Some(earliest_ts) = self.earliest_event_timestamp
+            && time > earliest_ts
+        {
+            return false;
         }
         true
     }
@@ -554,12 +554,11 @@ impl TransactionPool {
             let mut keys_to_freeze = Vec::new();
             if let Some(earliest_ts) = self.earliest_event_timestamp {
                 for (trans_key, trans) in &self.live_trans {
-                    if let Some(end_time) = trans.end_time {
-                        if (end_time - earliest_ts).num_seconds() as u64
+                    if let Some(end_time) = trans.end_time
+                        && (end_time - earliest_ts).num_seconds() as u64
                             > self.params.max_span.as_secs()
-                        {
-                            keys_to_freeze.push(trans_key.clone());
-                        }
+                    {
+                        keys_to_freeze.push(trans_key.clone());
                     }
                 }
             }
@@ -678,16 +677,15 @@ impl TransactionPool {
                 // Insert with the original trans_key
                 self.live_trans.insert(trans_key.clone(), new_trans);
             }
-        } else {
-            let mut trans = current_trans.unwrap();
+        } else if let Some(mut trans) = current_trans {
             if self.params.matches_starts_with(&event) {
                 trans.transaction_type = TransactionType::Start;
                 trans.add_event(&event)?;
                 // Use the matching key for the flag
-                if let Some(ref key) = matching_key {
-                    if self.trans_complete_flag.contains_key(key) {
-                        trans.set_is_closed();
-                    }
+                if let Some(ref key) = matching_key
+                    && self.trans_complete_flag.contains_key(key)
+                {
+                    trans.set_is_closed();
                 }
                 self.frozen_trans.push(trans);
                 // Use the matching key for the flag
@@ -712,12 +710,12 @@ impl TransactionPool {
             }
         }
 
-        if let Some(trans) = self.live_trans.get(&trans_key) {
-            if trans.get_event_count() >= self.params.max_events {
-                let trans_to_freeze = self.live_trans.remove(&trans_key).unwrap();
-                self.frozen_trans.push(trans_to_freeze);
-                self.trans_complete_flag.remove(&trans_key);
-            }
+        if let Some(trans) = self.live_trans.get(&trans_key)
+            && trans.get_event_count() >= self.params.max_events
+        {
+            let trans_to_freeze = self.live_trans.remove(&trans_key).unwrap();
+            self.frozen_trans.push(trans_to_freeze);
+            self.trans_complete_flag.remove(&trans_key);
         }
 
         Ok(())
