@@ -80,7 +80,7 @@ impl TransParams {
             match name.as_str() {
                 "fields" => {
                     let Arg::String(s) = arg else {
-                        return Err(anyhow!("Invalid type for {}. Expected string.", name));
+                        return Err(anyhow!("Invalid type for {name}. Expected string."));
                     };
                     if s.is_empty() {
                         continue;
@@ -89,7 +89,7 @@ impl TransParams {
                 }
                 "starts_with" => {
                     let Arg::String(s) = arg else {
-                        return Err(anyhow!("Invalid type for {}. Expected string.", name));
+                        return Err(anyhow!("Invalid type for {name}. Expected string."));
                     };
                     if s.is_empty() {
                         continue;
@@ -98,7 +98,7 @@ impl TransParams {
                 }
                 "starts_with_regex" => {
                     let Arg::String(s) = arg else {
-                        return Err(anyhow!("Invalid type for {}. Expected string.", name));
+                        return Err(anyhow!("Invalid type for {name}. Expected string."));
                     };
                     if s.is_empty() {
                         continue;
@@ -108,7 +108,7 @@ impl TransParams {
                 }
                 "starts_if_field" => {
                     let Arg::String(s) = arg else {
-                        return Err(anyhow!("Invalid type for {}. Expected string.", name));
+                        return Err(anyhow!("Invalid type for {name}. Expected string."));
                     };
                     if s.is_empty() {
                         continue;
@@ -117,7 +117,7 @@ impl TransParams {
                 }
                 "ends_with" => {
                     let Arg::String(s) = arg else {
-                        return Err(anyhow!("Invalid type for {}. Expected string.", name));
+                        return Err(anyhow!("Invalid type for {name}. Expected string."));
                     };
                     if s.is_empty() {
                         continue;
@@ -126,7 +126,7 @@ impl TransParams {
                 }
                 "ends_with_regex" => {
                     let Arg::String(s) = arg else {
-                        return Err(anyhow!("Invalid typ5e for {}. Expected string.", name));
+                        return Err(anyhow!("Invalid typ5e for {name}. Expected string."));
                     };
                     if s.is_empty() {
                         continue;
@@ -136,7 +136,7 @@ impl TransParams {
                 }
                 "ends_if_field" => {
                     let Arg::String(s) = arg else {
-                        return Err(anyhow!("Invalid type for {}. Expected string.", name));
+                        return Err(anyhow!("Invalid type for {name}. Expected string."));
                     };
                     if s.is_empty() {
                         continue;
@@ -145,7 +145,7 @@ impl TransParams {
                 }
                 "max_span" => {
                     let Arg::String(s) = arg else {
-                        return Err(anyhow!("Invalid type for {}. Expected string.", name));
+                        return Err(anyhow!("Invalid type for {name}. Expected string."));
                     };
                     if s.is_empty() {
                         continue;
@@ -160,18 +160,18 @@ impl TransParams {
                             "m" => value * 60,
                             "h" => value * 3600,
                             "d" => value * 86400,
-                            _ => return Err(anyhow!("Invalid time unit: {}", unit)),
+                            _ => return Err(anyhow!("Invalid time unit: {unit}")),
                         };
                         parsed_params.max_span = Duration::from_secs(seconds);
                     } else {
-                        return Err(anyhow!("Invalid max_span format: {}", s));
+                        return Err(anyhow!("Invalid max_span format: {s}"));
                     }
                 }
                 "max_events" => {
                     let max_events_val: i64 = match arg {
                         Arg::Int(i) => i,
                         _ => {
-                            return Err(anyhow!("Invalid type for {}. Expected integer.", name));
+                            return Err(anyhow!("Invalid type for {name}. Expected integer."));
                         }
                     };
                     parsed_params.max_events = if max_events_val <= 0 {
@@ -182,8 +182,7 @@ impl TransParams {
                 }
                 _ => {
                     return Err(anyhow!(
-                        "Invalid named parameter for trans table function: {}",
-                        name
+                        "Invalid named parameter for trans table function: {name}"
                     ));
                 }
             }

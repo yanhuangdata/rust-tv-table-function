@@ -121,7 +121,7 @@ impl OutputCsv {
                     let val = match arg {
                         Arg::Bool(i) => i,
                         _ => {
-                            return Err(anyhow!("Invalid type for {}. Expected boolean.", name));
+                            return Err(anyhow!("Invalid type for {name}. Expected boolean."));
                         }
                     };
                     append = val;
@@ -130,15 +130,14 @@ impl OutputCsv {
                     let val = match arg {
                         Arg::Bool(i) => i,
                         _ => {
-                            return Err(anyhow!("Invalid type for {}. Expected boolean.", name));
+                            return Err(anyhow!("Invalid type for {name}. Expected boolean."));
                         }
                     };
                     tee = val;
                 }
                 _ => {
                     return Err(anyhow!(
-                        "Invalid named parameter for trans table function: {}",
-                        name
+                        "Invalid named parameter for trans table function: {name}"
                     ));
                 }
             }

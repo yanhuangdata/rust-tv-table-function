@@ -63,7 +63,7 @@ impl TableFunction for Flatten {
 
         for column_name in &self.column_names {
             let Some((column_index, field)) = schema.column_with_name(column_name) else {
-                return Err(anyhow::anyhow!("Column '{}' not found", column_name));
+                return Err(anyhow::anyhow!("Column '{column_name}' not found"));
             };
 
             if !matches!(field.data_type(), DataType::List(_) | DataType::Null) {
