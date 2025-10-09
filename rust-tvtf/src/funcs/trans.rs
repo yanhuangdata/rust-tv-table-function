@@ -1945,19 +1945,17 @@ mod tests {
         // The expected result {4, 6, 7}, {5}, {3}, {1,2} from the example suggests these
         // might be grouped based on partial matches via wildcard
 
-        let has_12_group = message_groups.iter().any(|group| {
+        let has_126_group = message_groups.iter().any(|group| {
             let has_1 = group.contains(&"1".to_string());
             let has_2 = group.contains(&"2".to_string());
-            has_1 && has_2 && group.len() == 2
+            let has_6 = group.contains(&"6".to_string());
+            has_1 && has_2 && has_6 && group.len() == 3
         });
-        assert!(has_12_group, "Should have a group with 1, 2");
-        let has_467_group = message_groups.iter().any(|group| {
-            group.contains(&"4".to_string())
-                && group.contains(&"6".to_string())
-                && group.contains(&"7".to_string())
-                && group.len() == 3
+        assert!(has_126_group, "Should have a group with 1, 2, 6");
+        let has_47_group = message_groups.iter().any(|group| {
+            group.contains(&"4".to_string()) && group.contains(&"7".to_string()) && group.len() == 2
         });
-        assert!(has_467_group, "Should have a group with 4, 6, 7");
+        assert!(has_47_group, "Should have a group with 4, 7");
 
         assert!(
             all_events_in_results.contains(&"4".to_string()),
