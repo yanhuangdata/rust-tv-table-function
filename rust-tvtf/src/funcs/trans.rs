@@ -320,6 +320,31 @@ impl Transaction {
         Ok(())
     }
 
+    fn update_start_time_only(
+        &mut self,
+        event: &HashMap<String, SmallVec<[String; 4]>>,
+    ) -> Result<()> {
+        let time_str = event
+            .get(FIELD_TIME)
+            .context("Event missing _time field or _time is null")?;
+
+        let time = time_str
+            .first()
+            .context("No _time in transaction")?
+            .parse::<i64>()
+            .map(|ts| Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now))
+            .context("Failed to parse _time as timestamp")?;
+
+        if self.start_time.is_none_or(|current| time < current) {
+            self.start_time = Some(time);
+        }
+        if self.end_time.is_none_or(|current| time > current) {
+            self.end_time = Some(time);
+        }
+
+        Ok(())
+    }
+
     fn get_duration(&self) -> Option<f64> {
         let (Some(start), Some(end)) = (self.start_time, self.end_time) else {
             return None;
@@ -536,50 +561,52 @@ impl TransactionPool {
     }
 
     fn freeze_trans_exceeded_max_span_restriction(&mut self) {
-        if self.params.max_span.as_secs() > 0 {
-            let mut keys_to_freeze = Vec::new();
-            if let Some(earliest_ts) = self.earliest_event_timestamp {
-                for (trans_key, trans) in &self.live_trans {
-                    if let Some(end_time) = trans.end_time
-                        && (end_time - earliest_ts).num_seconds() as u64
-                            > self.params.max_span.as_secs()
-                    {
-                        keys_to_freeze.push(trans_key.clone());
-                    }
-                }
-            }
-            for key in keys_to_freeze {
-                if let Some(trans) = self.live_trans.remove(&key) {
-                    self.frozen_trans.push(trans);
-                    self.trans_complete_flag.remove(&key);
-                }
-            }
+        let max_span_secs = self.params.max_span.as_secs();
+        if max_span_secs == 0 {
+            return;
+        }
 
-            // Also check start transaction stack for max span violations
-            let mut stack_keys_to_freeze = Vec::new();
-            if let Some(earliest_ts) = self.earliest_event_timestamp {
-                for (trans_key, trans_stack) in &self.start_trans_stack {
-                    for trans in trans_stack {
-                        if let Some(end_time) = trans.end_time
-                            && (end_time - earliest_ts).num_seconds() as u64
-                                > self.params.max_span.as_secs()
-                        {
-                            stack_keys_to_freeze.push(trans_key.clone());
-                            break;
-                        }
-                    }
-                }
-            }
+        let Some(earliest_ts) = self.earliest_event_timestamp else {
+            return;
+        };
+        let max_span_limit = max_span_secs as i64;
 
-            for key in stack_keys_to_freeze {
-                if let Some(mut trans_stack) = self.start_trans_stack.remove(&key) {
-                    // Move all pending start transactions to frozen
-                    for trans in trans_stack.drain(..) {
-                        self.frozen_trans.push(trans);
-                    }
+        let mut keys_to_freeze = Vec::new();
+        for (trans_key, trans) in &self.live_trans {
+            if let Some(end_time) = trans.end_time {
+                let elapsed = end_time.signed_duration_since(earliest_ts).num_seconds();
+                if elapsed > max_span_limit {
+                    keys_to_freeze.push(trans_key.clone());
                 }
             }
         }
+
+        for key in keys_to_freeze {
+            if let Some(trans) = self.live_trans.remove(&key) {
+                self.frozen_trans.push(trans);
+                self.trans_complete_flag.remove(&key);
+            }
+        }
+
+        self.start_trans_stack.retain(|_, stack| {
+            let mut idx = 0;
+            while idx < stack.len() {
+                let expire = stack[idx]
+                    .end_time
+                    .map(|end_time| {
+                        end_time.signed_duration_since(earliest_ts).num_seconds() > max_span_limit
+                    })
+                    .unwrap_or(false);
+
+                if expire {
+                    let trans = stack.remove(idx);
+                    self.frozen_trans.push(trans);
+                } else {
+                    idx += 1;
+                }
+            }
+            !stack.is_empty()
+        });
     }
 
     fn make_trans_key(&self, event: &HashMap<String, SmallVec<[String; 4]>>) -> TransKey {
@@ -622,6 +649,7 @@ impl TransactionPool {
             .parse::<i64>()
             .map(|ts| Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now))
             .context("Failed to parse _time as timestamp")?;
+        let event_time_micros = time.timestamp_micros();
         self.earliest_event_timestamp = Some(time);
 
         self.freeze_trans_exceeded_max_span_restriction();
@@ -629,6 +657,12 @@ impl TransactionPool {
         let trans_key = self.make_trans_key(&event);
 
         if has_start_conditions || has_end_conditions {
+            let reserve_slot_for_start = has_start_conditions;
+            let pre_start_limit = if reserve_slot_for_start {
+                self.params.max_events.saturating_sub(1)
+            } else {
+                self.params.max_events
+            };
             // Bracket matching logic (for when start/end conditions are explicitly specified)
             // When processing in reverse chronological order (as in SQL ORDER BY _time DESC),
             // END events go to stack waiting for START events to close them
@@ -645,8 +679,14 @@ impl TransactionPool {
                 let end_stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
 
                 if let Some(mut end_trans) = end_stack.pop() {
-                    // Add the start event to the matched end transaction
-                    end_trans.add_event(&event)?;
+                    if self.params.max_events > 0
+                        && end_trans.get_event_count() >= self.params.max_events
+                    {
+                        end_trans.update_start_time_only(&event)?;
+                    } else {
+                        // Add the start event to the matched end transaction
+                        end_trans.add_event(&event)?;
+                    }
                     end_trans.set_is_closed(); // Mark as closed since it has both start and end
                     self.frozen_trans.push(end_trans);
                 } else {
@@ -659,7 +699,16 @@ impl TransactionPool {
                 // Regular event (neither start nor end) - add to most recent end transaction waiting for start (on stack)
                 let stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
                 if let Some(trans) = stack.last_mut() {
-                    trans.add_event(&event)?;
+                    let reached_pre_start_limit = reserve_slot_for_start
+                        && self.params.max_events > 0
+                        && trans.get_event_count() >= pre_start_limit;
+
+                    if (!reached_pre_start_limit)
+                        && (self.params.max_events == 0
+                            || trans.get_event_count() < self.params.max_events)
+                    {
+                        trans.add_event(&event)?;
+                    }
                 } else {
                     // If no end transaction waiting, add to regular live transaction
                     if let Some(trans) = self.live_trans.get_mut(&trans_key) {
@@ -676,9 +725,11 @@ impl TransactionPool {
             // Enhanced simple grouping logic with null wildcard matching
             // If there are transactions with compatible keys (considering nulls as wildcards),
             // add to the best matching one based on non-null field matches and time proximity; otherwise create new
-            if let Some(best_matching_key) =
-                self.find_best_matching_transaction_key(&self.live_trans, &trans_key)
-            {
+            if let Some(best_matching_key) = self.find_best_matching_transaction_key(
+                &self.live_trans,
+                &trans_key,
+                Some(event_time_micros),
+            ) {
                 if let Some(trans) = self.live_trans.get_mut(&best_matching_key) {
                     trans.add_event(&event)?;
                 }
@@ -725,57 +776,60 @@ impl TransactionPool {
     }
 
     // Find the best matching transaction key based on non-null field matches (more non-null matches = better match)
-    fn find_best_matching_transaction_key<V>(
+    fn find_best_matching_transaction_key(
         &self,
-        collection: &HashMap<TransKey, V>,
+        collection: &HashMap<TransKey, Transaction>,
         target_key: &TransKey,
+        target_time: Option<i64>, // Time of the event being added
     ) -> Option<TransKey> {
-        let mut best_matches = Vec::new();
+        let mut best_key: Option<TransKey> = None;
+        let mut best_score: usize = 0;
+        let mut best_time_diff: Option<i64> = None;
 
-        // Find all compatible keys and calculate match scores
-        for (existing_key, _) in collection.iter() {
-            if self.keys_match_with_null_wildcards(existing_key, target_key) {
-                // Calculate score based on number of non-null exact matches
-                let exact_non_null_matches = existing_key
-                    .iter()
-                    .zip(target_key.iter())
-                    .filter(|(v1, v2)| {
-                        // Both are Some and they match exactly
-                        matches!((v1, v2), (Some(val1), Some(val2)) if val1 == val2)
-                    })
-                    .count();
-                best_matches.push((existing_key.clone(), exact_non_null_matches));
+        for (existing_key, transaction) in collection.iter() {
+            if !self.keys_match_with_null_wildcards(existing_key, target_key) {
+                continue;
+            }
+
+            let exact_non_null_matches = existing_key
+                .iter()
+                .zip(target_key.iter())
+                .filter(|(v1, v2)| matches!((v1, v2), (Some(val1), Some(val2)) if val1 == val2))
+                .count();
+
+            let time_diff = match (target_time, transaction.start_time) {
+                (Some(target_t), Some(start_time)) => {
+                    Some((target_t - start_time.timestamp_micros()).abs())
+                }
+                _ => None,
+            };
+
+            let is_better = match &best_key {
+                None => true,
+                Some(best_key_ref) => match exact_non_null_matches.cmp(&best_score) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Less => false,
+                    std::cmp::Ordering::Equal => match (time_diff, best_time_diff) {
+                        (Some(diff_a), Some(diff_b)) => match diff_a.cmp(&diff_b) {
+                            std::cmp::Ordering::Less => true,
+                            std::cmp::Ordering::Greater => false,
+                            std::cmp::Ordering::Equal => existing_key < best_key_ref,
+                        },
+                        (Some(_), None) => true,
+                        (None, Some(_)) => false,
+                        (None, None) => existing_key < best_key_ref,
+                    },
+                },
+            };
+
+            if is_better {
+                best_key = Some(existing_key.clone());
+                best_score = exact_non_null_matches;
+                best_time_diff = time_diff;
             }
         }
 
-        if best_matches.is_empty() {
-            return None;
-        }
-
-        // Find the key with the highest score (most non-null exact matches)
-        // If multiple keys have the same score, sort them to ensure deterministic behavior
-        best_matches.sort_by(|a, b| {
-            // Sort by score descending first
-            b.1.cmp(&a.1)
-                // Then by key content to ensure deterministic behavior when scores are equal
-                .then_with(|| {
-                    // Compare key elements in order to establish a deterministic ordering
-                    for (v1, v2) in a.0.iter().zip(b.0.iter()) {
-                        match (v1, v2) {
-                            (None, None) => continue, // Keep comparing if both are None
-                            (None, Some(_)) => return std::cmp::Ordering::Less, // None comes before Some
-                            (Some(_), None) => return std::cmp::Ordering::Greater, // Some comes after None
-                            (Some(s1), Some(s2)) => match s1.cmp(s2) {
-                                std::cmp::Ordering::Equal => continue, // Keep comparing if equal
-                                other => return other,
-                            },
-                        }
-                    }
-                    // If all compared elements are equal, compare lengths
-                    a.0.len().cmp(&b.0.len())
-                })
-        });
-        Some(best_matches[0].0.clone())
+        best_key
     }
 
     fn is_valid_event_simple_grouping(
@@ -965,6 +1019,9 @@ mod tests {
         TimestampMicrosecondArray,
     };
     use chrono::{Duration as ChronoDuration, Utc};
+    use std::collections::BTreeMap;
+    use std::fs::File;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     // Helper function to create a simple event HashMap
@@ -1010,6 +1067,48 @@ mod tests {
         let values_array = inner_array.as_any().downcast_ref::<StringArray>().unwrap();
         (0..values_array.len())
             .map(|i| values_array.value(i).to_string())
+            .collect()
+    }
+
+    fn fixture_csv_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("access_log.csv")
+    }
+
+    fn sample_csv_records() -> Vec<csv::StringRecord> {
+        let file = File::open(fixture_csv_path()).expect("fixture access_log.csv must be present");
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(file);
+        reader
+            .records()
+            .map(|record| record.expect("valid csv record"))
+            .collect()
+    }
+
+    fn record_to_event(record: &csv::StringRecord) -> HashMap<String, SmallVec<[String; 4]>> {
+        let time_str = record.get(0).expect("timestamp column");
+        let message = record.get(1).expect("message column");
+        let client_ip = record.get(2).expect("client_ip column");
+        let jsessionid = record.get(3).expect("JSESSIONID column");
+
+        let time = chrono::DateTime::parse_from_rfc3339(time_str)
+            .expect("valid timestamp")
+            .timestamp_micros();
+
+        let mut event = HashMap::new();
+        event.insert(FIELD_TIME.to_string(), smallvec![time.to_string()]);
+        event.insert(FIELD_MESSAGE.to_string(), smallvec![message.to_string()]);
+        event.insert("client_ip".to_string(), smallvec![client_ip.to_string()]);
+        event.insert("JSESSIONID".to_string(), smallvec![jsessionid.to_string()]);
+        event
+    }
+
+    fn sample_csv_events() -> Vec<HashMap<String, SmallVec<[String; 4]>>> {
+        sample_csv_records()
+            .into_iter()
+            .map(|record| record_to_event(&record))
             .collect()
     }
 
@@ -1789,10 +1888,10 @@ mod tests {
         // 1: host=host1, user=user1 -> should be in a group
         // 2: host=host1, user=user1 -> should be with #1
         // 3: host=host2, user=user3 -> should be alone
-        // 4: host=host1, user=user4 -> should be alone
+        // 4: host=host1, user=user4 -> should be in a group
         // 5: host=host2, user=user1 -> should be alone
-        // 6: host=host1, user=null -> should be discarded (single null field)
-        // 7: host=null, user=user4 -> should be discarded (single null field)
+        // 6: host=host1, user=null -> could be with #1 or #4, but #4 is nearer/ more recent, should with #4, because null as a wildcard
+        // 7: host=null, user=user4 -> with #4
         // 8: host=null, user=null -> should be discarded (all null fields)
         let params = TransParams::new(
             Some(vec![]),
@@ -1939,23 +2038,23 @@ mod tests {
             "Event 7 should be in results (partial null)"
         );
 
-        // Event 6 has (host=host1, user=null) and Event 4 has (host=host1, user=user4)
-        // With wildcard matching, they might be in the same group since null matches with user4 for 'user' field
-        // Event 7 has (host=null, user=user4) which could match with others for wildcard matching
-        // The expected result {4, 6, 7}, {5}, {3}, {1,2} from the example suggests these
-        // might be grouped based on partial matches via wildcard
-
-        let has_126_group = message_groups.iter().any(|group| {
-            let has_1 = group.contains(&"1".to_string());
-            let has_2 = group.contains(&"2".to_string());
-            let has_6 = group.contains(&"6".to_string());
-            has_1 && has_2 && has_6 && group.len() == 3
-        });
-        assert!(has_126_group, "Should have a group with 1, 2, 6");
-        let has_47_group = message_groups.iter().any(|group| {
-            group.contains(&"4".to_string()) && group.contains(&"7".to_string()) && group.len() == 2
-        });
-        assert!(has_47_group, "Should have a group with 4, 7");
+        assert!(
+            message_groups.iter().any(|group| {
+                group.contains(&"1".to_string())
+                    && group.contains(&"2".to_string())
+                    && group.len() == 2
+            }),
+            "Should have a group with 1, 2"
+        );
+        assert!(
+            message_groups.iter().any(|group| {
+                group.contains(&"4".to_string())
+                    && group.contains(&"6".to_string())
+                    && group.contains(&"7".to_string())
+                    && group.len() == 3
+            }),
+            "Should have a group with 4, 6, 7"
+        );
 
         assert!(
             all_events_in_results.contains(&"4".to_string()),
@@ -1971,5 +2070,501 @@ mod tests {
             !all_events_in_results.contains(&"8".to_string()),
             "Event 8 should be excluded (all key fields null)"
         );
+    }
+
+    #[test]
+    fn test_transaction_with_three_fields_and_nulls() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![(
+                "fields".to_string(),
+                Arg::String("hostname,user,app".to_string()),
+            )],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params);
+
+        #[rustfmt::skip]
+        // Test data: (time, hostname, user, app, message)
+        let test_data = vec![
+            (1600000000000000, Some("host1"), Some("user1"), Some("app1"), "message1"),
+            (1599999999000000, Some("host1"), Some("user1"), Some("app1"), "message2"),
+            (1599999998000000, Some("host1"), Some("user2"), Some("app2"), "message3"),
+            (1599999997000000, Some("host2"), Some("user3"), Some("app3"), "message4"),
+            (1599999996000000, Some("host3"), Some("user4"), Some("app1"), "message5"),
+            (1599999995000000, Some("host1"), None, Some("app1"), "message6"),
+            (1599999994000000, Some("host1"), None, Some("app2"), "message7"),
+            (1599999993000000, Some("host2"), None, Some("app3"), "message8"),
+            (1599999992000000, None, Some("user1"), Some("app1"), "message9"),
+            (1599999991000000, None, Some("user2"), Some("app2"), "message10"),
+            (1599999990000000, None, Some("user3"), Some("app3"), "message11"),
+            (1599999989000000, Some("host1"), Some("user1"), None, "message12"),
+            (1599999988000000, Some("host2"), Some("user3"), None, "message13"),
+            (1599999987000000, Some("host3"), Some("user4"), None, "message14"),
+            (1599999986000000, None, None, Some("app1"), "message15"),
+            (1599999985000000, None, None, Some("app2"), "message16"),
+            (1599999984000000, None, None, Some("app3"), "message17"),
+            (1599999983000000, Some("host1"), None, None, "message18"),
+            (1599999982000000, Some("host2"), None, None, "message19"),
+            (1599999981000000, Some("host3"), None, None, "message20"),
+            (1599999980000000, None, Some("user1"), None, "message21"),
+            (1599999979000000, None, Some("user2"), None, "message22"),
+            (1599999978000000, None, Some("user4"), None, "message23"),
+            (1599999977000000, None, None, None, "message24"),
+        ];
+
+        for (time, hostname, user, app, message) in test_data {
+            let event = create_event_nullable(
+                time,
+                message,
+                &[("hostname", hostname), ("user", user), ("app", app)],
+            );
+            pool.add_event(event).unwrap();
+        }
+
+        // Get results
+        let final_transactions = pool.get_frozen_trans();
+        let live_transactions = pool.get_live_trans();
+        let all_transactions = [&final_transactions[..], &live_transactions[..]].concat();
+
+        // Extract messages for verification
+        let mut message_groups: Vec<Vec<String>> = Vec::new();
+        for trans in &all_transactions {
+            let mut msgs: Vec<String> = trans
+                .messages
+                .iter()
+                .flat_map(|msg_list| msg_list.iter().cloned())
+                .collect();
+            msgs.sort(); // Sort for consistent comparison
+            message_groups.push(msgs);
+        }
+
+        // Sort the groups for comparison since order might vary
+        message_groups.sort();
+
+        dbg!(&message_groups);
+
+        // Expected output:
+        // {message1 message12 message2 message21 message6 message9} - group with host1,user1,app1 + wildcard matches
+        // {message10 message16 message18 message22 message3 message7} - group with host1,user2,app2 + wildcard matches
+        // {message11 message13 message17 message19 message4 message8} - group with host2,user3,app3 + wildcard matches
+        // {message14 message15 message20 message23 message5} - group with host3,user4,app1 + wildcard matches
+
+        let all_messages_in_results: Vec<String> = message_groups
+            .iter()
+            .flat_map(|group| group.iter().cloned())
+            .collect();
+
+        // Event 24 should not be present because ALL its key fields are null
+        assert!(
+            !all_messages_in_results.contains(&"message24".to_string()),
+            "Event 24 should not be in results (all nulls)"
+        );
+
+        // Check that expected messages are in results
+        for i in 1..24 {
+            // messages 1-23 should be present
+            let message = format!("message{}", i);
+            assert!(
+                all_messages_in_results.contains(&message),
+                "Message {} should be in results",
+                i
+            );
+        }
+
+        fn has_group_with_messages(groups: &Vec<Vec<String>>, expected_messages: &[&str]) -> bool {
+            for group in groups {
+                let mut all_match = true;
+                for &msg in expected_messages {
+                    if !group.contains(&msg.to_string()) {
+                        all_match = false;
+                        break;
+                    }
+                }
+                if all_match && group.len() == expected_messages.len() {
+                    return true;
+                }
+            }
+            false
+        }
+
+        // Expected groupings according to specification:
+        // Group 1: {message1, message2, message6, message9, message12, message21} - host1,user1,app1 + wildcard matches
+        assert!(
+            has_group_with_messages(
+                &message_groups,
+                &[
+                    "message1",
+                    "message2",
+                    "message6",
+                    "message9",
+                    "message12",
+                    "message21"
+                ],
+            ),
+            "Should have group with message1, message2, message6, message9, message12, message21"
+        );
+
+        // Group 2: {message3, message7, message10, message16, message18, message22} - host1,user2,app2 + wildcard matches
+        assert!(
+            has_group_with_messages(
+                &message_groups,
+                &[
+                    "message3",
+                    "message7",
+                    "message10",
+                    "message16",
+                    "message18",
+                    "message22"
+                ],
+            ),
+            "Should have group with message3, message7, message10, message16, message18, message22"
+        );
+
+        // Group 3: {message4, message8, message11, message13, message17, message19} - host2,user3,app3 + wildcard matches
+        assert!(
+            has_group_with_messages(
+                &message_groups,
+                &[
+                    "message4",
+                    "message8",
+                    "message11",
+                    "message13",
+                    "message17",
+                    "message19"
+                ],
+            ),
+            "Should have group with message4, message8, message11, message13, message17, message19"
+        );
+
+        // Group 4: {message5, message14, message15, message20, message23} - host3,user4,app1 + wildcard matches
+        assert!(
+            has_group_with_messages(
+                &message_groups,
+                &[
+                    "message5",
+                    "message14",
+                    "message15",
+                    "message20",
+                    "message23"
+                ],
+            ),
+            "Should have group with message5, message14, message15, message20, message23"
+        );
+
+        // Verify that all 24 - 1 = 23 messages (excluding message24 which was discarded) are in exactly one group
+        assert_eq!(
+            all_messages_in_results.len(),
+            23,
+            "Should have exactly 23 messages in groups (excluding discarded message24)"
+        );
+    }
+
+    #[test]
+    fn test_max_events_bracket_matching_with_csv() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                (
+                    "fields".to_string(),
+                    Arg::String("client_ip,JSESSIONID".to_string()),
+                ),
+                ("starts_with".to_string(), Arg::String("view".to_string())), // Look for "view" in messages
+                ("ends_with".to_string(), Arg::String("purchase".to_string())), // Look for "purchase" in messages
+                ("max_events".to_string(), Arg::Int(2)), // Set max_events to 2
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params);
+
+        for record in sample_csv_records() {
+            let event = record_to_event(&record);
+            pool.add_event(event).unwrap();
+        }
+
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+
+        let closed: Vec<_> = transactions.into_iter().filter(|t| t.is_closed).collect();
+        assert!(
+            !closed.is_empty(),
+            "Expected at least one closed transaction from fixture"
+        );
+
+        for trans in &closed {
+            assert!(
+                trans.get_event_count() <= 2,
+                "Transaction exceeds max_events=2 with {} events",
+                trans.get_event_count()
+            );
+        }
+
+        assert!(
+            closed.iter().any(|t| t.get_event_count() == 2),
+            "Expected at least one closed transaction to have exactly two events"
+        );
+    }
+
+    #[test]
+    fn test_max_events_bracket_matching_with_limit_one() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                (
+                    "fields".to_string(),
+                    Arg::String("client_ip,JSESSIONID".to_string()),
+                ),
+                ("starts_with".to_string(), Arg::String("view".to_string())),
+                ("ends_with".to_string(), Arg::String("purchase".to_string())),
+                ("max_events".to_string(), Arg::Int(1)),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params);
+
+        for event in sample_csv_events() {
+            pool.add_event(event).unwrap();
+        }
+
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+
+        let closed: Vec<_> = transactions.into_iter().filter(|t| t.is_closed).collect();
+        assert!(
+            !closed.is_empty(),
+            "Expected closed transactions when max_events=1"
+        );
+        assert!(
+            closed.iter().all(|t| t.get_event_count() <= 1),
+            "Closed transactions should be limited to one event each"
+        );
+        assert!(closed.iter().all(|t| {
+            t.messages
+                .iter()
+                .flat_map(|msgs| msgs.iter())
+                .all(|msg| msg.contains("purchase"))
+        }));
+    }
+
+    #[test]
+    fn test_max_events_duration() {
+        let events = sample_csv_events();
+
+        let params_no_span = TransParams::new(
+            Some(vec![]),
+            vec![
+                (
+                    "fields".to_string(),
+                    Arg::String("client_ip,JSESSIONID".to_string()),
+                ),
+                ("starts_with".to_string(), Arg::String("view".to_string())),
+                ("ends_with".to_string(), Arg::String("purchase".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool_no_span = TransactionPool::new(params_no_span);
+        for event in &events {
+            pool_no_span.add_event(event.clone()).unwrap();
+        }
+
+        let mut transactions = pool_no_span.get_frozen_trans();
+        transactions.extend(pool_no_span.get_live_trans());
+
+        assert!(
+            !transactions.is_empty(),
+            "Expected transactions from sample data"
+        );
+
+        let closed_counts: Vec<_> = transactions
+            .iter()
+            .filter(|t| t.is_closed)
+            .map(|t| t.get_event_count())
+            .collect();
+        assert!(
+            !closed_counts.is_empty(),
+            "Expected closed transactions when no max_events limit is set"
+        );
+        assert!(
+            closed_counts.iter().any(|&c| c >= 3),
+            "Expected at least one closed transaction with three or more events"
+        );
+        assert!(
+            closed_counts.contains(&2),
+            "Expected at least one closed transaction with two events"
+        );
+
+        let open_counts: Vec<_> = transactions
+            .iter()
+            .filter(|t| !t.is_closed)
+            .map(|t| t.get_event_count())
+            .collect();
+        assert!(
+            open_counts.contains(&1),
+            "Expected at least one open transaction with a single event"
+        );
+
+        let params_with_span = TransParams::new(
+            Some(vec![]),
+            vec![
+                (
+                    "fields".to_string(),
+                    Arg::String("client_ip,JSESSIONID".to_string()),
+                ),
+                ("starts_with".to_string(), Arg::String("view".to_string())),
+                ("ends_with".to_string(), Arg::String("purchase".to_string())),
+                ("max_span".to_string(), Arg::String("2s".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool_with_span = TransactionPool::new(params_with_span);
+        for event in &events {
+            pool_with_span.add_event(event.clone()).unwrap();
+        }
+
+        let mut span_transactions = pool_with_span.get_frozen_trans();
+        span_transactions.extend(pool_with_span.get_live_trans());
+
+        assert!(
+            span_transactions.iter().any(|t| t.is_closed),
+            "Expected closed transactions when max_span is set"
+        );
+
+        let mut span_closed: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        let mut span_open: BTreeMap<(String, String), Vec<Vec<String>>> = BTreeMap::new();
+
+        for trans in &span_transactions {
+            let key = (
+                trans
+                    .fields
+                    .get("client_ip")
+                    .and_then(|v| v.first())
+                    .cloned()
+                    .unwrap_or_default(),
+                trans
+                    .fields
+                    .get("JSESSIONID")
+                    .and_then(|v| v.first())
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            let messages: Vec<String> = trans
+                .messages
+                .iter()
+                .flat_map(|msgs| msgs.iter().cloned())
+                .collect();
+            if trans.is_closed {
+                span_closed.insert(key, messages);
+            } else {
+                span_open.entry(key).or_default().push(messages);
+            }
+        }
+
+        let expected_closed_keys = [
+            ("27.96.191.11".to_string(), "SD6SL1FF10ADFF5226".to_string()),
+            ("60.18.93.11".to_string(), "SD4SL5FF3ADFF5111".to_string()),
+        ];
+
+        for key in &expected_closed_keys {
+            assert!(
+                span_closed.contains_key(key),
+                "Expected closed transaction for {key:?} within max_span"
+            );
+        }
+
+        assert!(
+            span_closed.values().any(|msgs| msgs.len() >= 2),
+            "Expected at least one closed transaction to retain multiple events"
+        );
+
+        for trans in span_transactions.iter().filter(|t| t.is_closed) {
+            if let Some(duration) = trans.get_duration() {
+                assert!(
+                    duration <= 2.0,
+                    "Closed transaction duration {} exceeds max_span",
+                    duration
+                );
+            }
+            assert!(
+                trans.get_event_count() <= 3,
+                "Closed transaction should not retain four events when max_span=2s"
+            );
+        }
+
+        assert!(
+            span_open
+                .values()
+                .flat_map(|lists| lists.iter())
+                .any(|messages| messages.len() == 1),
+            "Expected at least one truncated open transaction when max_span applies"
+        );
+    }
+
+    #[test]
+    fn test_max_span_one_second_from_fixture() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                (
+                    "fields".to_string(),
+                    Arg::String("client_ip,JSESSIONID".to_string()),
+                ),
+                ("starts_with".to_string(), Arg::String("view".to_string())),
+                ("ends_with".to_string(), Arg::String("purchase".to_string())),
+                ("max_span".to_string(), Arg::String("1s".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params);
+
+        for event in sample_csv_events() {
+            pool.add_event(event).unwrap();
+        }
+
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+
+        let closed: Vec<_> = transactions.into_iter().filter(|t| t.is_closed).collect();
+        assert!(
+            closed.len() >= 2,
+            "Expected at least two closed transactions when max_span=1s"
+        );
+
+        let expected_keys = [
+            ("27.96.191.11".to_string(), "SD6SL1FF10ADFF5226".to_string()),
+            ("88.12.32.208".to_string(), "SD1SL1FF3ADFF5727".to_string()),
+        ];
+
+        for (ip, session) in expected_keys {
+            let matching = closed.iter().any(|trans| {
+                let client_ip = trans
+                    .fields
+                    .get("client_ip")
+                    .and_then(|vals| vals.first())
+                    .cloned();
+                let jsession = trans
+                    .fields
+                    .get("JSESSIONID")
+                    .and_then(|vals| vals.first())
+                    .cloned();
+                if let (Some(client_ip), Some(jsession)) = (client_ip, jsession)
+                    && client_ip == ip
+                    && jsession == session
+                    && let Some(duration) = trans.get_duration()
+                {
+                    return duration <= 1.0 && trans.get_event_count() >= 2;
+                }
+                false
+            });
+            assert!(
+                matching,
+                "Expected closed transaction for ({ip}, {session}) within 1s span"
+            );
+        }
     }
 }
