@@ -61,9 +61,12 @@ impl TableFunction for Flatten {
         let mut processed_columns: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
 
+        let mut missing_column_encountered = false;
+
         for column_name in &self.column_names {
             let Some((column_index, field)) = schema.column_with_name(column_name) else {
-                return Err(anyhow::anyhow!("Column '{column_name}' not found"));
+                missing_column_encountered = true;
+                continue;
             };
 
             if !matches!(field.data_type(), DataType::List(_) | DataType::Null) {
@@ -78,6 +81,32 @@ impl TableFunction for Flatten {
                 list_columns_info.push((column_index, Arc::clone(input.column(column_index))));
                 processed_columns.insert(column_index);
             }
+        }
+
+        if missing_column_encountered {
+            let mut new_fields = schema.fields().to_vec();
+            let mut updated_columns: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+
+            for (col_idx, _) in &list_columns_info {
+                if !updated_columns.contains(col_idx) {
+                    let original_field = &new_fields[*col_idx];
+                    let inner_type = match original_field.data_type() {
+                        DataType::List(f) | DataType::LargeList(f) => f.data_type().clone(),
+                        DataType::Null => DataType::Null,
+                        _ => unreachable!(),
+                    };
+                    new_fields[*col_idx] = Arc::new(Field::new(
+                        original_field.name(),
+                        inner_type,
+                        original_field.is_nullable(),
+                    ));
+                    updated_columns.insert(*col_idx);
+                }
+            }
+
+            let new_schema = Arc::new(Schema::new(new_fields));
+            return Ok(Some(RecordBatch::new_empty(new_schema)));
         }
 
         if list_columns_info.is_empty() {
@@ -571,21 +600,24 @@ mod tests {
             DataType::Int32,
             false,
         )]));
+        let original_schema = schema.clone();
 
         let input_batch = RecordBatch::try_new(schema, vec![int_array as Arc<dyn Array>])
             .expect("Failed to create record batch");
 
         let params = vec![Arg::String("nonexistent_col".to_string())];
         let mut flatten = Flatten::new(Some(params)).expect("Failed to create Flatten");
-        let result = flatten.process(input_batch);
+        let output_batch_option = flatten.process(input_batch).expect("Processing failed");
+        assert!(output_batch_option.is_some());
+        let output_batch = output_batch_option.unwrap();
 
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Column 'nonexistent_col' not found")
-        );
+        assert_eq!(output_batch.num_rows(), 0);
+        assert_eq!(output_batch.num_columns(), original_schema.fields().len());
+
+        let output_schema = output_batch.schema();
+        assert_eq!(output_schema.fields().len(), original_schema.fields().len());
+        assert_eq!(output_schema.field(0).name(), "int_col");
+        assert_eq!(output_schema.field(0).data_type(), &DataType::Int32);
     }
 
     #[test]
