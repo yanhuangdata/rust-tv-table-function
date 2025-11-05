@@ -967,7 +967,7 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
 name = "rust-tvtf"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "arrow",
@@ -988,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "rust-tvtf-api"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "arrow",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "rust-tvtf-example"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "arrow",
