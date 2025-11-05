@@ -74,6 +74,27 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
             )
             .build()
             .context("create `flatten` registry failed")?,
+        FunctionRegistry::builder()
+            .name("filldown")
+            .init(Arc::new(|ctx| {
+                Filldown::new(ctx.arguments).map(|f| Box::new(f) as Box<dyn TableFunction>)
+            }))
+            .signature(Signature::empty())
+            .build()
+            .context("create `filldown` registry failed")?,
+        FunctionRegistry::builder()
+            .name("filldown")
+            .init(Arc::new(|ctx| {
+                Filldown::new(ctx.arguments).map(|f| Box::new(f) as Box<dyn TableFunction>)
+            }))
+            .signature(
+                Signature::builder()
+                    .parameter(ArgType::String) // column names (comma-separated)
+                    .build()
+                    .context("Failed to build signature parameters")?,
+            )
+            .build()
+            .context("create `filldown` registry failed")?,
     ])
 }
 
