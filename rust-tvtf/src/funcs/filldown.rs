@@ -105,11 +105,14 @@ impl TableFunction for Filldown {
         for col_idx in 0..input.num_columns() {
             let col = input.column(col_idx).clone();
 
-            if col.null_count() == 0 || !self.need_filldown(schema.field(col_idx).name()) {
-                if let Ok(Some(last)) = extract_last_value(&col) {
-                    self.last_values[col_idx] = Some(last);
-                }
-                // No nulls or column not specified for filldown; copy as is
+            // No nulls or column not specified for filldown; copy as is
+            if !self.need_filldown(schema.field(col_idx).name()) {
+                output_columns.push(col);
+                continue;
+            }
+
+            if col.null_count() == 0 {
+                self.last_values[col_idx] = extract_last_value(&col)?;
                 output_columns.push(col);
                 continue;
             }
