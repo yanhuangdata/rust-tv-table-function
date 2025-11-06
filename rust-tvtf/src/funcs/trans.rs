@@ -203,21 +203,19 @@ impl TransParams {
     }
 
     fn matches_starts_with(&self, event: &HashMap<String, SmallVec<[String; 4]>>) -> bool {
-        let Some(message) = event.get(FIELD_MESSAGE) else {
-            return false;
-        };
-
         if let Some(s) = &self.starts_with
+            && let Some(message) = event.get(FIELD_MESSAGE)
             && message.iter().any(|v| v.contains(s))
         {
             return true;
         }
         if let Some(r) = &self.starts_with_regex
+            && let Some(message) = event.get(FIELD_MESSAGE)
             && message.iter().any(|v| r.is_match(v))
         {
             return true;
         }
-        // Check ends_if_field condition
+        // Check starts_if_field condition
         if self.check_boolean_field_condition(event, &self.starts_if_field) {
             return true;
         }
@@ -225,16 +223,14 @@ impl TransParams {
     }
 
     fn matches_ends_with(&self, event: &HashMap<String, SmallVec<[String; 4]>>) -> bool {
-        let Some(message) = event.get(FIELD_MESSAGE) else {
-            return false;
-        };
-
         if let Some(s) = &self.ends_with
+            && let Some(message) = event.get(FIELD_MESSAGE)
             && message.iter().any(|v| v.contains(s))
         {
             return true;
         }
         if let Some(r) = &self.ends_with_regex
+            && let Some(message) = event.get(FIELD_MESSAGE)
             && message.iter().any(|v| r.is_match(v))
         {
             return true;
@@ -667,33 +663,70 @@ impl TransactionPool {
             // When processing in reverse chronological order (as in SQL ORDER BY _time DESC),
             // END events go to stack waiting for START events to close them
             if self.params.matches_ends_with(&event) {
-                // When an end event is encountered, push to the stack waiting for a matching start
-                let mut new_trans = Transaction::new(self.params.fields.clone());
-                new_trans.add_event(&event)?;
-
-                // Push to the end transaction stack for this key (waiting for a matching start)
-                let stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
-                stack.push(new_trans);
-            } else if self.params.matches_starts_with(&event) {
-                // When a start event is encountered, try to match with most recent unmatched end event
-                let end_stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
-
-                if let Some(mut end_trans) = end_stack.pop() {
-                    if self.params.max_events > 0
-                        && end_trans.get_event_count() >= self.params.max_events
-                    {
-                        end_trans.update_start_time_only(&event)?;
-                    } else {
-                        // Add the start event to the matched end transaction
-                        end_trans.add_event(&event)?;
-                    }
-                    end_trans.set_is_closed(); // Mark as closed since it has both start and end
-                    self.frozen_trans.push(end_trans);
-                } else {
-                    // If no matching end event, just store this start event in live_trans
+                if has_start_conditions {
+                    // When an end event is encountered, push to the stack waiting for a matching start
                     let mut new_trans = Transaction::new(self.params.fields.clone());
                     new_trans.add_event(&event)?;
-                    self.live_trans.insert(trans_key.clone(), new_trans);
+
+                    let stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
+                    stack.push(new_trans);
+                } else {
+                    let mut trans = self
+                        .live_trans
+                        .remove(&trans_key)
+                        .unwrap_or_else(|| Transaction::new(self.params.fields.clone()));
+
+                    if self.params.max_events > 0
+                        && trans.get_event_count() >= self.params.max_events
+                    {
+                        trans.update_start_time_only(&event)?;
+                    } else {
+                        trans.add_event(&event)?;
+                    }
+                    trans.set_is_closed();
+                    self.trans_complete_flag.remove(&trans_key);
+                    self.frozen_trans.push(trans);
+                }
+            } else if self.params.matches_starts_with(&event) {
+                if has_end_conditions {
+                    // When a start event is encountered, try to match with most recent unmatched end event
+                    let end_stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
+
+                    if let Some(mut end_trans) = end_stack.pop() {
+                        if self.params.max_events > 0
+                            && end_trans.get_event_count() >= self.params.max_events
+                        {
+                            end_trans.update_start_time_only(&event)?;
+                        } else {
+                            // Add the start event to the matched end transaction
+                            end_trans.add_event(&event)?;
+                        }
+                        end_trans.set_is_closed(); // Mark as closed since it has both start and end
+                        self.frozen_trans.push(end_trans);
+                    } else {
+                        // If no matching end event, just store this start event in live_trans
+                        let mut new_trans = Transaction::new(self.params.fields.clone());
+                        new_trans.add_event(&event)?;
+                        self.live_trans.insert(trans_key.clone(), new_trans);
+                    }
+                } else {
+                    // Handle starts_with-only by closing the active transaction
+                    if let Some(mut existing_trans) = self.live_trans.remove(&trans_key) {
+                        if self.params.max_events > 0
+                            && existing_trans.get_event_count() >= self.params.max_events
+                        {
+                            existing_trans.update_start_time_only(&event)?;
+                        } else {
+                            existing_trans.add_event(&event)?;
+                        }
+                        existing_trans.set_is_closed();
+                        self.trans_complete_flag.remove(&trans_key);
+                        self.frozen_trans.push(existing_trans);
+                    } else {
+                        let mut new_trans = Transaction::new(self.params.fields.clone());
+                        new_trans.add_event(&event)?;
+                        self.live_trans.insert(trans_key.clone(), new_trans);
+                    }
                 }
             } else {
                 // Regular event (neither start nor end) - add to most recent end transaction waiting for start (on stack)
@@ -1689,6 +1722,395 @@ mod tests {
             // If it's still in live_trans, it's not closed yet
             assert_eq!(live_transactions.len(), 1);
         }
+    }
+
+    #[test]
+    fn test_trans_pool_starts_with_without_ends_closes_transactions() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("session_id".to_string())),
+                ("starts_with".to_string(), Arg::String("START".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params);
+        let now = Utc::now();
+
+        let event_after_first_start = create_event(
+            now.timestamp_micros(),
+            "event_after_first_start",
+            &[("session_id", "S1")],
+        );
+        let first_start = create_event(
+            (now - ChronoDuration::seconds(1)).timestamp_micros(),
+            "START first",
+            &[("session_id", "S1")],
+        );
+        let event_after_second_start = create_event(
+            (now - ChronoDuration::seconds(2)).timestamp_micros(),
+            "event_after_second_start",
+            &[("session_id", "S1")],
+        );
+        let second_start = create_event(
+            (now - ChronoDuration::seconds(3)).timestamp_micros(),
+            "START second",
+            &[("session_id", "S1")],
+        );
+
+        pool.add_event(event_after_first_start).unwrap();
+        pool.add_event(first_start).unwrap();
+        pool.add_event(event_after_second_start).unwrap();
+        pool.add_event(second_start).unwrap();
+
+        let mut frozen = pool.get_frozen_trans();
+        let mut live = pool.get_live_trans();
+        frozen.append(&mut live);
+
+        assert_eq!(frozen.len(), 2);
+
+        let mut message_groups: Vec<Vec<String>> = frozen
+            .iter()
+            .map(|trans| {
+                trans
+                    .messages
+                    .iter()
+                    .flat_map(|msgs| msgs.iter().cloned())
+                    .collect::<Vec<String>>()
+            })
+            .collect();
+        for group in &mut message_groups {
+            group.sort();
+        }
+        message_groups.sort();
+
+        assert!(
+            message_groups.contains(&vec![
+                "START first".to_string(),
+                "event_after_first_start".to_string()
+            ]),
+            "First transaction should include start and subsequent event"
+        );
+        assert!(
+            message_groups.contains(&vec![
+                "START second".to_string(),
+                "event_after_second_start".to_string()
+            ]),
+            "Second transaction should include start and subsequent event"
+        );
+
+        for trans in frozen {
+            assert!(
+                trans.is_closed,
+                "Transactions should be closed when start boundary is hit"
+            );
+        }
+    }
+
+    #[test]
+    fn test_trans_pool_ends_with_without_starts_closes_transactions() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("session_id".to_string())),
+                ("ends_with".to_string(), Arg::String("END".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params);
+        let now = Utc::now();
+
+        let event_after_end = create_event(
+            now.timestamp_micros(),
+            "event_after_end",
+            &[("session_id", "S1")],
+        );
+        let event_before_end = create_event(
+            (now - ChronoDuration::seconds(1)).timestamp_micros(),
+            "event_before_end",
+            &[("session_id", "S1")],
+        );
+        let end_event = create_event(
+            (now - ChronoDuration::seconds(2)).timestamp_micros(),
+            "END boundary",
+            &[("session_id", "S1")],
+        );
+        let older_event = create_event(
+            (now - ChronoDuration::seconds(3)).timestamp_micros(),
+            "older_event",
+            &[("session_id", "S1")],
+        );
+
+        pool.add_event(event_after_end).unwrap();
+        pool.add_event(event_before_end).unwrap();
+        pool.add_event(end_event).unwrap();
+        pool.add_event(older_event).unwrap();
+
+        let mut frozen = pool.get_frozen_trans();
+        let mut live = pool.get_live_trans();
+        frozen.append(&mut live);
+
+        assert_eq!(frozen.len(), 2);
+
+        frozen.sort_by_key(|trans| trans.start_time);
+
+        let closed_trans = &frozen[1];
+        let messages: Vec<String> = closed_trans
+            .messages
+            .iter()
+            .flat_map(|msgs| msgs.iter().cloned())
+            .collect();
+        assert!(closed_trans.is_closed);
+        assert!(messages.contains(&"event_after_end".to_string()));
+        assert!(messages.contains(&"event_before_end".to_string()));
+        assert!(messages.contains(&"END boundary".to_string()));
+
+        let older_messages: Vec<String> = frozen[0]
+            .messages
+            .iter()
+            .flat_map(|msgs| msgs.iter().cloned())
+            .collect();
+        assert_eq!(older_messages, vec!["older_event".to_string()]);
+    }
+
+    #[test]
+    fn test_trans_pool_starts_with_regex_only_closes_transactions() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("session_id".to_string())),
+                (
+                    "starts_with_regex".to_string(),
+                    Arg::String("^START\\d+".to_string()),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params);
+        let now = Utc::now();
+
+        let after_first = create_event(
+            now.timestamp_micros(),
+            "event_after_start1",
+            &[("session_id", "S1")],
+        );
+        let start1 = create_event(
+            (now - ChronoDuration::seconds(1)).timestamp_micros(),
+            "START1 boundary",
+            &[("session_id", "S1")],
+        );
+        let after_second = create_event(
+            (now - ChronoDuration::seconds(2)).timestamp_micros(),
+            "event_after_start2",
+            &[("session_id", "S1")],
+        );
+        let start2 = create_event(
+            (now - ChronoDuration::seconds(3)).timestamp_micros(),
+            "START2 boundary",
+            &[("session_id", "S1")],
+        );
+
+        pool.add_event(after_first).unwrap();
+        pool.add_event(start1).unwrap();
+        pool.add_event(after_second).unwrap();
+        pool.add_event(start2).unwrap();
+
+        let mut frozen = pool.get_frozen_trans();
+        let mut live = pool.get_live_trans();
+        frozen.append(&mut live);
+
+        assert_eq!(frozen.len(), 2);
+        for trans in &frozen {
+            assert!(trans.is_closed);
+        }
+
+        let mut groups: Vec<Vec<String>> = frozen
+            .iter()
+            .map(|trans| {
+                trans
+                    .messages
+                    .iter()
+                    .flat_map(|msgs| msgs.iter().cloned())
+                    .collect()
+            })
+            .collect();
+        for group in &mut groups {
+            group.sort();
+        }
+        groups.sort();
+        assert!(groups.contains(&vec![
+            "START1 boundary".to_string(),
+            "event_after_start1".to_string()
+        ]));
+        assert!(groups.contains(&vec![
+            "START2 boundary".to_string(),
+            "event_after_start2".to_string()
+        ]));
+    }
+
+    #[test]
+    fn test_trans_pool_ends_with_regex_only_closes_transactions() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("session_id".to_string())),
+                (
+                    "ends_with_regex".to_string(),
+                    Arg::String("END\\d+$".to_string()),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params);
+        let now = Utc::now();
+
+        let after_end = create_event(
+            now.timestamp_micros(),
+            "event_after_end1",
+            &[("session_id", "S1")],
+        );
+        let end1 = create_event(
+            (now - ChronoDuration::seconds(1)).timestamp_micros(),
+            "match END1",
+            &[("session_id", "S1")],
+        );
+        let after_end_two = create_event(
+            (now - ChronoDuration::seconds(2)).timestamp_micros(),
+            "event_after_end2",
+            &[("session_id", "S1")],
+        );
+        let end2 = create_event(
+            (now - ChronoDuration::seconds(3)).timestamp_micros(),
+            "match END2",
+            &[("session_id", "S1")],
+        );
+
+        pool.add_event(after_end).unwrap();
+        pool.add_event(end1).unwrap();
+        pool.add_event(after_end_two).unwrap();
+        pool.add_event(end2).unwrap();
+
+        let mut frozen = pool.get_frozen_trans();
+        let mut live = pool.get_live_trans();
+        frozen.append(&mut live);
+
+        assert_eq!(frozen.len(), 2);
+        for trans in &frozen {
+            assert!(trans.is_closed);
+        }
+
+        let mut groups: Vec<Vec<String>> = frozen
+            .iter()
+            .map(|trans| {
+                trans
+                    .messages
+                    .iter()
+                    .flat_map(|msgs| msgs.iter().cloned())
+                    .collect()
+            })
+            .collect();
+        for group in &mut groups {
+            group.sort();
+        }
+        groups.sort();
+        assert!(groups.contains(&vec![
+            "event_after_end1".to_string(),
+            "match END1".to_string()
+        ]));
+        assert!(groups.contains(&vec![
+            "event_after_end2".to_string(),
+            "match END2".to_string()
+        ]));
+    }
+
+    #[test]
+    fn test_trans_pool_starts_if_and_ends_if_without_message_field() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("session_id".to_string())),
+                (
+                    "starts_if_field".to_string(),
+                    Arg::String("start_flag".to_string()),
+                ),
+                (
+                    "ends_if_field".to_string(),
+                    Arg::String("end_flag".to_string()),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params);
+        let now = Utc::now();
+
+        let make_event = |offset_secs: i64, session: &str, flags: &[(&str, &str)], step: &str| {
+            let mut event = HashMap::new();
+            event.insert(
+                FIELD_TIME.to_string(),
+                smallvec![
+                    (now - ChronoDuration::seconds(offset_secs))
+                        .timestamp_micros()
+                        .to_string()
+                ],
+            );
+            event.insert("session_id".to_string(), smallvec![session.to_string()]);
+            event.insert("step".to_string(), smallvec![step.to_string()]);
+            for (k, v) in flags {
+                event.insert((*k).to_string(), smallvec![(*v).to_string()]);
+            }
+            event
+        };
+
+        let after_end = make_event(0, "S1", &[], "after_end");
+        let end_event = make_event(1, "S1", &[("end_flag", "true")], "end");
+        let between_event = make_event(2, "S1", &[], "between");
+        let start_event = make_event(3, "S1", &[("start_flag", "true")], "start");
+        let older_event = make_event(4, "S1", &[], "older");
+
+        pool.add_event(after_end).unwrap();
+        pool.add_event(end_event).unwrap();
+        pool.add_event(between_event).unwrap();
+        pool.add_event(start_event).unwrap();
+        pool.add_event(older_event).unwrap();
+
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+
+        let (closed, open): (Vec<_>, Vec<_>) =
+            transactions.iter().partition(|trans| trans.is_closed);
+
+        assert_eq!(closed.len(), 1, "Expected exactly one closed transaction");
+        let closed_trans = closed[0];
+        assert_eq!(closed_trans.get_event_count(), 3);
+
+        let mut steps: Vec<String> = closed_trans
+            .fields
+            .get("step")
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        steps.sort();
+        assert_eq!(
+            steps,
+            vec![
+                "between".to_string(),
+                "end".to_string(),
+                "start".to_string()
+            ]
+        );
+
+        assert!(open.iter().any(|trans| {
+            trans
+                .fields
+                .get("step")
+                .is_some_and(|vals| vals.contains(&"after_end".to_string()))
+        }));
     }
 
     #[test]
