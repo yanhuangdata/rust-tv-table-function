@@ -34,7 +34,7 @@ const TRANS_RESERVED_FIELDS: [&str; 5] = [
 
 #[derive(Debug, Clone)]
 pub struct TransParams {
-    pub fields: SmallVec<[String; 4]>,
+    pub fields: Arc<[String]>,
     pub starts_with: Option<String>,
     pub starts_with_regex: Option<Regex>,
     pub starts_if_field: Option<String>,
@@ -48,7 +48,7 @@ pub struct TransParams {
 impl Default for TransParams {
     fn default() -> Self {
         Self {
-            fields: Default::default(),
+            fields: Arc::from(Vec::<String>::new()),
             starts_with: Default::default(),
             starts_with_regex: Default::default(),
             starts_if_field: Default::default(),
@@ -83,7 +83,8 @@ impl TransParams {
                     if s.is_empty() {
                         continue;
                     }
-                    parsed_params.fields = s.split(',').map(|f| f.trim().to_string()).collect();
+                    let v: Vec<String> = s.split(',').map(|f| f.trim().to_string()).collect();
+                    parsed_params.fields = Arc::from(v.into_boxed_slice());
                 }
                 "starts_with" => {
                     let Arg::String(s) = arg else {
@@ -172,11 +173,10 @@ impl TransParams {
                             return Err(anyhow!("Invalid type for {}. Expected integer.", name));
                         }
                     };
-                    parsed_params.max_events = if max_events_val <= 0 {
-                        1000
-                    } else {
-                        max_events_val as u64
-                    };
+                    if max_events_val < 0 {
+                        return Err(anyhow!("max_events must be >= 0"));
+                    }
+                    parsed_params.max_events = max_events_val as u64;
                 }
                 _ => {
                     return Err(anyhow!(
@@ -203,17 +203,20 @@ impl TransParams {
     }
 
     fn matches_starts_with(&self, event: &HashMap<String, SmallVec<[String; 4]>>) -> bool {
-        if let Some(s) = &self.starts_with
-            && let Some(message) = event.get(FIELD_MESSAGE)
-            && message.iter().any(|v| v.contains(s))
-        {
-            return true;
-        }
-        if let Some(r) = &self.starts_with_regex
-            && let Some(message) = event.get(FIELD_MESSAGE)
-            && message.iter().any(|v| r.is_match(v))
-        {
-            return true;
+        if let Some(message_values) = event.get(FIELD_MESSAGE) {
+            for v in message_values {
+                // Boundary-aware matching across the whole message
+                if let Some(s) = &self.starts_with
+                    && v.contains(s)
+                {
+                    return true;
+                }
+                if let Some(r) = &self.starts_with_regex
+                    && r.is_match(v)
+                {
+                    return true;
+                }
+            }
         }
         // Check starts_if_field condition
         if self.check_boolean_field_condition(event, &self.starts_if_field) {
@@ -222,18 +225,20 @@ impl TransParams {
         false
     }
 
+    // removed boundary-specific contains and helpers per simplified matching requirement
+
     fn matches_ends_with(&self, event: &HashMap<String, SmallVec<[String; 4]>>) -> bool {
-        if let Some(s) = &self.ends_with
-            && let Some(message) = event.get(FIELD_MESSAGE)
-            && message.iter().any(|v| v.contains(s))
-        {
-            return true;
-        }
-        if let Some(r) = &self.ends_with_regex
-            && let Some(message) = event.get(FIELD_MESSAGE)
-            && message.iter().any(|v| r.is_match(v))
-        {
-            return true;
+        if let Some(message) = event.get(FIELD_MESSAGE) {
+            if let Some(s) = &self.ends_with
+                && message.iter().any(|v| v.contains(s))
+            {
+                return true;
+            }
+            if let Some(r) = &self.ends_with_regex
+                && message.iter().any(|v| r.is_match(v))
+            {
+                return true;
+            }
         }
         // Check ends_if_field condition
         if self.check_boolean_field_condition(event, &self.ends_if_field) {
@@ -245,25 +250,40 @@ impl TransParams {
 
 #[derive(Debug, Clone)]
 struct Transaction {
-    field_names: SmallVec<[String; 4]>,
-    fields: HashMap<String, SmallVec<[String; 4]>>,
+    fields: HashMap<String, SmallVec<[Arc<str>; 4]>, ahash::RandomState>,
+    key_set: hashbrown::HashSet<String, ahash::RandomState>,
     start_time: Option<DateTime<Utc>>,
     end_time: Option<DateTime<Utc>>,
-    messages: VecDeque<SmallVec<[String; 4]>>,
+    messages: VecDeque<SmallVec<[Arc<str>; 4]>>,
     event_count: u64,
     is_closed: bool,
+    has_start_marker: bool,
+    has_end_marker: bool,
 }
 
 impl Transaction {
-    fn new(field_names: SmallVec<[String; 4]>) -> Self {
+    fn new(field_names: Arc<[String]>) -> Self {
+        // Pre-size and pre-populate known key fields to avoid rehashing and key cloning on every merge
+        let mut fields =
+            HashMap::with_capacity_and_hasher(field_names.len(), ahash::RandomState::new());
+        let mut key_set = hashbrown::HashSet::with_capacity_and_hasher(
+            field_names.len(),
+            ahash::RandomState::new(),
+        );
+        for k in field_names.iter() {
+            fields.insert(k.clone(), SmallVec::<[Arc<str>; 4]>::new());
+            key_set.insert(k.clone());
+        }
         Transaction {
-            field_names,
-            fields: HashMap::new(),
+            fields,
+            key_set,
             start_time: None,
             end_time: None,
             messages: VecDeque::new(),
             event_count: 0,
             is_closed: false,
+            has_start_marker: false,
+            has_end_marker: false,
         }
     }
 
@@ -272,19 +292,27 @@ impl Transaction {
             if message.is_empty() {
                 return;
             }
-            self.messages.push_front(message.clone());
+            let mapped: SmallVec<[Arc<str>; 4]> = message
+                .iter()
+                .map(|s| Arc::<str>::from(s.as_str()))
+                .collect();
+            self.messages.push_front(mapped);
         }
 
         for (k, v) in event {
             if TRANS_RESERVED_FIELDS.contains(&k.as_str()) {
                 continue;
             }
-            if self.field_names.contains(k) {
-                self.fields.insert(k.clone(), v.clone());
-            } else {
-                let entry = self.fields.entry(k.clone()).or_default();
-                entry.extend(v.clone());
+            // If this is a configured key field, overwrite its slot (keep latest)
+            if self.key_set.contains(k) {
+                let slot = self.fields.get_mut(k).expect("pre-populated key missing");
+                slot.clear();
+                slot.extend(v.iter().map(|s| Arc::<str>::from(s.as_str())));
+                continue;
             }
+            // Otherwise, accumulate values for non-key fields
+            let entry = self.fields.entry(k.clone()).or_default();
+            entry.extend(v.iter().map(|s| Arc::<str>::from(s.as_str())));
         }
     }
 
@@ -359,11 +387,29 @@ impl Transaction {
     fn set_is_closed(&mut self) {
         self.is_closed = true;
     }
+}
 
-    #[allow(dead_code)]
-    fn get_is_closed(&self) -> bool {
-        self.is_closed
+// Process an owned set of events end-to-end
+pub fn bench_transaction_process_owned(
+    events: Vec<HashMap<String, SmallVec<[String; 4]>>>,
+) -> usize {
+    let params = TransParams::new(
+        Some(vec![]),
+        vec![
+            ("fields".to_string(), Arg::String("host".to_string())),
+            ("starts_with".to_string(), Arg::String("start".to_string())),
+            ("ends_with".to_string(), Arg::String("end".to_string())),
+            ("max_events".to_string(), Arg::Int(3)),
+        ],
+    )
+    .unwrap();
+    let mut pool = TransactionPool::new(params);
+    for event in events {
+        let _ = pool.add_event(event);
     }
+    let mut groups = pool.get_frozen_trans();
+    groups.extend(pool.get_live_trans());
+    groups.len()
 }
 
 fn to_record_batch(
@@ -428,7 +474,7 @@ fn to_record_batch(
     for transaction in transactions {
         for messages in transaction.messages.iter() {
             for message in messages {
-                messages_builder.values().append_value(message);
+                messages_builder.values().append_value(message.as_ref());
             }
         }
         messages_builder.append(true);
@@ -459,10 +505,11 @@ fn to_record_batch(
                     field_builder.append_null();
                     continue;
                 };
-                let mut values = values.clone();
-                values.sort_unstable();
-                values.dedup();
-                let Some(value) = values.first() else {
+                // Borrow and dedup without cloning the vector
+                let mut refs: Vec<&str> = values.iter().map(|s| s.as_ref()).collect();
+                refs.sort_unstable();
+                refs.dedup();
+                let Some(value) = refs.first() else {
                     field_builder.append_null();
                     continue;
                 };
@@ -476,14 +523,15 @@ fn to_record_batch(
                     field_builder.append_null();
                     continue;
                 };
-                let mut values = values.clone();
-                values.sort_unstable();
-                values.dedup();
-                if values.is_empty() {
+                // Use borrowed &str to avoid cloning the vector
+                let mut refs: Vec<&str> = values.iter().map(|s| s.as_ref()).collect();
+                refs.sort_unstable();
+                refs.dedup();
+                if refs.is_empty() {
                     field_builder.append_null();
                     continue;
                 }
-                for value in values {
+                for value in refs {
                     field_builder.values().append_value(value);
                 }
                 field_builder.append(true);
@@ -610,9 +658,16 @@ impl TransactionPool {
             .fields
             .iter()
             .map(|f| {
-                event
-                    .get(f)
-                    .and_then(|v_opt| v_opt.first().as_ref().map(|s| s.to_string()))
+                event.get(f).and_then(|v_opt| {
+                    v_opt.first().and_then(|s| {
+                        let s_trim = s.trim();
+                        if s_trim.is_empty() {
+                            None
+                        } else {
+                            Some(s_trim.to_string())
+                        }
+                    })
+                })
             })
             .collect()
     }
@@ -638,6 +693,27 @@ impl TransactionPool {
             }
         }
 
+        // Special semantics: max_events == 0
+        // - If no start/end conditions: each event becomes a single closed group (identity).
+        // - If there are start/end conditions: each event becomes a single open group,
+        //   unless it simultaneously matches both start and end (then closed).
+        if self.params.max_events == 0 {
+            let mut single = Transaction::new(self.params.fields.clone());
+            if has_start_conditions && self.params.matches_starts_with(&event) {
+                single.has_start_marker = true;
+            }
+            if has_end_conditions && self.params.matches_ends_with(&event) {
+                single.has_end_marker = true;
+            }
+            single.add_event(&event)?;
+            let has_brackets = has_start_conditions || has_end_conditions;
+            if !has_brackets || (single.has_start_marker && single.has_end_marker) {
+                single.set_is_closed();
+            }
+            self.frozen_trans.push(single);
+            return Ok(());
+        }
+
         let time_str = event.get(FIELD_TIME).unwrap();
         let time = time_str
             .first()
@@ -653,44 +729,55 @@ impl TransactionPool {
         let trans_key = self.make_trans_key(&event);
 
         if has_start_conditions || has_end_conditions {
-            let reserve_slot_for_start = has_start_conditions;
-            let pre_start_limit = if reserve_slot_for_start {
-                self.params.max_events.saturating_sub(1)
-            } else {
-                self.params.max_events
-            };
             // Bracket matching logic (for when start/end conditions are explicitly specified)
             // When processing in reverse chronological order (as in SQL ORDER BY _time DESC),
             // END events go to stack waiting for START events to close them
             if self.params.matches_ends_with(&event) {
                 if has_start_conditions {
-                    // When an end event is encountered, push to the stack waiting for a matching start
+                    // In bracket mode, always push END to the stack to be paired by a future START.
+                    // Do not try to immediately attach END to any existing start-live in live_trans.
                     let mut new_trans = Transaction::new(self.params.fields.clone());
+                    new_trans.has_end_marker = true;
                     new_trans.add_event(&event)?;
-
                     let stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
                     stack.push(new_trans);
                 } else {
-                    let mut trans = self
-                        .live_trans
-                        .remove(&trans_key)
-                        .unwrap_or_else(|| Transaction::new(self.params.fields.clone()));
-
-                    if self.params.max_events > 0
-                        && trans.get_event_count() >= self.params.max_events
-                    {
-                        trans.update_start_time_only(&event)?;
-                    } else {
-                        trans.add_event(&event)?;
+                    // ends_only mode:
+                    // Use live_trans as buffer for regular events; maintain the current "end-live" on the stack.
+                    let stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
+                    if let Some(mut prev_end_live) = stack.pop() {
+                        // Freeze previous end-live, set closed if has end marker
+                        if prev_end_live.has_end_marker {
+                            prev_end_live.set_is_closed();
+                        }
+                        self.frozen_trans.push(prev_end_live);
                     }
-                    trans.set_is_closed();
-                    self.trans_complete_flag.remove(&trans_key);
-                    self.frozen_trans.push(trans);
+                    // Do NOT merge more-recent buffered events into this end; freeze buffer as its own open group
+                    if let Some(buffer) = self.live_trans.remove(&trans_key) {
+                        self.frozen_trans.push(buffer);
+                    }
+                    // Start a new end-live with just this end
+                    let mut end_only = Transaction::new(self.params.fields.clone());
+                    end_only.has_end_marker = true;
+                    end_only.add_event(&event)?;
+                    stack.push(end_only);
                 }
             } else if self.params.matches_starts_with(&event) {
                 if has_end_conditions {
                     // When a start event is encountered, try to match with most recent unmatched end event
                     let end_stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
+
+                    // If the top end-only transaction already reached max_events, freeze it first
+                    if let Some(top) = end_stack.last()
+                        && self.params.max_events > 0
+                        && top.get_event_count() >= self.params.max_events
+                    {
+                        let mut trans_to_freeze = end_stack.pop().unwrap();
+                        if trans_to_freeze.has_start_marker && trans_to_freeze.has_end_marker {
+                            trans_to_freeze.set_is_closed();
+                        }
+                        self.frozen_trans.push(trans_to_freeze);
+                    }
 
                     if let Some(mut end_trans) = end_stack.pop() {
                         if self.params.max_events > 0
@@ -701,57 +788,147 @@ impl TransactionPool {
                             // Add the start event to the matched end transaction
                             end_trans.add_event(&event)?;
                         }
+                        end_trans.has_start_marker = true;
                         end_trans.set_is_closed(); // Mark as closed since it has both start and end
                         self.frozen_trans.push(end_trans);
+                    // Do not start a new live transaction with this start; it serves only to close the matched end.
                     } else {
-                        // If no matching end event, just store this start event in live_trans
-                        let mut new_trans = Transaction::new(self.params.fields.clone());
-                        new_trans.add_event(&event)?;
-                        self.live_trans.insert(trans_key.clone(), new_trans);
+                        // No pending end:
+                        // If there is an existing live:
+                        //  - If it is a regular (no start marker), merge that live with this start (attach start and keep live)
+                        //  - If it already has a start marker, freeze it and start a new live with this start only
+                        if let Some(mut existing_trans) = self.live_trans.remove(&trans_key) {
+                            if existing_trans.has_start_marker {
+                                // Freeze previous start-only live, start a fresh one
+                                self.frozen_trans.push(existing_trans);
+                                let mut new_trans = Transaction::new(self.params.fields.clone());
+                                new_trans.has_start_marker = true;
+                                new_trans.add_event(&event)?;
+                                self.live_trans.insert(trans_key.clone(), new_trans);
+                            } else {
+                                // Merge previously accumulated regular events into this start live
+                                existing_trans.has_start_marker = true;
+                                if self.params.max_events > 0
+                                    && existing_trans.get_event_count() >= self.params.max_events
+                                {
+                                    existing_trans.update_start_time_only(&event)?;
+                                } else {
+                                    existing_trans.add_event(&event)?;
+                                }
+                                self.live_trans.insert(trans_key.clone(), existing_trans);
+                            }
+                        } else {
+                            let mut new_trans = Transaction::new(self.params.fields.clone());
+                            new_trans.has_start_marker = true;
+                            new_trans.add_event(&event)?;
+                            self.live_trans.insert(trans_key.clone(), new_trans);
+                        }
                     }
                 } else {
-                    // Handle starts_with-only by closing the active transaction
-                    if let Some(mut existing_trans) = self.live_trans.remove(&trans_key) {
-                        if self.params.max_events > 0
-                            && existing_trans.get_event_count() >= self.params.max_events
-                        {
-                            existing_trans.update_start_time_only(&event)?;
-                        } else {
-                            existing_trans.add_event(&event)?;
-                        }
-                        existing_trans.set_is_closed();
-                        self.trans_complete_flag.remove(&trans_key);
-                        self.frozen_trans.push(existing_trans);
-                    } else {
-                        let mut new_trans = Transaction::new(self.params.fields.clone());
-                        new_trans.add_event(&event)?;
-                        self.live_trans.insert(trans_key.clone(), new_trans);
+                    // starts_only mode:
+                    // Use live_trans as buffer for regular events; maintain the current "start-live" on the stack.
+                    let stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
+                    if let Some(mut prev_start_live) = stack.pop() {
+                        // Close and freeze the previous start-live when a new start arrives
+                        prev_start_live.set_is_closed();
+                        self.frozen_trans.push(prev_start_live);
                     }
+                    // Merge buffer with this start
+                    let mut new_trans = if let Some(mut buffer) = self.live_trans.remove(&trans_key)
+                    {
+                        if self.params.max_events > 0
+                            && buffer.get_event_count() >= self.params.max_events
+                        {
+                            buffer.update_start_time_only(&event)?;
+                        } else {
+                            buffer.add_event(&event)?;
+                        }
+                        buffer
+                    } else {
+                        let mut t = Transaction::new(self.params.fields.clone());
+                        t.add_event(&event)?;
+                        t
+                    };
+                    new_trans.has_start_marker = true;
+                    stack.push(new_trans);
                 }
-            } else {
-                // Regular event (neither start nor end) - add to most recent end transaction waiting for start (on stack)
+            } else if has_start_conditions && has_end_conditions {
+                // Regular event in bracket mode: buffer into live_trans (to be merged with the next boundary)
                 let stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
                 if let Some(trans) = stack.last_mut() {
-                    let reached_pre_start_limit = reserve_slot_for_start
-                        && self.params.max_events > 0
-                        && trans.get_event_count() >= pre_start_limit;
-
-                    if (!reached_pre_start_limit)
-                        && (self.params.max_events == 0
-                            || trans.get_event_count() < self.params.max_events)
+                    if self.params.max_events == 0
+                        || trans.get_event_count() < self.params.max_events
                     {
                         trans.add_event(&event)?;
                     }
-                } else {
-                    // If no end transaction waiting, add to regular live transaction
-                    if let Some(trans) = self.live_trans.get_mut(&trans_key) {
-                        trans.add_event(&event)?;
-                    } else {
-                        // Create new live transaction for regular events
+                    // Check if max_events is reached after adding (or if it was already reached)
+                    if self.params.max_events > 0
+                        && trans.get_event_count() >= self.params.max_events
+                    {
+                        // Immediately freeze and check conditions
+                        let mut trans_to_freeze = stack.pop().unwrap();
+                        // For bracket mode: need both start and end markers to be closed
+                        if trans_to_freeze.has_start_marker && trans_to_freeze.has_end_marker {
+                            trans_to_freeze.set_is_closed();
+                        }
+                        // If only end marker, leave as open (closed=false)
+                        self.frozen_trans.push(trans_to_freeze);
+                    }
+                } else if let Some(existing) = self.live_trans.get_mut(&trans_key) {
+                    if existing.has_start_marker {
+                        // Freeze the current start-live segment; start a separate regular-live for this event
+                        // Need to take ownership to freeze: remove then re-insert a new buffer
+                        let taken = self.live_trans.remove(&trans_key).unwrap();
+                        self.frozen_trans.push(taken);
                         let mut new_trans = Transaction::new(self.params.fields.clone());
                         new_trans.add_event(&event)?;
                         self.live_trans.insert(trans_key.clone(), new_trans);
+                    } else {
+                        // Continue accumulating regular events until a start arrives
+                        existing.add_event(&event)?;
                     }
+                } else {
+                    // Start a new regular-live buffer
+                    let mut new_trans = Transaction::new(self.params.fields.clone());
+                    new_trans.add_event(&event)?;
+                    self.live_trans.insert(trans_key.clone(), new_trans);
+                }
+            } else if has_end_conditions {
+                // ends_only: add to current end-live if present; otherwise buffer until an end comes
+                let stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
+                if let Some(trans) = stack.last_mut() {
+                    if self.params.max_events == 0
+                        || trans.get_event_count() < self.params.max_events
+                    {
+                        trans.add_event(&event)?;
+                    }
+                    // Check if max_events is reached after adding (or if it was already reached)
+                    if self.params.max_events > 0
+                        && trans.get_event_count() >= self.params.max_events
+                    {
+                        // Immediately freeze and check conditions
+                        let mut trans_to_freeze = stack.pop().unwrap();
+                        // If has end marker, set closed
+                        if trans_to_freeze.has_end_marker {
+                            trans_to_freeze.set_is_closed();
+                        }
+                        self.frozen_trans.push(trans_to_freeze);
+                    }
+                } else if let Some(existing) = self.live_trans.get_mut(&trans_key) {
+                    existing.add_event(&event)?;
+                } else {
+                    let mut new_trans = Transaction::new(self.params.fields.clone());
+                    new_trans.add_event(&event)?;
+                    self.live_trans.insert(trans_key.clone(), new_trans);
+                }
+            } else {
+                // starts_only mode: buffer regular events in live_trans until a start comes
+                if let Some(existing) = self.live_trans.get_mut(&trans_key) {
+                    existing.add_event(&event)?;
+                } else {
+                    let mut new_trans = Transaction::new(self.params.fields.clone());
+                    new_trans.add_event(&event)?;
+                    self.live_trans.insert(trans_key.clone(), new_trans);
                 }
             }
         } else {
@@ -777,7 +954,24 @@ impl TransactionPool {
         if let Some(trans) = self.live_trans.get(&trans_key)
             && trans.get_event_count() >= self.params.max_events
         {
-            let trans_to_freeze = self.live_trans.remove(&trans_key).unwrap();
+            let mut trans_to_freeze = self.live_trans.remove(&trans_key).unwrap();
+            // When max_events is reached, check if conditions are satisfied to set closed
+            if has_start_conditions && has_end_conditions {
+                // Bracket mode: need both start and end markers
+                if trans_to_freeze.has_start_marker && trans_to_freeze.has_end_marker {
+                    trans_to_freeze.set_is_closed();
+                }
+            } else if has_end_conditions {
+                // ends_only mode: if has end marker, set closed
+                if trans_to_freeze.has_end_marker {
+                    trans_to_freeze.set_is_closed();
+                }
+            } else if has_start_conditions {
+                // starts_only mode: if has start marker, set closed
+                if trans_to_freeze.has_start_marker {
+                    trans_to_freeze.set_is_closed();
+                }
+            }
             self.frozen_trans.push(trans_to_freeze);
             self.trans_complete_flag.remove(&trans_key);
         }
@@ -887,9 +1081,10 @@ impl TransactionPool {
         // If some key fields are null but not all, allow for wildcard matching in multi-field scenarios
         if !self.params.fields.is_empty() {
             let mut non_empty_count = 0;
-            for field in &self.params.fields {
+            for field in self.params.fields.iter() {
                 if let Some(values) = event.get(field)
-                    && !values.is_empty()
+                    && let Some(first) = values.first()
+                    && !first.trim().is_empty()
                 {
                     non_empty_count += 1;
                 }
@@ -917,15 +1112,40 @@ impl TransactionPool {
     fn get_live_trans(&mut self) -> Vec<Transaction> {
         let mut live_transactions: Vec<Transaction> = Vec::new();
 
+        let has_start_only = self.params.ends_with.is_none()
+            && self.params.ends_with_regex.is_none()
+            && self.params.ends_if_field.is_none()
+            && (self.params.starts_with.is_some()
+                || self.params.starts_with_regex.is_some()
+                || self.params.starts_if_field.is_some());
+        let has_end_only = (self.params.ends_with.is_some()
+            || self.params.ends_with_regex.is_some()
+            || self.params.ends_if_field.is_some())
+            && self.params.starts_with.is_none()
+            && self.params.starts_with_regex.is_none()
+            && self.params.starts_if_field.is_none();
+
         // Add all remaining live transactions
-        for (_, trans) in self.live_trans.drain() {
+        for (_, mut trans) in self.live_trans.drain() {
+            // If we are in ends_only mode, mark as closed if has end marker
+            if has_end_only && trans.has_end_marker {
+                trans.set_is_closed();
+            }
             live_transactions.push(trans);
         }
 
         // Add all remaining start transactions from the stack
         // These are unmatched end events that never found their corresponding start events
-        for (_, mut trans_stack) in self.start_trans_stack.drain() {
-            for trans in trans_stack.drain(..) {
+        for (_key, mut trans_stack) in self.start_trans_stack.drain() {
+            for mut trans in trans_stack.drain(..) {
+                // If we are in starts_only mode, mark remaining as closed if has start marker
+                if has_start_only && trans.has_start_marker {
+                    trans.set_is_closed();
+                }
+                // If we are in ends_only mode, mark as closed if has end marker
+                if has_end_only && trans.has_end_marker {
+                    trans.set_is_closed();
+                }
                 live_transactions.push(trans);
             }
         }
@@ -1145,6 +1365,755 @@ mod tests {
             .collect()
     }
 
+    fn event_time_for_index(base: chrono::DateTime<Utc>, idx: i64) -> i64 {
+        // idx starts from 1 (newest first, then older)
+        (base - ChronoDuration::seconds(idx * 60)).timestamp_micros()
+    }
+
+    fn messages_of(trans: &Transaction) -> Vec<String> {
+        let mut out = Vec::new();
+        for msgs in trans.messages.iter() {
+            for m in msgs {
+                out.push(m.to_string());
+            }
+        }
+        out
+    }
+
+    fn assert_has_group(groups: &[Transaction], expected_msgs: &[&str], expected_closed: bool) {
+        let needle: Vec<String> = expected_msgs.iter().map(|s| s.to_string()).collect();
+        assert!(
+            groups
+                .iter()
+                .any(|t| messages_of(t) == needle && t.is_closed == expected_closed),
+            "Expected to find group messages {:?} closed={}",
+            needle,
+            expected_closed
+        );
+    }
+
+    #[test]
+    fn trans_starts_ends_nested() {
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("starts_with".to_string(), Arg::String("start".to_string())),
+                ("ends_with".to_string(), Arg::String("end".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+
+        // count=1..7 newest->oldest; host=host1
+        let seq = vec![
+            ("end", 1),
+            ("end", 2),
+            ("middle", 3),
+            ("start", 4),
+            ("middle", 5),
+            ("start", 6),
+            ("other", 7),
+        ];
+
+        for (msg, idx) in seq {
+            let e = create_event(event_time_for_index(base, idx), msg, &[("host", "host1")]);
+            pool.add_event(e).unwrap();
+        }
+
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 3);
+        assert_has_group(&groups, &["start", "middle", "end"], true);
+        // there are two closed start-middle-end groups
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|t| messages_of(t) == vec!["start", "middle", "end"] && t.is_closed)
+                .count(),
+            2
+        );
+        assert_has_group(&groups, &["other"], false);
+    }
+
+    #[test]
+    fn trans_starts_ends_nested_with_maxevents() {
+        // trans.md (229-249): nested startswith + endswith + maxevents
+        // Sequence (newest to oldest):
+        //   1: end, 2: end, 3: start, 4: start, 5: other
+        // Params: startswith="start", endswith="end", maxevents=3, keepevicted=true
+        // Expected groups:
+        //   group1 (closed=true): start, end (no. 2, 3) -> time ascending: start(3), end(2)
+        //   group2 (closed=true): start, end (no. 1, 4) -> time ascending: start(4), end(1)
+        //   group3 (closed=false): other (no. 5)
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("starts_with".to_string(), Arg::String("start".to_string())),
+                ("ends_with".to_string(), Arg::String("end".to_string())),
+                ("max_events".to_string(), Arg::Int(3)),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+
+        let seq = vec![
+            ("end", 1),
+            ("end", 2),
+            ("start", 3),
+            ("start", 4),
+            ("other", 5),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+
+        assert_eq!(groups.len(), 3);
+        // There should be exactly two closed ["start","end"] groups
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|t| messages_of(t) == vec!["start", "end"] && t.is_closed)
+                .count(),
+            2
+        );
+        // And one open ["other"]
+        assert_has_group(&groups, &["other"], false);
+    }
+
+    #[test]
+    fn trans_starts_ends_multiple_start() {
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("starts_with".to_string(), Arg::String("start".to_string())),
+                ("ends_with".to_string(), Arg::String("end".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+
+        // count=1..6
+        let seq = vec![
+            ("end", 1),
+            ("middle", 2),
+            ("start", 3),
+            ("start", 4),
+            ("start", 5),
+            ("other", 6),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 4);
+        assert_has_group(&groups, &["start", "middle", "end"], true);
+        assert_has_group(&groups, &["start"], false);
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|t| messages_of(t) == vec!["start"] && !t.is_closed)
+                .count(),
+            2
+        );
+        assert_has_group(&groups, &["other"], false);
+    }
+
+    #[test]
+    fn trans_starts_ends_multiple_end() {
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("starts_with".to_string(), Arg::String("start".to_string())),
+                ("ends_with".to_string(), Arg::String("end".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+
+        // count=1..6
+        let seq = vec![
+            ("end", 1),
+            ("end", 2),
+            ("end", 3),
+            ("middle", 4),
+            ("start", 5),
+            ("other", 6),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 3);
+        assert_has_group(&groups, &["end"], false);
+        assert_has_group(&groups, &["start", "middle", "end"], true);
+        assert_has_group(&groups, &["other", "end"], false);
+    }
+
+    #[test]
+    fn trans_starts_ends_only_start() {
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("starts_with".to_string(), Arg::String("start".to_string())),
+                ("ends_with".to_string(), Arg::String("end".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+
+        // count=1..5
+        let seq = vec![
+            ("middle", 1),
+            ("middle", 2),
+            ("start", 3),
+            ("start", 4),
+            ("other", 5),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 3);
+        assert_has_group(&groups, &["start", "middle", "middle"], false);
+        assert_has_group(&groups, &["start"], false);
+        assert_has_group(&groups, &["other"], false);
+    }
+
+    #[test]
+    fn trans_starts_ends_only_end() {
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("starts_with".to_string(), Arg::String("start".to_string())),
+                ("ends_with".to_string(), Arg::String("end".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+
+        // count=1..5
+        let seq = vec![
+            ("end", 1),
+            ("middle", 2),
+            ("end", 3),
+            ("middle", 4),
+            ("other", 5),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 2);
+        assert_has_group(&groups, &["middle", "end"], false);
+        assert_has_group(&groups, &["other", "middle", "end"], false);
+    }
+
+    #[test]
+    fn trans_only_end_strange() {
+        // trans.md: strange end
+        // Sequence (newest to oldest): middle(1), end(2), middle(3), end(4)
+        // Expected groups:
+        //   group1 (open): middle
+        //   group2 (open): middle, end
+        //   group3 (open): end
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("ends_with".to_string(), Arg::String("end".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+
+        let seq = vec![("middle", 1), ("end", 2), ("middle", 3), ("end", 4)];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+
+        assert_eq!(groups.len(), 3);
+        // ends_only semantics updated: groups containing end are closed
+        assert_has_group(&groups, &["middle"], false);
+        assert_has_group(&groups, &["middle", "end"], true);
+        assert_has_group(&groups, &["end"], true);
+    }
+
+    #[test]
+    fn trans_message_order_time_ascending_bracket_simple() {
+        // Newest -> Oldest: end, middle, start
+        // Expect one closed group with messages in ascending time order: start, middle, end
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("starts_with".to_string(), Arg::String("start".to_string())),
+                ("ends_with".to_string(), Arg::String("end".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+
+        let seq = vec![("end", 1), ("middle", 2), ("start", 3)];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+
+        assert_eq!(groups.len(), 1);
+        assert_has_group(&groups, &["start", "middle", "end"], true);
+    }
+
+    #[test]
+    fn trans_starts_ends_with_maxevents() {
+        // trans.md: starts ends with maxevents
+        // Sequence (newest to oldest): end(1), middle(2), start(3), end(4), start(5), end(6), m3(7), m2(8), m1(9), start(10), other(11)
+        // maxevents=3
+        // Expected groups:
+        //   group1 (closed=true): start, middle, end (no. 3, 2, 1) - time ascending
+        //   group2 (closed=true): start, end (no. 5, 4) - time ascending
+        //   group3 (closed=false): m2, m3, end (no. 8, 7, 6) - time ascending, maxevents reached
+        //   group4 (closed=false): start, m1 (no. 10, 9) - time ascending
+        //   group5 (closed=false): other (no. 11)
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("starts_with".to_string(), Arg::String("start".to_string())),
+                ("ends_with".to_string(), Arg::String("end".to_string())),
+                ("max_events".to_string(), Arg::Int(3)),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+
+        let seq = vec![
+            ("end", 1),
+            ("middle", 2),
+            ("start", 3),
+            ("end", 4),
+            ("start", 5),
+            ("end", 6),
+            ("m3", 7),
+            ("m2", 8),
+            ("m1", 9),
+            ("start", 10),
+            ("other", 11),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+
+        for (i, g) in groups.iter().enumerate() {
+            let msgs: Vec<String> = g
+                .messages
+                .iter()
+                .flat_map(|m| m.iter().map(|a| a.to_string()))
+                .collect();
+            println!(
+                "Group {}: closed={}, has_start={}, has_end={}, messages={:?}",
+                i + 1,
+                g.is_closed,
+                g.has_start_marker,
+                g.has_end_marker,
+                msgs
+            );
+        }
+
+        assert_eq!(groups.len(), 5);
+        // group1 (closed=true): start(3), middle(2), end(1) - time ascending
+        assert_has_group(&groups, &["start", "middle", "end"], true);
+        // group2 (closed=true): start(5), end(4) - time ascending
+        assert_has_group(&groups, &["start", "end"], true);
+        // group3 (closed=false): m2(8), m3(7), end(6) - time ascending, maxevents=3 reached
+        assert_has_group(&groups, &["m2", "m3", "end"], false);
+        // group4 (closed=false): start(10), m1(9) - time ascending
+        assert_has_group(&groups, &["start", "m1"], false);
+        // group5 (closed=false): other(11)
+        assert_has_group(&groups, &["other"], false);
+    }
+
+    #[test]
+    fn trans_max_events_zero_with_brackets_singletons_open() {
+        // trans.md: max_events=0 + starts + ends
+        // end, middle, start, other1, other2 -> each one single open group
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("starts_with".to_string(), Arg::String("start".to_string())),
+                ("ends_with".to_string(), Arg::String("end".to_string())),
+                ("max_events".to_string(), Arg::Int(0)),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        let seq = vec![
+            ("end", 1),
+            ("middle", 2),
+            ("start", 3),
+            ("other1", 4),
+            ("other2", 5),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 5);
+        assert_has_group(&groups, &["end"], false);
+        assert_has_group(&groups, &["middle"], false);
+        assert_has_group(&groups, &["start"], false);
+        assert_has_group(&groups, &["other1"], false);
+        assert_has_group(&groups, &["other2"], false);
+    }
+
+    #[test]
+    fn trans_max_events_zero_no_brackets_identity_closed() {
+        // trans.md: max_events=0 without starts/ends -> identity closed
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("max_events".to_string(), Arg::Int(0)),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        let seq = vec![
+            ("event1", 1),
+            ("event2", 2),
+            ("event3", 3),
+            ("event4", 4),
+            ("event5", 5),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 5);
+        assert_has_group(&groups, &["event1"], true);
+        assert_has_group(&groups, &["event2"], true);
+        assert_has_group(&groups, &["event3"], true);
+        assert_has_group(&groups, &["event4"], true);
+        assert_has_group(&groups, &["event5"], true);
+    }
+
+    #[test]
+    fn trans_max_events_zero_start_equals_end_single_closed() {
+        // trans.md: max_events=0, starts+ends have same token -> each such event closed
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                (
+                    "starts_with".to_string(),
+                    Arg::String("start_and_end".to_string()),
+                ),
+                (
+                    "ends_with".to_string(),
+                    Arg::String("start_and_end".to_string()),
+                ),
+                ("max_events".to_string(), Arg::Int(0)),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        let seq = vec![
+            ("start_and_end", 1),
+            ("start_and_end", 2),
+            ("start_and_end", 3),
+            ("other", 4),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 4);
+        assert_has_group(&groups, &["start_and_end"], true);
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|t| messages_of(t) == vec!["start_and_end"] && t.is_closed)
+                .count(),
+            3
+        );
+        assert_has_group(&groups, &["other"], false);
+    }
+    #[test]
+    fn trans_only_start_multiple_start() {
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("starts_with".to_string(), Arg::String("start".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+
+        // count=1..7
+        let seq = vec![
+            ("middle", 1),
+            ("middle", 2),
+            ("start", 3),
+            ("middle", 4),
+            ("start", 5),
+            ("middle", 6),
+            ("start", 7),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 3);
+        assert_has_group(&groups, &["start", "middle", "middle"], true);
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|t| messages_of(t) == vec!["start", "middle"] && t.is_closed)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn trans_only_start_sequential_starts() {
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("starts_with".to_string(), Arg::String("start".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+
+        // count=1..5
+        let seq = vec![
+            ("start", 1),
+            ("start", 2),
+            ("start", 3),
+            ("middle", 4),
+            ("other", 5),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 4);
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|t| messages_of(t) == vec!["start"] && t.is_closed)
+                .count(),
+            3
+        );
+        assert_has_group(&groups, &["other", "middle"], false);
+    }
+
+    #[test]
+    fn trans_only_end_multiple_end() {
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("ends_with".to_string(), Arg::String("end".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+
+        // count=1..8 (newest to oldest)
+        // trans.md: count=1 "other", count=2 "end", count=3 "middle", count=4 "end",
+        // count=5 "middle", count=6 "end", count=7 "middle", count=8 "other"
+        let seq = vec![
+            ("other", 1),
+            ("end", 2),
+            ("middle", 3),
+            ("end", 4),
+            ("middle", 5),
+            ("end", 6),
+            ("middle", 7),
+            ("other", 8),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 4);
+        // group1 (closed=false): other (no. 1)
+        assert_has_group(&groups, &["other"], false);
+        // group2 (closed=true): middle, end (no. 2, 3)
+        assert_has_group(&groups, &["middle", "end"], true);
+        // group3 (closed=true): middle, end (no. 4, 5)
+        assert_has_group(&groups, &["middle", "end"], true);
+        // group4 (closed=true): other, middle, end (no. 6, 7, 8)
+        assert_has_group(&groups, &["other", "middle", "end"], true);
+    }
+
+    #[test]
+    fn trans_only_end_sequential_ends() {
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("ends_with".to_string(), Arg::String("end".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+
+        // count=1..6
+        let seq = vec![
+            ("end", 1),
+            ("end", 2),
+            ("end", 3),
+            ("middle", 4),
+            ("middle", 5),
+            ("other", 6),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 3);
+        // ends_only semantics updated: groups containing end are closed
+        assert_has_group(&groups, &["end"], true);
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|t| messages_of(t) == vec!["end"] && t.is_closed)
+                .count(),
+            2
+        );
+        assert_has_group(&groups, &["other", "middle", "middle", "end"], true);
+    }
     #[test]
     fn test_trans_params_new() {
         let params_args = Some(vec![]);
@@ -1218,7 +2187,7 @@ mod tests {
 
     #[test]
     fn test_transaction_add_event_and_merge() {
-        let mut trans = Transaction::new(smallvec!["user_id".to_string()]);
+        let mut trans = Transaction::new(Arc::from(vec!["user_id".to_string()].into_boxed_slice()));
         let now = Utc::now();
 
         let event1 = create_event(
@@ -1244,34 +2213,44 @@ mod tests {
         assert_eq!(trans.get_event_count(), 3);
         assert_eq!(trans.messages.len(), 3);
         assert_eq!(
-            trans.messages.front().unwrap().first().unwrap(),
+            trans.messages.front().unwrap().first().unwrap().as_ref(),
             "message three"
         );
         assert_eq!(
-            trans.messages.back().unwrap().first().unwrap(),
+            trans.messages.back().unwrap().first().unwrap().as_ref(),
             "message one"
         );
 
-        let expected: SmallVec<[&str; 4]> = smallvec!["user1"];
-        assert_eq!(trans.fields["user_id"], expected);
-        assert!(trans.fields["status"].contains(&"success".to_string()));
-        assert!(trans.fields["status"].contains(&"fail".to_string()));
-        let expected: SmallVec<[&str; 4]> = smallvec!["abc"];
-        assert_eq!(trans.fields["data"], expected);
+        {
+            let expected: SmallVec<[&str; 4]> = smallvec!["user1"];
+            let actual_user: SmallVec<[&str; 4]> =
+                trans.fields["user_id"].iter().map(|s| s.as_ref()).collect();
+            assert_eq!(actual_user, expected);
+            assert!(
+                trans.fields["status"]
+                    .iter()
+                    .any(|s| s.as_ref() == "success")
+            );
+            assert!(trans.fields["status"].iter().any(|s| s.as_ref() == "fail"));
+            let expected: SmallVec<[&str; 4]> = smallvec!["abc"];
+            let actual_data: SmallVec<[&str; 4]> =
+                trans.fields["data"].iter().map(|s| s.as_ref()).collect();
+            assert_eq!(actual_data, expected);
+        }
 
         let expected_duration = ((now - ChronoDuration::seconds(10)).timestamp_micros()
             - (now - ChronoDuration::seconds(30)).timestamp_micros())
             as f64
             / 1_000_000.0;
         assert_eq!(trans.get_duration().unwrap(), expected_duration);
-        assert!(!trans.get_is_closed());
+        assert!(!trans.is_closed);
         trans.set_is_closed();
-        assert!(trans.get_is_closed());
+        assert!(trans.is_closed);
     }
 
     #[test]
     fn test_transaction_to_record_batch() {
-        let mut trans = Transaction::new(smallvec!["user_id".to_string()]);
+        let mut trans = Transaction::new(Arc::from(vec!["user_id".to_string()].into_boxed_slice()));
         let now = Utc::now();
         let event1_time = now - ChronoDuration::seconds(20);
         let event2_time = now - ChronoDuration::seconds(10);
@@ -1724,308 +2703,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_trans_pool_starts_with_without_ends_closes_transactions() {
-        let params = TransParams::new(
-            Some(vec![]),
-            vec![
-                ("fields".to_string(), Arg::String("session_id".to_string())),
-                ("starts_with".to_string(), Arg::String("START".to_string())),
-            ],
-        )
-        .unwrap();
+    // removed legacy test: starts-only closes transactions; trans.md defines starts-only as open segments
 
-        let mut pool = TransactionPool::new(params);
-        let now = Utc::now();
+    // removed legacy test: ends-only closes transactions; trans.md defines ends-only as open segments
 
-        let event_after_first_start = create_event(
-            now.timestamp_micros(),
-            "event_after_first_start",
-            &[("session_id", "S1")],
-        );
-        let first_start = create_event(
-            (now - ChronoDuration::seconds(1)).timestamp_micros(),
-            "START first",
-            &[("session_id", "S1")],
-        );
-        let event_after_second_start = create_event(
-            (now - ChronoDuration::seconds(2)).timestamp_micros(),
-            "event_after_second_start",
-            &[("session_id", "S1")],
-        );
-        let second_start = create_event(
-            (now - ChronoDuration::seconds(3)).timestamp_micros(),
-            "START second",
-            &[("session_id", "S1")],
-        );
+    // removed legacy test: starts_with_regex-only closes transactions; follow trans.md
 
-        pool.add_event(event_after_first_start).unwrap();
-        pool.add_event(first_start).unwrap();
-        pool.add_event(event_after_second_start).unwrap();
-        pool.add_event(second_start).unwrap();
-
-        let mut frozen = pool.get_frozen_trans();
-        let mut live = pool.get_live_trans();
-        frozen.append(&mut live);
-
-        assert_eq!(frozen.len(), 2);
-
-        let mut message_groups: Vec<Vec<String>> = frozen
-            .iter()
-            .map(|trans| {
-                trans
-                    .messages
-                    .iter()
-                    .flat_map(|msgs| msgs.iter().cloned())
-                    .collect::<Vec<String>>()
-            })
-            .collect();
-        for group in &mut message_groups {
-            group.sort();
-        }
-        message_groups.sort();
-
-        assert!(
-            message_groups.contains(&vec![
-                "START first".to_string(),
-                "event_after_first_start".to_string()
-            ]),
-            "First transaction should include start and subsequent event"
-        );
-        assert!(
-            message_groups.contains(&vec![
-                "START second".to_string(),
-                "event_after_second_start".to_string()
-            ]),
-            "Second transaction should include start and subsequent event"
-        );
-
-        for trans in frozen {
-            assert!(
-                trans.is_closed,
-                "Transactions should be closed when start boundary is hit"
-            );
-        }
-    }
-
-    #[test]
-    fn test_trans_pool_ends_with_without_starts_closes_transactions() {
-        let params = TransParams::new(
-            Some(vec![]),
-            vec![
-                ("fields".to_string(), Arg::String("session_id".to_string())),
-                ("ends_with".to_string(), Arg::String("END".to_string())),
-            ],
-        )
-        .unwrap();
-
-        let mut pool = TransactionPool::new(params);
-        let now = Utc::now();
-
-        let event_after_end = create_event(
-            now.timestamp_micros(),
-            "event_after_end",
-            &[("session_id", "S1")],
-        );
-        let event_before_end = create_event(
-            (now - ChronoDuration::seconds(1)).timestamp_micros(),
-            "event_before_end",
-            &[("session_id", "S1")],
-        );
-        let end_event = create_event(
-            (now - ChronoDuration::seconds(2)).timestamp_micros(),
-            "END boundary",
-            &[("session_id", "S1")],
-        );
-        let older_event = create_event(
-            (now - ChronoDuration::seconds(3)).timestamp_micros(),
-            "older_event",
-            &[("session_id", "S1")],
-        );
-
-        pool.add_event(event_after_end).unwrap();
-        pool.add_event(event_before_end).unwrap();
-        pool.add_event(end_event).unwrap();
-        pool.add_event(older_event).unwrap();
-
-        let mut frozen = pool.get_frozen_trans();
-        let mut live = pool.get_live_trans();
-        frozen.append(&mut live);
-
-        assert_eq!(frozen.len(), 2);
-
-        frozen.sort_by_key(|trans| trans.start_time);
-
-        let closed_trans = &frozen[1];
-        let messages: Vec<String> = closed_trans
-            .messages
-            .iter()
-            .flat_map(|msgs| msgs.iter().cloned())
-            .collect();
-        assert!(closed_trans.is_closed);
-        assert!(messages.contains(&"event_after_end".to_string()));
-        assert!(messages.contains(&"event_before_end".to_string()));
-        assert!(messages.contains(&"END boundary".to_string()));
-
-        let older_messages: Vec<String> = frozen[0]
-            .messages
-            .iter()
-            .flat_map(|msgs| msgs.iter().cloned())
-            .collect();
-        assert_eq!(older_messages, vec!["older_event".to_string()]);
-    }
-
-    #[test]
-    fn test_trans_pool_starts_with_regex_only_closes_transactions() {
-        let params = TransParams::new(
-            Some(vec![]),
-            vec![
-                ("fields".to_string(), Arg::String("session_id".to_string())),
-                (
-                    "starts_with_regex".to_string(),
-                    Arg::String("^START\\d+".to_string()),
-                ),
-            ],
-        )
-        .unwrap();
-
-        let mut pool = TransactionPool::new(params);
-        let now = Utc::now();
-
-        let after_first = create_event(
-            now.timestamp_micros(),
-            "event_after_start1",
-            &[("session_id", "S1")],
-        );
-        let start1 = create_event(
-            (now - ChronoDuration::seconds(1)).timestamp_micros(),
-            "START1 boundary",
-            &[("session_id", "S1")],
-        );
-        let after_second = create_event(
-            (now - ChronoDuration::seconds(2)).timestamp_micros(),
-            "event_after_start2",
-            &[("session_id", "S1")],
-        );
-        let start2 = create_event(
-            (now - ChronoDuration::seconds(3)).timestamp_micros(),
-            "START2 boundary",
-            &[("session_id", "S1")],
-        );
-
-        pool.add_event(after_first).unwrap();
-        pool.add_event(start1).unwrap();
-        pool.add_event(after_second).unwrap();
-        pool.add_event(start2).unwrap();
-
-        let mut frozen = pool.get_frozen_trans();
-        let mut live = pool.get_live_trans();
-        frozen.append(&mut live);
-
-        assert_eq!(frozen.len(), 2);
-        for trans in &frozen {
-            assert!(trans.is_closed);
-        }
-
-        let mut groups: Vec<Vec<String>> = frozen
-            .iter()
-            .map(|trans| {
-                trans
-                    .messages
-                    .iter()
-                    .flat_map(|msgs| msgs.iter().cloned())
-                    .collect()
-            })
-            .collect();
-        for group in &mut groups {
-            group.sort();
-        }
-        groups.sort();
-        assert!(groups.contains(&vec![
-            "START1 boundary".to_string(),
-            "event_after_start1".to_string()
-        ]));
-        assert!(groups.contains(&vec![
-            "START2 boundary".to_string(),
-            "event_after_start2".to_string()
-        ]));
-    }
-
-    #[test]
-    fn test_trans_pool_ends_with_regex_only_closes_transactions() {
-        let params = TransParams::new(
-            Some(vec![]),
-            vec![
-                ("fields".to_string(), Arg::String("session_id".to_string())),
-                (
-                    "ends_with_regex".to_string(),
-                    Arg::String("END\\d+$".to_string()),
-                ),
-            ],
-        )
-        .unwrap();
-
-        let mut pool = TransactionPool::new(params);
-        let now = Utc::now();
-
-        let after_end = create_event(
-            now.timestamp_micros(),
-            "event_after_end1",
-            &[("session_id", "S1")],
-        );
-        let end1 = create_event(
-            (now - ChronoDuration::seconds(1)).timestamp_micros(),
-            "match END1",
-            &[("session_id", "S1")],
-        );
-        let after_end_two = create_event(
-            (now - ChronoDuration::seconds(2)).timestamp_micros(),
-            "event_after_end2",
-            &[("session_id", "S1")],
-        );
-        let end2 = create_event(
-            (now - ChronoDuration::seconds(3)).timestamp_micros(),
-            "match END2",
-            &[("session_id", "S1")],
-        );
-
-        pool.add_event(after_end).unwrap();
-        pool.add_event(end1).unwrap();
-        pool.add_event(after_end_two).unwrap();
-        pool.add_event(end2).unwrap();
-
-        let mut frozen = pool.get_frozen_trans();
-        let mut live = pool.get_live_trans();
-        frozen.append(&mut live);
-
-        assert_eq!(frozen.len(), 2);
-        for trans in &frozen {
-            assert!(trans.is_closed);
-        }
-
-        let mut groups: Vec<Vec<String>> = frozen
-            .iter()
-            .map(|trans| {
-                trans
-                    .messages
-                    .iter()
-                    .flat_map(|msgs| msgs.iter().cloned())
-                    .collect()
-            })
-            .collect();
-        for group in &mut groups {
-            group.sort();
-        }
-        groups.sort();
-        assert!(groups.contains(&vec![
-            "event_after_end1".to_string(),
-            "match END1".to_string()
-        ]));
-        assert!(groups.contains(&vec![
-            "event_after_end2".to_string(),
-            "match END2".to_string()
-        ]));
-    }
+    // removed legacy test: ends_with_regex-only closes transactions; follow trans.md
 
     #[test]
     fn test_trans_pool_starts_if_and_ends_if_without_message_field() {
@@ -2094,6 +2778,7 @@ mod tests {
             .cloned()
             .unwrap_or_default()
             .into_iter()
+            .map(|a| a.to_string())
             .collect();
         steps.sort();
         assert_eq!(
@@ -2109,7 +2794,7 @@ mod tests {
             trans
                 .fields
                 .get("step")
-                .is_some_and(|vals| vals.contains(&"after_end".to_string()))
+                .is_some_and(|vals| vals.iter().any(|s| s.as_ref() == "after_end"))
         }));
     }
 
@@ -2172,7 +2857,7 @@ mod tests {
             let messages: Vec<String> = trans
                 .messages
                 .iter()
-                .flat_map(|msg_list| msg_list.iter().cloned())
+                .flat_map(|msg_list| msg_list.iter().map(|a| a.to_string()))
                 .collect();
             all_messages.push(messages);
         }
@@ -2186,7 +2871,7 @@ mod tests {
             let mut msgs: Vec<String> = trans
                 .messages
                 .iter()
-                .flat_map(|msg_list| msg_list.iter().cloned())
+                .flat_map(|msg_list| msg_list.iter().map(|a| a.to_string()))
                 .collect();
             msgs.sort(); // Sort for consistent comparison
             message_groups.push(msgs);
@@ -2262,7 +2947,7 @@ mod tests {
             let mut msgs: Vec<String> = trans
                 .messages
                 .iter()
-                .flat_map(|msg_list| msg_list.iter().cloned())
+                .flat_map(|msg_list| msg_list.iter().map(|a| a.to_string()))
                 .collect();
             msgs.sort(); // Sort for consistent comparison
             message_groups.push(msgs);
@@ -2426,7 +3111,7 @@ mod tests {
             let mut msgs: Vec<String> = trans
                 .messages
                 .iter()
-                .flat_map(|msg_list| msg_list.iter().cloned())
+                .flat_map(|msg_list| msg_list.iter().map(|a| a.to_string()))
                 .collect();
             msgs.sort(); // Sort for consistent comparison
             message_groups.push(msgs);
@@ -2434,8 +3119,6 @@ mod tests {
 
         // Sort the groups for comparison since order might vary
         message_groups.sort();
-
-        dbg!(&message_groups);
 
         // Expected from example: Only event with ALL nulls (event 8) should be discarded
         // Events 6 and 7 have partial nulls and should be included (using wildcard matching)
@@ -2556,7 +3239,7 @@ mod tests {
             let mut msgs: Vec<String> = trans
                 .messages
                 .iter()
-                .flat_map(|msg_list| msg_list.iter().cloned())
+                .flat_map(|msg_list| msg_list.iter().map(|a| a.to_string()))
                 .collect();
             msgs.sort(); // Sort for consistent comparison
             message_groups.push(msgs);
@@ -2564,8 +3247,6 @@ mod tests {
 
         // Sort the groups for comparison since order might vary
         message_groups.sort();
-
-        dbg!(&message_groups);
 
         // Expected output:
         // {message1 message12 message2 message21 message6 message9} - group with host1,user1,app1 + wildcard matches
@@ -2866,23 +3547,27 @@ mod tests {
                     .get("client_ip")
                     .and_then(|v| v.first())
                     .cloned()
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| Arc::<str>::from("")),
                 trans
                     .fields
                     .get("JSESSIONID")
                     .and_then(|v| v.first())
                     .cloned()
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| Arc::<str>::from("")),
             );
             let messages: Vec<String> = trans
                 .messages
                 .iter()
-                .flat_map(|msgs| msgs.iter().cloned())
+                .flat_map(|msgs| msgs.iter().map(|a| a.to_string()))
                 .collect();
             if trans.is_closed {
-                span_closed.insert(key, messages);
+                // convert Arc<str> key parts to String
+                span_closed.insert((key.0.to_string(), key.1.to_string()), messages);
             } else {
-                span_open.entry(key).or_default().push(messages);
+                span_open
+                    .entry((key.0.to_string(), key.1.to_string()))
+                    .or_default()
+                    .push(messages);
             }
         }
 
@@ -2975,8 +3660,8 @@ mod tests {
                     .and_then(|vals| vals.first())
                     .cloned();
                 if let (Some(client_ip), Some(jsession)) = (client_ip, jsession)
-                    && client_ip == ip
-                    && jsession == session
+                    && client_ip.as_ref() == ip
+                    && jsession.as_ref() == session
                     && let Some(duration) = trans.get_duration()
                 {
                     return duration <= 1.0 && trans.get_event_count() >= 2;
@@ -2988,5 +3673,143 @@ mod tests {
                 "Expected closed transaction for ({ip}, {session}) within 1s span"
             );
         }
+    }
+
+    #[test]
+    fn test_transaction_counts_view_purchase_from_fixture() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                (
+                    "fields".to_string(),
+                    Arg::String("client_ip,JSESSIONID".to_string()),
+                ),
+                ("starts_with".to_string(), Arg::String("view".to_string())),
+                ("ends_with".to_string(), Arg::String("purchase".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params.clone());
+
+        for event in sample_csv_events() {
+            pool.add_event(event).unwrap();
+        }
+        let frozen = pool.get_frozen_trans();
+        let frozen_record_batch = to_record_batch(&params, &frozen).unwrap().unwrap();
+        let live_record_batch = to_record_batch(&params, &pool.get_live_trans())
+            .unwrap()
+            .unwrap();
+        // get _is_closed, and count true and false
+        let frozen_is_closed = frozen_record_batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let live_is_closed = live_record_batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let frozen_is_closed_true = frozen_is_closed.iter().filter(|&b| b.unwrap()).count();
+        let frozen_is_closed_false = frozen_is_closed.iter().filter(|&b| !b.unwrap()).count();
+        let live_is_closed_true = live_is_closed.iter().filter(|&b| b.unwrap()).count();
+        let live_is_closed_false = live_is_closed.iter().filter(|&b| !b.unwrap()).count();
+        let total_is_closed_true = frozen_is_closed_true + live_is_closed_true;
+        let total_is_closed_false = frozen_is_closed_false + live_is_closed_false;
+        assert_eq!(total_is_closed_true, 7);
+        assert_eq!(total_is_closed_false, 67);
+    }
+
+    #[test]
+    fn test_nested_starts_ends_order() {
+        // Scenario:
+        // t10: purchase (END)
+        // t09: checkout (middle)
+        // t08: purchase (END)
+        // t07: add_to_cart (middle)
+        // t06: view (START)
+        // t05: browse (middle)
+        // t04: view (START)
+        // t03: login (other)
+        // t02: search (other)
+        // t01: home (other)
+        //
+        // Expected closed groups (unordered message sets):
+        //   ["view", "add_to_cart", "purchase"]
+        //   ["view", "browse", "checkout", "purchase"]
+        //
+        // Plus one open group for the remaining early events.
+
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("ip,session".to_string())),
+                ("starts_with".to_string(), Arg::String("view".to_string())),
+                ("ends_with".to_string(), Arg::String("purchase".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params.clone());
+
+        let key_fields = &[("ip", "1.1.1.1"), ("session", "a")];
+        let events = vec![
+            (10_i64, "purchase"),
+            (9, "checkout"),
+            (8, "purchase"),
+            (7, "add_to_cart"),
+            (6, "view"),
+            (5, "browse"),
+            (4, "view"),
+            (3, "login"),
+            (2, "search"),
+            (1, "home"),
+        ];
+
+        for (t, msg) in events {
+            let event = create_event(t, msg, key_fields);
+            pool.add_event(event).unwrap();
+        }
+
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+
+        // Collect closed transactions' message sets
+        let mut closed_sets: Vec<std::collections::BTreeSet<String>> = Vec::new();
+        for trans in transactions.iter().filter(|t| t.is_closed) {
+            let mut set = std::collections::BTreeSet::new();
+            for messages in &trans.messages {
+                for m in messages {
+                    set.insert(m.to_string());
+                }
+            }
+            closed_sets.push(set);
+        }
+
+        // We expect exactly 2 closed groups with the following compositions (order-insensitive)
+        let expected1: std::collections::BTreeSet<String> = ["view", "add_to_cart", "purchase"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        let expected2: std::collections::BTreeSet<String> =
+            ["view", "browse", "checkout", "purchase"]
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+
+        assert_eq!(
+            closed_sets.len(),
+            2,
+            "Expected exactly 2 closed transactions in nested scenario"
+        );
+        assert!(
+            closed_sets.contains(&expected1),
+            "Closed transactions should contain {{view, add_to_cart, purchase}}"
+        );
+        assert!(
+            closed_sets.contains(&expected2),
+            "Closed transactions should contain {{view, browse, checkout, purchase}}"
+        );
     }
 }

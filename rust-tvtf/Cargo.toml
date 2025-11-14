@@ -4,7 +4,7 @@ version = "0.2.25"
 edition = "2024"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rust-tvtf-api = { path = "../rust-tvtf-api" }
@@ -21,6 +21,7 @@ regex = { workspace = true }
 smallvec = { workspace = true }
 hashbrown = { workspace = true }
 csv = { workspace = true }
+ahash = "0.8"
 
 [build-dependencies]
 anyhow = { workspace = true }
@@ -29,3 +30,8 @@ zngur = { workspace = true }
 [dev-dependencies]
 csv.workspace = true
 tempfile = { workspace = true }
+criterion = "0.7"
+
+[[bench]]
+name = "trans_bench"
+harness = false
