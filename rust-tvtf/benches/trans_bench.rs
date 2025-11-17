@@ -1,14 +1,14 @@
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use rust_tvtf::funcs::trans::bench_transaction_process_owned;
+use hashbrown::HashMap;
+use rust_tvtf::funcs::trans::{TransParams, TransactionPool};
+use rust_tvtf_api::arg::Arg;
+use smallvec::{SmallVec, smallvec};
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::Duration;
 
-fn generate_events(
-    num_events: usize,
-) -> Vec<hashbrown::HashMap<String, smallvec::SmallVec<[String; 4]>>> {
+fn generate_events(num_events: usize) -> Vec<HashMap<String, SmallVec<[Arc<str>; 4]>>> {
     use chrono::{Duration as ChronoDuration, Utc};
-    use hashbrown::HashMap;
-    use smallvec::{SmallVec, smallvec};
     const FIELD_TIME: &str = "_time";
     const FIELD_MESSAGE: &str = "_message";
     let base = Utc::now();
@@ -21,13 +21,36 @@ fn generate_events(
             _ => "other",
         };
         let ts = (base - ChronoDuration::seconds((i as i64) * 60)).timestamp_micros();
-        let mut event: HashMap<String, SmallVec<[String; 4]>> = HashMap::new();
-        event.insert(FIELD_TIME.to_string(), smallvec![ts.to_string()]);
-        event.insert(FIELD_MESSAGE.to_string(), smallvec![msg.to_string()]);
-        event.insert("host".to_string(), smallvec!["host1".to_string()]);
+        let mut event: HashMap<String, SmallVec<[Arc<str>; 4]>> = HashMap::new();
+        event.insert(
+            FIELD_TIME.to_string(),
+            smallvec![Arc::<str>::from(ts.to_string().into_boxed_str())],
+        );
+        event.insert(FIELD_MESSAGE.to_string(), smallvec![Arc::<str>::from(msg)]);
+        event.insert("host".to_string(), smallvec![Arc::<str>::from("host1")]);
         out.push(event);
     }
     out
+}
+
+fn bench_transaction_process_owned(events: Vec<HashMap<String, SmallVec<[Arc<str>; 4]>>>) -> usize {
+    let params = TransParams::new(
+        Some(vec![]),
+        vec![
+            ("fields".to_string(), Arg::String("host".to_string())),
+            ("starts_with".to_string(), Arg::String("start".to_string())),
+            ("ends_with".to_string(), Arg::String("end".to_string())),
+            ("max_events".to_string(), Arg::Int(3)),
+        ],
+    )
+    .unwrap();
+    let mut pool = TransactionPool::new(params);
+    for event in events {
+        let _ = pool.add_event(event);
+    }
+    let mut groups = pool.get_frozen_trans();
+    groups.extend(pool.get_live_trans());
+    groups.len()
 }
 
 fn bench_transaction_10k(c: &mut Criterion) {

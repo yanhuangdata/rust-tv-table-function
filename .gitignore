@@ -14,5 +14,8 @@ cpp/src/*.dylib
 zngur_generated.rs
 generated.cpp
 
+*.gz
 *.tar.gz
 *.sha256
+
+rust-tvtf/src/funcs/trans.md

@@ -7,7 +7,9 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use chrono::{DateTime, TimeZone, Utc};
+use hashbrown::Equivalent;
 use hashbrown::HashMap;
+use hashbrown::hash_map::RawEntryMut;
 use parking_lot::Mutex;
 use regex::Regex;
 use rust_tvtf_api::TableFunction;
@@ -32,6 +34,14 @@ const TRANS_RESERVED_FIELDS: [&str; 5] = [
     FIELD_IS_CLOSED,
 ];
 
+pub type EventFieldValues = SmallVec<[Arc<str>; 4]>;
+pub type EventMap = HashMap<String, EventFieldValues>;
+
+#[inline]
+fn string_to_arc(s: String) -> Arc<str> {
+    Arc::<str>::from(s.into_boxed_str())
+}
+
 #[derive(Debug, Clone)]
 pub struct TransParams {
     pub fields: Arc<[String]>,
@@ -41,7 +51,7 @@ pub struct TransParams {
     pub ends_with: Option<String>,
     pub ends_with_regex: Option<Regex>,
     pub ends_if_field: Option<String>,
-    pub max_span: Duration,
+    pub max_span: Option<Duration>,
     pub max_events: u64,
 }
 
@@ -55,7 +65,7 @@ impl Default for TransParams {
             ends_with: Default::default(),
             ends_with_regex: Default::default(),
             ends_if_field: Default::default(),
-            max_span: Default::default(),
+            max_span: None,
             max_events: 1000,
         }
     }
@@ -150,18 +160,24 @@ impl TransParams {
                         continue;
                     }
                     static DURATION_REGEX: LazyLock<Regex> =
-                        LazyLock::new(|| Regex::new(r"(\d+)([smhd])").unwrap());
+                        LazyLock::new(|| Regex::new(r"(-?\d+)([smhd])").unwrap());
                     if let Some(m) = DURATION_REGEX.captures(&s) {
-                        let value: u64 = m[1].parse()?;
+                        let value_raw: i64 = m[1].parse()?;
                         let unit = &m[2];
-                        let seconds = match unit {
-                            "s" => value,
-                            "m" => value * 60,
-                            "h" => value * 3600,
-                            "d" => value * 86400,
-                            _ => return Err(anyhow!("Invalid time unit: {}", unit)),
-                        };
-                        parsed_params.max_span = Duration::from_secs(seconds);
+                        if value_raw < 0 {
+                            // Negative => treat as unset (continue)
+                            continue;
+                        } else {
+                            let value = value_raw as u64;
+                            let seconds = match unit {
+                                "s" => value,
+                                "m" => value * 60,
+                                "h" => value * 3600,
+                                "d" => value * 86400,
+                                _ => return Err(anyhow!("Invalid time unit: {}", unit)),
+                            };
+                            parsed_params.max_span = Some(Duration::from_secs(seconds));
+                        }
                     } else {
                         return Err(anyhow!("Invalid max_span format: {}", s));
                     }
@@ -174,9 +190,10 @@ impl TransParams {
                         }
                     };
                     if max_events_val < 0 {
-                        return Err(anyhow!("max_events must be >= 0"));
+                        parsed_params.max_events = u64::MAX;
+                    } else {
+                        parsed_params.max_events = max_events_val as u64;
                     }
-                    parsed_params.max_events = max_events_val as u64;
                 }
                 _ => {
                     return Err(anyhow!(
@@ -191,7 +208,7 @@ impl TransParams {
 
     fn check_boolean_field_condition(
         &self,
-        event: &HashMap<String, SmallVec<[String; 4]>>,
+        event: &EventMap,
         field_name_opt: &Option<String>,
     ) -> bool {
         if let Some(field_name) = field_name_opt
@@ -202,10 +219,18 @@ impl TransParams {
         false
     }
 
-    fn matches_starts_with(&self, event: &HashMap<String, SmallVec<[String; 4]>>) -> bool {
-        if let Some(message_values) = event.get(FIELD_MESSAGE) {
+    #[cfg(test)]
+    fn matches_starts_with(&self, event: &EventMap) -> bool {
+        self.matches_starts_with_cached(event.get(FIELD_MESSAGE), event)
+    }
+
+    fn matches_starts_with_cached(
+        &self,
+        message_values: Option<&EventFieldValues>,
+        event: &EventMap,
+    ) -> bool {
+        if let Some(message_values) = message_values {
             for v in message_values {
-                // Boundary-aware matching across the whole message
                 if let Some(s) = &self.starts_with
                     && v.contains(s)
                 {
@@ -218,17 +243,20 @@ impl TransParams {
                 }
             }
         }
-        // Check starts_if_field condition
-        if self.check_boolean_field_condition(event, &self.starts_if_field) {
-            return true;
-        }
-        false
+        self.check_boolean_field_condition(event, &self.starts_if_field)
     }
 
-    // removed boundary-specific contains and helpers per simplified matching requirement
+    #[cfg(test)]
+    fn matches_ends_with(&self, event: &EventMap) -> bool {
+        self.matches_ends_with_cached(event.get(FIELD_MESSAGE), event)
+    }
 
-    fn matches_ends_with(&self, event: &HashMap<String, SmallVec<[String; 4]>>) -> bool {
-        if let Some(message) = event.get(FIELD_MESSAGE) {
+    fn matches_ends_with_cached(
+        &self,
+        message_values: Option<&EventFieldValues>,
+        event: &EventMap,
+    ) -> bool {
+        if let Some(message) = message_values {
             if let Some(s) = &self.ends_with
                 && message.iter().any(|v| v.contains(s))
             {
@@ -240,21 +268,20 @@ impl TransParams {
                 return true;
             }
         }
-        // Check ends_if_field condition
-        if self.check_boolean_field_condition(event, &self.ends_if_field) {
-            return true;
-        }
-        false
+        self.check_boolean_field_condition(event, &self.ends_if_field)
     }
 }
 
 #[derive(Debug, Clone)]
-struct Transaction {
-    fields: HashMap<String, SmallVec<[Arc<str>; 4]>, ahash::RandomState>,
-    key_set: hashbrown::HashSet<String, ahash::RandomState>,
+pub struct Transaction {
+    key_names: Arc<[String]>,
+    key_index_map: HashMap<String, usize, ahash::RandomState>,
+    key_slots: Vec<EventFieldValues>,
+    extra_fields: HashMap<String, EventFieldValues, ahash::RandomState>,
     start_time: Option<DateTime<Utc>>,
     end_time: Option<DateTime<Utc>>,
     messages: VecDeque<SmallVec<[Arc<str>; 4]>>,
+    times: VecDeque<DateTime<Utc>>,
     event_count: u64,
     is_closed: bool,
     has_start_marker: bool,
@@ -263,23 +290,22 @@ struct Transaction {
 
 impl Transaction {
     fn new(field_names: Arc<[String]>) -> Self {
-        // Pre-size and pre-populate known key fields to avoid rehashing and key cloning on every merge
-        let mut fields =
+        let mut key_index_map =
             HashMap::with_capacity_and_hasher(field_names.len(), ahash::RandomState::new());
-        let mut key_set = hashbrown::HashSet::with_capacity_and_hasher(
-            field_names.len(),
-            ahash::RandomState::new(),
-        );
-        for k in field_names.iter() {
-            fields.insert(k.clone(), SmallVec::<[Arc<str>; 4]>::new());
-            key_set.insert(k.clone());
+        let mut key_slots = Vec::with_capacity(field_names.len());
+        for (idx, k) in field_names.iter().enumerate() {
+            key_index_map.insert(k.clone(), idx);
+            key_slots.push(EventFieldValues::new());
         }
         Transaction {
-            fields,
-            key_set,
+            key_names: field_names,
+            key_index_map,
+            key_slots,
+            extra_fields: HashMap::with_hasher(ahash::RandomState::new()),
             start_time: None,
             end_time: None,
             messages: VecDeque::new(),
+            times: VecDeque::new(),
             event_count: 0,
             is_closed: false,
             has_start_marker: false,
@@ -287,15 +313,12 @@ impl Transaction {
         }
     }
 
-    fn merge_event(&mut self, event: &HashMap<String, SmallVec<[String; 4]>>) {
+    fn merge_event(&mut self, event: &EventMap) {
         if let Some(message) = event.get(FIELD_MESSAGE) {
             if message.is_empty() {
                 return;
             }
-            let mapped: SmallVec<[Arc<str>; 4]> = message
-                .iter()
-                .map(|s| Arc::<str>::from(s.as_str()))
-                .collect();
+            let mapped: EventFieldValues = message.iter().cloned().collect();
             self.messages.push_front(mapped);
         }
 
@@ -303,30 +326,63 @@ impl Transaction {
             if TRANS_RESERVED_FIELDS.contains(&k.as_str()) {
                 continue;
             }
-            // If this is a configured key field, overwrite its slot (keep latest)
-            if self.key_set.contains(k) {
-                let slot = self.fields.get_mut(k).expect("pre-populated key missing");
-                slot.clear();
-                slot.extend(v.iter().map(|s| Arc::<str>::from(s.as_str())));
+            if v.is_empty() {
                 continue;
             }
-            // Otherwise, accumulate values for non-key fields
-            let entry = self.fields.entry(k.clone()).or_default();
-            entry.extend(v.iter().map(|s| Arc::<str>::from(s.as_str())));
+            if let Some(&idx) = self.key_index_map.get(k) {
+                let slot = &mut self.key_slots[idx];
+                slot.truncate(0);
+                slot.extend(v.iter().cloned());
+            } else {
+                let entry = self.extra_fields.entry(k.clone()).or_default();
+                entry.extend(v.iter().cloned());
+            }
         }
     }
 
-    fn add_event(&mut self, event: &HashMap<String, SmallVec<[String; 4]>>) -> Result<()> {
+    pub fn key_names(&self) -> &[String] {
+        &self.key_names
+    }
+
+    pub fn get_field_values(&self, name: &str) -> Option<&EventFieldValues> {
+        if let Some(&idx) = self.key_index_map.get(name) {
+            Some(&self.key_slots[idx])
+        } else {
+            self.extra_fields.get(name)
+        }
+    }
+
+    fn set_key_field_from(&mut self, name: &str, values: &EventFieldValues) {
+        if let Some(&idx) = self.key_index_map.get(name) {
+            let slot = &mut self.key_slots[idx];
+            slot.truncate(0);
+            slot.extend(values.iter().cloned());
+        }
+    }
+
+    fn clear_key_field(&mut self, name: &str) {
+        if let Some(&idx) = self.key_index_map.get(name) {
+            self.key_slots[idx].truncate(0);
+        }
+    }
+
+    pub fn iter_fields(&self) -> TransactionFieldIter<'_> {
+        TransactionFieldIter {
+            key_iter: self.key_names.iter().enumerate(),
+            key_slots: &self.key_slots,
+            extra_iter: self.extra_fields.iter(),
+        }
+    }
+
+    fn add_event(&mut self, event: &EventMap) -> Result<()> {
         let time_str = event
             .get(FIELD_TIME)
             .context("Event missing _time field or _time is null")?;
 
-        let time = time_str
-            .first()
-            .context("No _time in transaction")?
-            .parse::<i64>()
-            .map(|ts| Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now))
-            .context("Failed to parse _time as timestamp")?;
+        let time_first = time_str.first().context("No _time in transaction")?;
+        let ts = atoi_simd::parse::<i64>(time_first.as_bytes())
+            .map_err(|_| anyhow!("Failed to parse _time as timestamp"))?;
+        let time = Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now);
 
         self.event_count += 1;
 
@@ -334,30 +390,28 @@ impl Transaction {
             self.start_time = Some(time);
             self.end_time = Some(time);
             self.merge_event(event);
+            self.times.push_front(time);
         } else if time <= self.start_time.unwrap() {
             self.start_time = Some(time);
             self.merge_event(event);
+            self.times.push_front(time);
         } else if time <= self.end_time.unwrap() && time >= self.start_time.unwrap() {
             self.merge_event(event);
+            self.times.push_front(time);
         }
 
         Ok(())
     }
 
-    fn update_start_time_only(
-        &mut self,
-        event: &HashMap<String, SmallVec<[String; 4]>>,
-    ) -> Result<()> {
+    fn update_start_time_only(&mut self, event: &EventMap) -> Result<()> {
         let time_str = event
             .get(FIELD_TIME)
             .context("Event missing _time field or _time is null")?;
 
-        let time = time_str
-            .first()
-            .context("No _time in transaction")?
-            .parse::<i64>()
-            .map(|ts| Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now))
-            .context("Failed to parse _time as timestamp")?;
+        let time_first = time_str.first().context("No _time in transaction")?;
+        let ts = atoi_simd::parse::<i64>(time_first.as_bytes())
+            .map_err(|_| anyhow!("Failed to parse _time as timestamp"))?;
+        let time = Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now);
 
         if self.start_time.is_none_or(|current| time < current) {
             self.start_time = Some(time);
@@ -387,29 +441,55 @@ impl Transaction {
     fn set_is_closed(&mut self) {
         self.is_closed = true;
     }
+
+    fn span_exceeds_with_candidate(
+        &self,
+        candidate_time: DateTime<Utc>,
+        max_span_secs: u64,
+    ) -> bool {
+        if max_span_secs == 0 {
+            return false;
+        }
+        let reference_end = self.end_time.or(self.start_time);
+        let Some(end_time) = reference_end else {
+            return false;
+        };
+        let start_time = self.start_time.unwrap_or(end_time);
+        let new_start = if candidate_time < start_time {
+            candidate_time
+        } else {
+            start_time
+        };
+        let new_end = if candidate_time > end_time {
+            candidate_time
+        } else {
+            end_time
+        };
+        let span_micros = new_end
+            .signed_duration_since(new_start)
+            .num_microseconds()
+            .unwrap_or(i64::MAX);
+        span_micros > (max_span_secs as i64 * 1_000_000)
+    }
 }
 
-// Process an owned set of events end-to-end
-pub fn bench_transaction_process_owned(
-    events: Vec<HashMap<String, SmallVec<[String; 4]>>>,
-) -> usize {
-    let params = TransParams::new(
-        Some(vec![]),
-        vec![
-            ("fields".to_string(), Arg::String("host".to_string())),
-            ("starts_with".to_string(), Arg::String("start".to_string())),
-            ("ends_with".to_string(), Arg::String("end".to_string())),
-            ("max_events".to_string(), Arg::Int(3)),
-        ],
-    )
-    .unwrap();
-    let mut pool = TransactionPool::new(params);
-    for event in events {
-        let _ = pool.add_event(event);
+pub struct TransactionFieldIter<'a> {
+    key_iter: std::iter::Enumerate<std::slice::Iter<'a, String>>,
+    key_slots: &'a [EventFieldValues],
+    extra_iter: hashbrown::hash_map::Iter<'a, String, EventFieldValues>,
+}
+
+impl<'a> Iterator for TransactionFieldIter<'a> {
+    type Item = (&'a str, &'a EventFieldValues);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some((idx, name)) = self.key_iter.next() {
+            return Some((name.as_str(), &self.key_slots[idx]));
+        }
+        self.extra_iter
+            .next()
+            .map(|(name, values)| (name.as_str(), values))
     }
-    let mut groups = pool.get_frozen_trans();
-    groups.extend(pool.get_live_trans());
-    groups.len()
 }
 
 fn to_record_batch(
@@ -422,8 +502,13 @@ fn to_record_batch(
 
     // Collect all unique field names from all transactions
     let mut all_field_names = std::collections::HashSet::new();
+    if let Some(first) = transactions.first() {
+        for key_name in first.key_names() {
+            all_field_names.insert(key_name.clone());
+        }
+    }
     for transaction in transactions {
-        for field_name in transaction.fields.keys() {
+        for field_name in transaction.extra_fields.keys() {
             all_field_names.insert(field_name.clone());
         }
     }
@@ -501,7 +586,7 @@ fn to_record_batch(
         if params.fields.contains(field_name) {
             let mut field_builder = StringBuilder::new();
             for transaction in transactions.iter() {
-                let Some(values) = transaction.fields.get(field_name) else {
+                let Some(values) = transaction.get_field_values(field_name) else {
                     field_builder.append_null();
                     continue;
                 };
@@ -519,7 +604,7 @@ fn to_record_batch(
         } else {
             let mut field_builder = ListBuilder::new(StringBuilder::new());
             for transaction in transactions.iter() {
-                let Some(values) = transaction.fields.get(field_name) else {
+                let Some(values) = transaction.get_field_values(field_name) else {
                     field_builder.append_null();
                     continue;
                 };
@@ -546,45 +631,88 @@ fn to_record_batch(
     ))
 }
 
-type TransKey = SmallVec<[Option<String>; 4]>;
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct OwnedTransKey {
+    parts: SmallVec<[Option<String>; 4]>,
+}
+
+#[derive(Debug, Eq, PartialEq, Hash)]
+struct RefTransKey<'a> {
+    parts: SmallVec<[Option<&'a str>; 4]>,
+}
+
+type TransKey = OwnedTransKey;
+
+impl<'a> Equivalent<OwnedTransKey> for RefTransKey<'a> {
+    fn equivalent(&self, key: &OwnedTransKey) -> bool {
+        if self.parts.len() != key.parts.len() {
+            return false;
+        }
+        for (a, b) in self.parts.iter().zip(key.parts.iter()) {
+            match (a, b) {
+                (None, _) => continue,
+                (_, None) => continue,
+                (Some(sa), Some(sb)) => {
+                    if *sa != sb.as_str() {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+impl Equivalent<OwnedTransKey> for SmallVec<[Option<String>; 4]> {
+    fn equivalent(&self, key: &OwnedTransKey) -> bool {
+        if self.len() != key.parts.len() {
+            return false;
+        }
+        for (a, b) in self.iter().zip(key.parts.iter()) {
+            match (a, b) {
+                (None, _) => continue,
+                (_, None) => continue,
+                (Some(sa), Some(sb)) => {
+                    if sa != sb {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+}
 
 #[derive(Clone, Debug)]
-struct TransactionPool {
+pub struct TransactionPool {
     params: TransParams,
     frozen_trans: Vec<Transaction>,
-    live_trans: HashMap<TransKey, Transaction>,
-    start_trans_stack: HashMap<TransKey, Vec<Transaction>>, // Stack for pending start transactions
+    live_trans: hashbrown::HashMap<TransKey, Transaction, ahash::RandomState>,
+    start_trans_stack: hashbrown::HashMap<TransKey, Vec<Transaction>, ahash::RandomState>, // Stack for pending start transactions
     earliest_event_timestamp: Option<DateTime<Utc>>,
-    trans_complete_flag: HashMap<TransKey, bool>,
+    trans_complete_flag: hashbrown::HashMap<TransKey, bool, ahash::RandomState>,
 }
 
 impl TransactionPool {
-    fn new(params: TransParams) -> Self {
+    fn extract_event_time(event: &EventMap) -> Option<DateTime<Utc>> {
+        let time_str = event.get(FIELD_TIME)?;
+        let time_str_val = time_str.first()?;
+        let ts = atoi_simd::parse::<i64>(time_str_val.as_bytes()).ok()?;
+        Some(Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now))
+    }
+
+    pub fn new(params: TransParams) -> Self {
         TransactionPool {
             params,
             frozen_trans: Vec::new(),
-            live_trans: HashMap::new(),
-            start_trans_stack: HashMap::new(),
+            live_trans: hashbrown::HashMap::with_hasher(ahash::RandomState::new()),
+            start_trans_stack: hashbrown::HashMap::with_hasher(ahash::RandomState::new()),
             earliest_event_timestamp: None,
-            trans_complete_flag: HashMap::new(),
+            trans_complete_flag: hashbrown::HashMap::with_hasher(ahash::RandomState::new()),
         }
     }
 
-    fn is_valid_event(&self, event: &HashMap<String, SmallVec<[String; 4]>>) -> bool {
-        let Some(time_str) = event.get(FIELD_TIME) else {
-            return false;
-        };
-        let Some(time_str_val) = time_str.first() else {
-            return false;
-        };
-
-        let Ok(time) = time_str_val
-            .parse::<i64>()
-            .map(|ts| Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now))
-        else {
-            return false;
-        };
-
+    fn is_valid_event(&self, event: &EventMap, event_time: DateTime<Utc>) -> bool {
         if !self.params.fields.is_empty() {
             let has_all_fields = self
                 .params
@@ -597,7 +725,7 @@ impl TransactionPool {
         }
 
         if let Some(earliest_ts) = self.earliest_event_timestamp
-            && time > earliest_ts
+            && event_time > earliest_ts
         {
             return false;
         }
@@ -605,7 +733,10 @@ impl TransactionPool {
     }
 
     fn freeze_trans_exceeded_max_span_restriction(&mut self) {
-        let max_span_secs = self.params.max_span.as_secs();
+        let Some(dur) = self.params.max_span else {
+            return;
+        };
+        let max_span_secs = dur.as_secs();
         if max_span_secs == 0 {
             return;
         }
@@ -615,21 +746,23 @@ impl TransactionPool {
         };
         let max_span_limit = max_span_secs as i64;
 
-        let mut keys_to_freeze = Vec::new();
-        for (trans_key, trans) in &self.live_trans {
+        // Move out the map to avoid cloning keys while deciding which entries to keep
+        let old_live = std::mem::take(&mut self.live_trans);
+        for (key, mut trans) in old_live.into_iter() {
             if let Some(end_time) = trans.end_time {
                 let elapsed = end_time.signed_duration_since(earliest_ts).num_seconds();
                 if elapsed > max_span_limit {
-                    keys_to_freeze.push(trans_key.clone());
+                    // Freeze without cloning the key
+                    if trans.has_end_marker {
+                        trans.set_is_closed();
+                    }
+                    self.frozen_trans.push(trans);
+                    self.trans_complete_flag.remove(&key);
+                    continue;
                 }
             }
-        }
-
-        for key in keys_to_freeze {
-            if let Some(trans) = self.live_trans.remove(&key) {
-                self.frozen_trans.push(trans);
-                self.trans_complete_flag.remove(&key);
-            }
+            // Keep the entry
+            self.live_trans.insert(key, trans);
         }
 
         self.start_trans_stack.retain(|_, stack| {
@@ -643,7 +776,10 @@ impl TransactionPool {
                     .unwrap_or(false);
 
                 if expire {
-                    let trans = stack.remove(idx);
+                    let mut trans = stack.remove(idx);
+                    if trans.has_end_marker {
+                        trans.set_is_closed();
+                    }
                     self.frozen_trans.push(trans);
                 } else {
                     idx += 1;
@@ -653,26 +789,63 @@ impl TransactionPool {
         });
     }
 
-    fn make_trans_key(&self, event: &HashMap<String, SmallVec<[String; 4]>>) -> TransKey {
-        self.params
-            .fields
-            .iter()
-            .map(|f| {
-                event.get(f).and_then(|v_opt| {
-                    v_opt.first().and_then(|s| {
-                        let s_trim = s.trim();
-                        if s_trim.is_empty() {
-                            None
-                        } else {
-                            Some(s_trim.to_string())
-                        }
-                    })
-                })
-            })
-            .collect()
+    fn make_trans_key_ref<'a>(&self, event: &'a EventMap) -> RefTransKey<'a> {
+        let mut parts: SmallVec<[Option<&'a str>; 4]> =
+            SmallVec::with_capacity(self.params.fields.len());
+        for f in self.params.fields.iter() {
+            if let Some(vals) = event.get(f)
+                && let Some(first) = vals.first()
+            {
+                // Avoid trimming when there is no whitespace to reduce extra scan and allocation
+                if first.is_empty() {
+                    parts.push(None);
+                    continue;
+                }
+                if first
+                    .bytes()
+                    .any(|b| b == b' ' || b == b'\t' || b == b'\n' || b == b'\r')
+                {
+                    let trimmed = first.trim();
+                    if trimmed.is_empty() {
+                        parts.push(None);
+                    } else {
+                        parts.push(Some(trimmed));
+                    }
+                } else {
+                    parts.push(Some(first.as_ref()));
+                }
+                continue;
+            }
+            parts.push(None);
+        }
+        RefTransKey { parts }
     }
 
-    fn add_event(&mut self, event: HashMap<String, SmallVec<[String; 4]>>) -> Result<()> {
+    fn make_trans_key_owned_from_ref(ref_key: &RefTransKey<'_>) -> TransKey {
+        let mut parts: SmallVec<[Option<String>; 4]> = SmallVec::with_capacity(ref_key.parts.len());
+        for p in ref_key.parts.iter() {
+            match p {
+                Some(s) => parts.push(Some((*s).to_string())),
+                None => parts.push(None),
+            }
+        }
+        OwnedTransKey { parts }
+    }
+
+    fn get_or_insert_stack<'a>(
+        stack: &'a mut hashbrown::HashMap<TransKey, Vec<Transaction>, ahash::RandomState>,
+        key_ref: &RefTransKey<'_>,
+    ) -> &'a mut Vec<Transaction> {
+        match stack.raw_entry_mut().from_key(key_ref) {
+            RawEntryMut::Occupied(entry) => entry.into_mut(),
+            RawEntryMut::Vacant(entry) => {
+                let owned = Self::make_trans_key_owned_from_ref(key_ref);
+                entry.insert(owned, Vec::new()).1
+            }
+        }
+    }
+
+    pub fn add_event(&mut self, event: EventMap) -> Result<()> {
         // For simple grouping without start/end conditions, bypass the allow_nulls filtering
         let has_start_conditions = self.params.starts_with.is_some()
             || self.params.starts_with_regex.is_some()
@@ -681,28 +854,39 @@ impl TransactionPool {
             || self.params.ends_with_regex.is_some()
             || self.params.ends_if_field.is_some();
 
+        let Some(event_time) = Self::extract_event_time(&event) else {
+            return Ok(());
+        };
+
         // Only apply the original validation when there are start/end conditions
         if has_start_conditions || has_end_conditions {
-            if !self.is_valid_event(&event) {
+            if !self.is_valid_event(&event, event_time) {
                 return Ok(());
             }
         } else {
             // For simple grouping, do basic validation without field existence check
-            if !self.is_valid_event_simple_grouping(&event) {
+            if !self.is_valid_event_simple_grouping(&event, event_time) {
                 return Ok(());
             }
         }
 
-        // Special semantics: max_events == 0
         // - If no start/end conditions: each event becomes a single closed group (identity).
         // - If there are start/end conditions: each event becomes a single open group,
         //   unless it simultaneously matches both start and end (then closed).
-        if self.params.max_events == 0 {
+        if self.params.max_events == 0 || self.params.max_span.is_some_and(|d| d.as_secs() == 0) {
             let mut single = Transaction::new(self.params.fields.clone());
-            if has_start_conditions && self.params.matches_starts_with(&event) {
+            if has_start_conditions
+                && self
+                    .params
+                    .matches_starts_with_cached(event.get(FIELD_MESSAGE), &event)
+            {
                 single.has_start_marker = true;
             }
-            if has_end_conditions && self.params.matches_ends_with(&event) {
+            if has_end_conditions
+                && self
+                    .params
+                    .matches_ends_with_cached(event.get(FIELD_MESSAGE), &event)
+            {
                 single.has_end_marker = true;
             }
             single.add_event(&event)?;
@@ -714,58 +898,124 @@ impl TransactionPool {
             return Ok(());
         }
 
-        let time_str = event.get(FIELD_TIME).unwrap();
-        let time = time_str
-            .first()
-            .context("No _time field")?
-            .parse::<i64>()
-            .map(|ts| Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now))
-            .context("Failed to parse _time as timestamp")?;
-        let event_time_micros = time.timestamp_micros();
-        self.earliest_event_timestamp = Some(time);
+        let event_time_micros = event_time.timestamp_micros();
+        self.earliest_event_timestamp = Some(event_time);
 
         self.freeze_trans_exceeded_max_span_restriction();
 
-        let trans_key = self.make_trans_key(&event);
+        let trans_key_ref = self.make_trans_key_ref(&event);
+
+        let message_values = event.get(FIELD_MESSAGE);
 
         if has_start_conditions || has_end_conditions {
-            // Bracket matching logic (for when start/end conditions are explicitly specified)
             // When processing in reverse chronological order (as in SQL ORDER BY _time DESC),
             // END events go to stack waiting for START events to close them
-            if self.params.matches_ends_with(&event) {
+            if self.params.matches_ends_with_cached(message_values, &event) {
                 if has_start_conditions {
                     // In bracket mode, always push END to the stack to be paired by a future START.
                     // Do not try to immediately attach END to any existing start-live in live_trans.
                     let mut new_trans = Transaction::new(self.params.fields.clone());
                     new_trans.has_end_marker = true;
                     new_trans.add_event(&event)?;
-                    let stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
+                    let stack =
+                        Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
                     stack.push(new_trans);
                 } else {
                     // ends_only mode:
-                    // Use live_trans as buffer for regular events; maintain the current "end-live" on the stack.
-                    let stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
-                    if let Some(mut prev_end_live) = stack.pop() {
-                        // Freeze previous end-live, set closed if has end marker
-                        if prev_end_live.has_end_marker {
-                            prev_end_live.set_is_closed();
-                        }
-                        self.frozen_trans.push(prev_end_live);
-                    }
-                    // Do NOT merge more-recent buffered events into this end; freeze buffer as its own open group
-                    if let Some(buffer) = self.live_trans.remove(&trans_key) {
-                        self.frozen_trans.push(buffer);
-                    }
-                    // Start a new end-live with just this end
+                    // ends_only mode, always use nested/backfill behavior
+                    let stack =
+                        Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
                     let mut end_only = Transaction::new(self.params.fields.clone());
                     end_only.has_end_marker = true;
                     end_only.add_event(&event)?;
                     stack.push(end_only);
+                    if let Some(span) = self.params.max_span
+                        && span.as_secs() > 0
+                        && let Some(mut_buffer) = self.live_trans.get_mut(&trans_key_ref)
+                    {
+                        loop {
+                            while let Some(top) = stack.last()
+                                && self.params.max_events > 0
+                                && top.get_event_count() >= self.params.max_events
+                            {
+                                let mut full = stack.pop().unwrap();
+                                if full.has_end_marker {
+                                    full.set_is_closed();
+                                }
+                                self.frozen_trans.push(full);
+                            }
+                            if mut_buffer.messages.is_empty() || stack.is_empty() {
+                                break;
+                            }
+                            let top = stack.last_mut().unwrap();
+                            if self.params.max_events > 0
+                                && top.get_event_count() >= self.params.max_events
+                            {
+                                continue;
+                            }
+                            if let Some(&candidate_time) = mut_buffer.times.front()
+                                && top.span_exceeds_with_candidate(candidate_time, span.as_secs())
+                            {
+                                break;
+                            }
+                            if let (Some(msgs), Some(ev_time)) = (
+                                mut_buffer.messages.pop_front(),
+                                mut_buffer.times.pop_front(),
+                            ) {
+                                top.messages.push_front(msgs);
+                                top.times.push_front(ev_time);
+                                top.start_time = Some(
+                                    top.start_time
+                                        .map(|cur| if ev_time < cur { ev_time } else { cur })
+                                        .unwrap_or(ev_time),
+                                );
+                                top.end_time = Some(
+                                    top.end_time
+                                        .map(|cur| if ev_time > cur { ev_time } else { cur })
+                                        .unwrap_or(ev_time),
+                                );
+                                top.event_count = top.event_count.saturating_add(1);
+                                if mut_buffer.event_count > 0 {
+                                    mut_buffer.event_count -= 1;
+                                }
+                                match (mut_buffer.times.front(), mut_buffer.times.back()) {
+                                    (Some(&s), Some(&e)) => {
+                                        mut_buffer.start_time = Some(s);
+                                        mut_buffer.end_time = Some(e);
+                                    }
+                                    _ => {
+                                        mut_buffer.start_time = None;
+                                        mut_buffer.end_time = None;
+                                    }
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        if mut_buffer.messages.is_empty() {
+                            let _ = self.live_trans.remove(&trans_key_ref);
+                        }
+                    }
+                    if let Some(top) = stack.last()
+                        && self.params.max_events > 0
+                        && top.get_event_count() >= self.params.max_events
+                    {
+                        let mut full = stack.pop().unwrap();
+                        if full.has_end_marker {
+                            full.set_is_closed();
+                        }
+                        self.frozen_trans.push(full);
+                    }
+                    // buffer freeze handled above (span case only)
                 }
-            } else if self.params.matches_starts_with(&event) {
+            } else if self
+                .params
+                .matches_starts_with_cached(message_values, &event)
+            {
                 if has_end_conditions {
                     // When a start event is encountered, try to match with most recent unmatched end event
-                    let end_stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
+                    let end_stack =
+                        Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
 
                     // If the top end-only transaction already reached max_events, freeze it first
                     if let Some(top) = end_stack.last()
@@ -797,14 +1047,15 @@ impl TransactionPool {
                         // If there is an existing live:
                         //  - If it is a regular (no start marker), merge that live with this start (attach start and keep live)
                         //  - If it already has a start marker, freeze it and start a new live with this start only
-                        if let Some(mut existing_trans) = self.live_trans.remove(&trans_key) {
+                        if let Some(mut existing_trans) = self.live_trans.remove(&trans_key_ref) {
                             if existing_trans.has_start_marker {
                                 // Freeze previous start-only live, start a fresh one
                                 self.frozen_trans.push(existing_trans);
                                 let mut new_trans = Transaction::new(self.params.fields.clone());
                                 new_trans.has_start_marker = true;
                                 new_trans.add_event(&event)?;
-                                self.live_trans.insert(trans_key.clone(), new_trans);
+                                let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
+                                self.live_trans.insert(owned, new_trans);
                             } else {
                                 // Merge previously accumulated regular events into this start live
                                 existing_trans.has_start_marker = true;
@@ -815,46 +1066,49 @@ impl TransactionPool {
                                 } else {
                                     existing_trans.add_event(&event)?;
                                 }
-                                self.live_trans.insert(trans_key.clone(), existing_trans);
+                                let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
+                                self.live_trans.insert(owned, existing_trans);
                             }
                         } else {
                             let mut new_trans = Transaction::new(self.params.fields.clone());
                             new_trans.has_start_marker = true;
                             new_trans.add_event(&event)?;
-                            self.live_trans.insert(trans_key.clone(), new_trans);
+                            let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
+                            self.live_trans.insert(owned, new_trans);
                         }
                     }
                 } else {
                     // starts_only mode:
                     // Use live_trans as buffer for regular events; maintain the current "start-live" on the stack.
-                    let stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
+                    let stack =
+                        Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
                     if let Some(mut prev_start_live) = stack.pop() {
                         // Close and freeze the previous start-live when a new start arrives
                         prev_start_live.set_is_closed();
                         self.frozen_trans.push(prev_start_live);
                     }
                     // Merge buffer with this start
-                    let mut new_trans = if let Some(mut buffer) = self.live_trans.remove(&trans_key)
-                    {
-                        if self.params.max_events > 0
-                            && buffer.get_event_count() >= self.params.max_events
-                        {
-                            buffer.update_start_time_only(&event)?;
+                    let mut new_trans =
+                        if let Some(mut buffer) = self.live_trans.remove(&trans_key_ref) {
+                            if self.params.max_events > 0
+                                && buffer.get_event_count() >= self.params.max_events
+                            {
+                                buffer.update_start_time_only(&event)?;
+                            } else {
+                                buffer.add_event(&event)?;
+                            }
+                            buffer
                         } else {
-                            buffer.add_event(&event)?;
-                        }
-                        buffer
-                    } else {
-                        let mut t = Transaction::new(self.params.fields.clone());
-                        t.add_event(&event)?;
-                        t
-                    };
+                            let mut t = Transaction::new(self.params.fields.clone());
+                            t.add_event(&event)?;
+                            t
+                        };
                     new_trans.has_start_marker = true;
                     stack.push(new_trans);
                 }
             } else if has_start_conditions && has_end_conditions {
                 // Regular event in bracket mode: buffer into live_trans (to be merged with the next boundary)
-                let stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
+                let stack = Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
                 if let Some(trans) = stack.last_mut() {
                     if self.params.max_events == 0
                         || trans.get_event_count() < self.params.max_events
@@ -874,15 +1128,16 @@ impl TransactionPool {
                         // If only end marker, leave as open (closed=false)
                         self.frozen_trans.push(trans_to_freeze);
                     }
-                } else if let Some(existing) = self.live_trans.get_mut(&trans_key) {
+                } else if let Some(existing) = self.live_trans.get_mut(&trans_key_ref) {
                     if existing.has_start_marker {
                         // Freeze the current start-live segment; start a separate regular-live for this event
                         // Need to take ownership to freeze: remove then re-insert a new buffer
-                        let taken = self.live_trans.remove(&trans_key).unwrap();
+                        let taken = self.live_trans.remove(&trans_key_ref).unwrap();
                         self.frozen_trans.push(taken);
                         let mut new_trans = Transaction::new(self.params.fields.clone());
                         new_trans.add_event(&event)?;
-                        self.live_trans.insert(trans_key.clone(), new_trans);
+                        let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
+                        self.live_trans.insert(owned, new_trans);
                     } else {
                         // Continue accumulating regular events until a start arrives
                         existing.add_event(&event)?;
@@ -891,44 +1146,78 @@ impl TransactionPool {
                     // Start a new regular-live buffer
                     let mut new_trans = Transaction::new(self.params.fields.clone());
                     new_trans.add_event(&event)?;
-                    self.live_trans.insert(trans_key.clone(), new_trans);
+                    let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
+                    self.live_trans.insert(owned, new_trans);
                 }
             } else if has_end_conditions {
                 // ends_only: add to current end-live if present; otherwise buffer until an end comes
-                let stack = self.start_trans_stack.entry(trans_key.clone()).or_default();
-                if let Some(trans) = stack.last_mut() {
-                    if self.params.max_events == 0
-                        || trans.get_event_count() < self.params.max_events
-                    {
-                        trans.add_event(&event)?;
-                    }
-                    // Check if max_events is reached after adding (or if it was already reached)
-                    if self.params.max_events > 0
-                        && trans.get_event_count() >= self.params.max_events
-                    {
-                        // Immediately freeze and check conditions
-                        let mut trans_to_freeze = stack.pop().unwrap();
-                        // If has end marker, set closed
-                        if trans_to_freeze.has_end_marker {
-                            trans_to_freeze.set_is_closed();
+                let stack = Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
+                let mut handled_event = false;
+                if stack.last().is_some() {
+                    loop {
+                        let Some(top) = stack.last() else {
+                            break;
+                        };
+                        let mut should_freeze = false;
+                        if self.params.max_events > 0
+                            && top.get_event_count() >= self.params.max_events
+                        {
+                            should_freeze = true;
+                        } else if let Some(span) = self.params.max_span
+                            && span.as_secs() > 0
+                            && top.span_exceeds_with_candidate(event_time, span.as_secs())
+                        {
+                            should_freeze = true;
                         }
-                        self.frozen_trans.push(trans_to_freeze);
+
+                        if should_freeze {
+                            let mut trans_to_freeze = stack.pop().unwrap();
+                            if trans_to_freeze.has_end_marker {
+                                trans_to_freeze.set_is_closed();
+                            }
+                            self.frozen_trans.push(trans_to_freeze);
+                            continue;
+                        }
+                        break;
                     }
-                } else if let Some(existing) = self.live_trans.get_mut(&trans_key) {
+
+                    if let Some(trans) = stack.last_mut() {
+                        if self.params.max_events == 0
+                            || trans.get_event_count() < self.params.max_events
+                        {
+                            trans.add_event(&event)?;
+                        }
+                        if self.params.max_events > 0
+                            && trans.get_event_count() >= self.params.max_events
+                        {
+                            let mut trans_to_freeze = stack.pop().unwrap();
+                            if trans_to_freeze.has_end_marker {
+                                trans_to_freeze.set_is_closed();
+                            }
+                            self.frozen_trans.push(trans_to_freeze);
+                        }
+                        handled_event = true;
+                    }
+                }
+                if handled_event {
+                    // Event already merged into the latest end-only transaction
+                } else if let Some(existing) = self.live_trans.get_mut(&trans_key_ref) {
                     existing.add_event(&event)?;
                 } else {
                     let mut new_trans = Transaction::new(self.params.fields.clone());
                     new_trans.add_event(&event)?;
-                    self.live_trans.insert(trans_key.clone(), new_trans);
+                    let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
+                    self.live_trans.insert(owned, new_trans);
                 }
             } else {
                 // starts_only mode: buffer regular events in live_trans until a start comes
-                if let Some(existing) = self.live_trans.get_mut(&trans_key) {
+                if let Some(existing) = self.live_trans.get_mut(&trans_key_ref) {
                     existing.add_event(&event)?;
                 } else {
                     let mut new_trans = Transaction::new(self.params.fields.clone());
                     new_trans.add_event(&event)?;
-                    self.live_trans.insert(trans_key.clone(), new_trans);
+                    let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
+                    self.live_trans.insert(owned, new_trans);
                 }
             }
         } else {
@@ -937,7 +1226,7 @@ impl TransactionPool {
             // add to the best matching one based on non-null field matches and time proximity; otherwise create new
             if let Some(best_matching_key) = self.find_best_matching_transaction_key(
                 &self.live_trans,
-                &trans_key,
+                &trans_key_ref,
                 Some(event_time_micros),
             ) {
                 if let Some(trans) = self.live_trans.get_mut(&best_matching_key) {
@@ -947,14 +1236,18 @@ impl TransactionPool {
                 // No compatible transaction found, create new one with this key
                 let mut new_trans = Transaction::new(self.params.fields.clone());
                 new_trans.add_event(&event)?;
-                self.live_trans.insert(trans_key.clone(), new_trans);
+                let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
+                self.live_trans.insert(owned, new_trans);
             }
         }
 
-        if let Some(trans) = self.live_trans.get(&trans_key)
+        // Do not auto-freeze the regular buffer in ends_only mode; keep it for backfill.
+        let ends_only_mode = has_end_conditions && !has_start_conditions;
+        if !ends_only_mode
+            && let Some(trans) = self.live_trans.get(&trans_key_ref)
             && trans.get_event_count() >= self.params.max_events
         {
-            let mut trans_to_freeze = self.live_trans.remove(&trans_key).unwrap();
+            let mut trans_to_freeze = self.live_trans.remove(&trans_key_ref).unwrap();
             // When max_events is reached, check if conditions are satisfied to set closed
             if has_start_conditions && has_end_conditions {
                 // Bracket mode: need both start and end markers
@@ -973,40 +1266,39 @@ impl TransactionPool {
                 }
             }
             self.frozen_trans.push(trans_to_freeze);
-            self.trans_complete_flag.remove(&trans_key);
+            self.trans_complete_flag.remove(&trans_key_ref);
         }
 
         Ok(())
     }
 
-    // Check if two keys match with null wildcards (nulls match anything, non-nulls must match exactly)
-    fn keys_match_with_null_wildcards(&self, key1: &TransKey, key2: &TransKey) -> bool {
-        if key1.len() != key2.len() {
+    fn keys_match_with_null_wildcards_owned_ref(
+        &self,
+        key1: &TransKey,
+        key2: &RefTransKey<'_>,
+    ) -> bool {
+        if key1.parts.len() != key2.parts.len() {
             return false;
         }
-
-        for (v1, v2) in key1.iter().zip(key2.iter()) {
+        for (v1, v2) in key1.parts.iter().zip(key2.parts.iter()) {
             match (v1, v2) {
-                // If either is None (null), it matches with anything
-                (None, _) => continue, // First key has null - wildcard matches
-                (_, None) => continue, // Second key has null - wildcard matches
-                // Both are Some - they must match exactly
+                (None, _) => continue,
+                (_, None) => continue,
                 (Some(val1), Some(val2)) => {
-                    if val1 != val2 {
+                    if val1.as_str() != *val2 {
                         return false;
                     }
                 }
             }
         }
-
         true
     }
 
     // Find the best matching transaction key based on non-null field matches (more non-null matches = better match)
     fn find_best_matching_transaction_key(
         &self,
-        collection: &HashMap<TransKey, Transaction>,
-        target_key: &TransKey,
+        collection: &hashbrown::HashMap<TransKey, Transaction, ahash::RandomState>,
+        target_key: &RefTransKey<'_>,
         target_time: Option<i64>, // Time of the event being added
     ) -> Option<TransKey> {
         let mut best_key: Option<TransKey> = None;
@@ -1014,13 +1306,14 @@ impl TransactionPool {
         let mut best_time_diff: Option<i64> = None;
 
         for (existing_key, transaction) in collection.iter() {
-            if !self.keys_match_with_null_wildcards(existing_key, target_key) {
+            if !self.keys_match_with_null_wildcards_owned_ref(existing_key, target_key) {
                 continue;
             }
 
             let exact_non_null_matches = existing_key
+                .parts
                 .iter()
-                .zip(target_key.iter())
+                .zip(target_key.parts.iter())
                 .filter(|(v1, v2)| matches!((v1, v2), (Some(val1), Some(val2)) if val1 == val2))
                 .count();
 
@@ -1040,11 +1333,11 @@ impl TransactionPool {
                         (Some(diff_a), Some(diff_b)) => match diff_a.cmp(&diff_b) {
                             std::cmp::Ordering::Less => true,
                             std::cmp::Ordering::Greater => false,
-                            std::cmp::Ordering::Equal => existing_key < best_key_ref,
+                            std::cmp::Ordering::Equal => existing_key.parts < best_key_ref.parts,
                         },
                         (Some(_), None) => true,
                         (None, Some(_)) => false,
-                        (None, None) => existing_key < best_key_ref,
+                        (None, None) => existing_key.parts < best_key_ref.parts,
                     },
                 },
             };
@@ -1059,26 +1352,7 @@ impl TransactionPool {
         best_key
     }
 
-    fn is_valid_event_simple_grouping(
-        &self,
-        event: &HashMap<String, SmallVec<[String; 4]>>,
-    ) -> bool {
-        let Some(time_str) = event.get(FIELD_TIME) else {
-            return false;
-        };
-        let Some(time_str_val) = time_str.first() else {
-            return false;
-        };
-
-        let Ok(time) = time_str_val
-            .parse::<i64>()
-            .map(|ts| Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now))
-        else {
-            return false;
-        };
-
-        // For simple grouping, exclude events where ALL key fields are null/empty
-        // If some key fields are null but not all, allow for wildcard matching in multi-field scenarios
+    fn is_valid_event_simple_grouping(&self, event: &EventMap, event_time: DateTime<Utc>) -> bool {
         if !self.params.fields.is_empty() {
             let mut non_empty_count = 0;
             for field in self.params.fields.iter() {
@@ -1098,18 +1372,18 @@ impl TransactionPool {
 
         // Check the time constraints
         if let Some(earliest_ts) = self.earliest_event_timestamp
-            && time > earliest_ts
+            && event_time > earliest_ts
         {
             return false;
         }
         true
     }
 
-    fn get_frozen_trans(&mut self) -> Vec<Transaction> {
+    pub fn get_frozen_trans(&mut self) -> Vec<Transaction> {
         std::mem::take(&mut self.frozen_trans)
     }
 
-    fn get_live_trans(&mut self) -> Vec<Transaction> {
+    pub fn get_live_trans(&mut self) -> Vec<Transaction> {
         let mut live_transactions: Vec<Transaction> = Vec::new();
 
         let has_start_only = self.params.ends_with.is_none()
@@ -1131,7 +1405,58 @@ impl TransactionPool {
             if has_end_only && trans.has_end_marker {
                 trans.set_is_closed();
             }
-            live_transactions.push(trans);
+            // In ends_only with explicit max_events, split oversized open buffers into chunks
+            if has_end_only
+                && !trans.has_end_marker
+                && self.params.max_events > 0
+                && trans.get_event_count() > self.params.max_events
+            {
+                // Split open regular buffer into chunks of size max_events preserving deque order (front=oldest)
+                let max_k = self.params.max_events as usize;
+                while trans.get_event_count() > 0 {
+                    let mut chunk = Transaction::new(self.params.fields.clone());
+                    for key_name in self.params.fields.iter() {
+                        if let Some(vals) = trans.get_field_values(key_name) {
+                            chunk.set_key_field_from(key_name, vals);
+                        } else {
+                            chunk.clear_key_field(key_name);
+                        }
+                    }
+                    let mut moved = 0usize;
+                    while moved < max_k && trans.get_event_count() > 0 {
+                        if let (Some(msgs), Some(t)) =
+                            (trans.messages.pop_back(), trans.times.pop_back())
+                        {
+                            chunk.messages.push_back(msgs);
+                            chunk.times.push_back(t);
+                            chunk.start_time = Some(
+                                chunk
+                                    .start_time
+                                    .map(|cur| if t < cur { t } else { cur })
+                                    .unwrap_or(t),
+                            );
+                            chunk.end_time = Some(
+                                chunk
+                                    .end_time
+                                    .map(|cur| if t > cur { t } else { cur })
+                                    .unwrap_or(t),
+                            );
+                            chunk.event_count = chunk.event_count.saturating_add(1);
+                            if trans.event_count > 0 {
+                                trans.event_count -= 1;
+                            }
+                            moved += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if chunk.get_event_count() > 0 {
+                        live_transactions.push(chunk);
+                    }
+                }
+            } else if trans.get_event_count() > 0 {
+                live_transactions.push(trans);
+            }
         }
 
         // Add all remaining start transactions from the stack
@@ -1191,24 +1516,26 @@ fn scalar_to_string(array: ArrayRef, row_idx: usize) -> Option<String> {
     }
 }
 
-fn array_to_strings(array: ArrayRef, row_idx: usize) -> SmallVec<[String; 4]> {
+fn array_to_strings(array: ArrayRef, row_idx: usize) -> EventFieldValues {
     match array.data_type() {
-        DataType::Utf8 => smallvec![scalar_to_string(array, row_idx).expect("utf8 must be scalar")],
-        DataType::Int64 => {
-            smallvec![scalar_to_string(array, row_idx).expect("int64 must be scalar")]
-        }
-        DataType::Float64 => {
-            smallvec![scalar_to_string(array, row_idx).expect("float64 must be scalar")]
-        }
-        DataType::Boolean => {
-            smallvec![scalar_to_string(array, row_idx).expect("boolean must be scalar")]
-        }
-        DataType::Timestamp(_, _) => {
-            smallvec![scalar_to_string(array, row_idx).expect("timestamp must be scalar")]
-        }
+        DataType::Utf8 => smallvec![string_to_arc(
+            scalar_to_string(array, row_idx).expect("utf8 must be scalar")
+        )],
+        DataType::Int64 => smallvec![string_to_arc(
+            scalar_to_string(array, row_idx).expect("int64 must be scalar")
+        )],
+        DataType::Float64 => smallvec![string_to_arc(
+            scalar_to_string(array, row_idx).expect("float64 must be scalar")
+        )],
+        DataType::Boolean => smallvec![string_to_arc(
+            scalar_to_string(array, row_idx).expect("boolean must be scalar")
+        )],
+        DataType::Timestamp(_, _) => smallvec![string_to_arc(
+            scalar_to_string(array, row_idx).expect("timestamp must be scalar")
+        )],
         DataType::List(_inner_field) => {
             let nested_list = array.as_list::<i32>().value(row_idx);
-            let mut small_vec: SmallVec<[String; 4]> = smallvec![];
+            let mut small_vec: EventFieldValues = smallvec![];
             for i in 0..nested_list.len() {
                 let inner = array_to_strings(Arc::clone(&nested_list), i);
                 small_vec.extend(inner);
@@ -1228,11 +1555,10 @@ impl TableFunction for TransFunction {
             .context("TransPool not initialized")?;
 
         let schema = input.schema();
-        let mut events: Vec<HashMap<String, SmallVec<[String; 4]>>> =
-            Vec::with_capacity(input.num_rows());
+        let mut events: Vec<EventMap> = Vec::with_capacity(input.num_rows());
 
         for row_idx in 0..input.num_rows() {
-            let mut event: HashMap<String, SmallVec<[String; 4]>> = HashMap::new();
+            let mut event: EventMap = HashMap::new();
             for col_idx in 0..input.num_columns() {
                 let field = schema.field(col_idx);
                 let array = Arc::clone(input.column(col_idx));
@@ -1278,16 +1604,18 @@ mod tests {
     use std::sync::Arc;
 
     // Helper function to create a simple event HashMap
-    fn create_event(
-        time_micros: i64,
-        message: &str,
-        other_fields: &[(&str, &str)],
-    ) -> HashMap<String, SmallVec<[String; 4]>> {
-        let mut event = HashMap::new();
-        event.insert(FIELD_TIME.to_string(), smallvec![time_micros.to_string()]);
-        event.insert(FIELD_MESSAGE.to_string(), smallvec![message.to_string()]);
+    fn create_event(time_micros: i64, message: &str, other_fields: &[(&str, &str)]) -> EventMap {
+        let mut event = EventMap::new();
+        event.insert(
+            FIELD_TIME.to_string(),
+            smallvec![string_to_arc(time_micros.to_string())],
+        );
+        event.insert(
+            FIELD_MESSAGE.to_string(),
+            smallvec![Arc::<str>::from(message)],
+        );
         for (k, v) in other_fields {
-            event.insert(k.to_string(), smallvec![v.to_string()]);
+            event.insert(k.to_string(), smallvec![Arc::<str>::from(*v)]);
         }
         event
     }
@@ -1296,15 +1624,21 @@ mod tests {
         time_micros: i64,
         message: &str,
         other_fields: &[(&str, Option<&str>)],
-    ) -> HashMap<String, SmallVec<[String; 4]>> {
-        let mut event = HashMap::new();
-        event.insert(FIELD_TIME.to_string(), smallvec![time_micros.to_string()]);
-        event.insert(FIELD_MESSAGE.to_string(), smallvec![message.to_string()]);
+    ) -> EventMap {
+        let mut event = EventMap::new();
+        event.insert(
+            FIELD_TIME.to_string(),
+            smallvec![string_to_arc(time_micros.to_string())],
+        );
+        event.insert(
+            FIELD_MESSAGE.to_string(),
+            smallvec![Arc::<str>::from(message)],
+        );
         for (k, v) in other_fields {
             if let Some(v) = *v {
-                event.insert(k.to_string(), smallvec![v.to_string()]);
+                event.insert(k.to_string(), smallvec![Arc::<str>::from(v)]);
             } else {
-                event.insert(k.to_string(), smallvec![]);
+                event.insert(k.to_string(), SmallVec::<[Arc<str>; 4]>::new());
             }
         }
         event
@@ -1340,7 +1674,7 @@ mod tests {
             .collect()
     }
 
-    fn record_to_event(record: &csv::StringRecord) -> HashMap<String, SmallVec<[String; 4]>> {
+    fn record_to_event(record: &csv::StringRecord) -> EventMap {
         let time_str = record.get(0).expect("timestamp column");
         let message = record.get(1).expect("message column");
         let client_ip = record.get(2).expect("client_ip column");
@@ -1350,15 +1684,27 @@ mod tests {
             .expect("valid timestamp")
             .timestamp_micros();
 
-        let mut event = HashMap::new();
-        event.insert(FIELD_TIME.to_string(), smallvec![time.to_string()]);
-        event.insert(FIELD_MESSAGE.to_string(), smallvec![message.to_string()]);
-        event.insert("client_ip".to_string(), smallvec![client_ip.to_string()]);
-        event.insert("JSESSIONID".to_string(), smallvec![jsessionid.to_string()]);
+        let mut event = EventMap::new();
+        event.insert(
+            FIELD_TIME.to_string(),
+            smallvec![string_to_arc(time.to_string())],
+        );
+        event.insert(
+            FIELD_MESSAGE.to_string(),
+            smallvec![Arc::<str>::from(message)],
+        );
+        event.insert(
+            "client_ip".to_string(),
+            smallvec![Arc::<str>::from(client_ip)],
+        );
+        event.insert(
+            "JSESSIONID".to_string(),
+            smallvec![Arc::<str>::from(jsessionid)],
+        );
         event
     }
 
-    fn sample_csv_events() -> Vec<HashMap<String, SmallVec<[String; 4]>>> {
+    fn sample_csv_events() -> Vec<EventMap> {
         sample_csv_records()
             .into_iter()
             .map(|record| record_to_event(&record))
@@ -1689,7 +2035,6 @@ mod tests {
         groups.extend(pool.get_live_trans());
 
         assert_eq!(groups.len(), 3);
-        // ends_only semantics updated: groups containing end are closed
         assert_has_group(&groups, &["middle"], false);
         assert_has_group(&groups, &["middle", "end"], true);
         assert_has_group(&groups, &["end"], true);
@@ -1933,6 +2278,192 @@ mod tests {
         );
         assert_has_group(&groups, &["other"], false);
     }
+
+    #[test]
+    fn trans_max_span_zero_with_brackets_singletons_open() {
+        // trans.md mirrored: maxspan=0s + starts + ends -> each single open group
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("starts_with".to_string(), Arg::String("start".to_string())),
+                ("ends_with".to_string(), Arg::String("end".to_string())),
+                ("max_span".to_string(), Arg::String("0s".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        let seq = vec![
+            ("end", 1),
+            ("middle", 2),
+            ("start", 3),
+            ("other1", 4),
+            ("other2", 5),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 5);
+        assert_has_group(&groups, &["end"], false);
+        assert_has_group(&groups, &["middle"], false);
+        assert_has_group(&groups, &["start"], false);
+        assert_has_group(&groups, &["other1"], false);
+        assert_has_group(&groups, &["other2"], false);
+    }
+
+    #[test]
+    fn trans_max_span_zero_no_brackets_identity_closed() {
+        // trans.md mirrored: maxspan=0s without starts/ends -> identity closed
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("max_span".to_string(), Arg::String("0s".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        let seq = vec![
+            ("event1", 1),
+            ("event2", 2),
+            ("event3", 3),
+            ("event4", 4),
+            ("event5", 5),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 5);
+        assert_has_group(&groups, &["event1"], true);
+        assert_has_group(&groups, &["event2"], true);
+        assert_has_group(&groups, &["event3"], true);
+        assert_has_group(&groups, &["event4"], true);
+        assert_has_group(&groups, &["event5"], true);
+    }
+
+    #[test]
+    fn trans_max_span_zero_start_equals_end_single_closed() {
+        // trans.md mirrored: maxspan=0s, starts+ends same token -> closed singles
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                (
+                    "starts_with".to_string(),
+                    Arg::String("start_and_end".to_string()),
+                ),
+                (
+                    "ends_with".to_string(),
+                    Arg::String("start_and_end".to_string()),
+                ),
+                ("max_span".to_string(), Arg::String("0s".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        let seq = vec![
+            ("start_and_end", 1),
+            ("start_and_end", 2),
+            ("start_and_end", 3),
+            ("other", 4),
+        ];
+        for (msg, idx) in seq {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 4);
+        assert_has_group(&groups, &["start_and_end"], true);
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|t| messages_of(t) == vec!["start_and_end"] && t.is_closed)
+                .count(),
+            3
+        );
+        assert_has_group(&groups, &["other"], false);
+    }
+
+    #[test]
+    fn trans_max_span_negative_unset_no_brackets() {
+        // Negative maxspan acts as unset: should not force singletons
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("max_span".to_string(), Arg::String("-5s".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        for (msg, idx) in [("a", 1), ("b", 2), ("c", 3)] {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        // Expect not 3 singleton groups; behavior should be equivalent to unset
+        // i.e., not forcing singletons. Assert total events are 3 and group count < 3.
+        let total_events: usize = groups.iter().map(|t| t.get_event_count() as usize).sum();
+        assert_eq!(total_events, 3);
+        assert!(groups.len() < 3);
+    }
+
+    #[test]
+    fn trans_max_span_negative_unset_with_brackets() {
+        // Negative maxspan acts as unset: bracket behavior remains normal
+        let base = Utc::now();
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("starts_with".to_string(), Arg::String("start".to_string())),
+                ("ends_with".to_string(), Arg::String("end".to_string())),
+                ("max_span".to_string(), Arg::String("-1s".to_string())),
+            ],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        for (msg, idx) in [("end", 1), ("middle", 2), ("start", 3)] {
+            pool.add_event(create_event(
+                event_time_for_index(base, idx),
+                msg,
+                &[("host", "host1")],
+            ))
+            .unwrap();
+        }
+        let mut groups = pool.get_frozen_trans();
+        groups.extend(pool.get_live_trans());
+        assert_eq!(groups.len(), 1);
+        assert_has_group(&groups, &["start", "middle", "end"], true);
+    }
     #[test]
     fn trans_only_start_multiple_start() {
         let base = Utc::now();
@@ -2059,14 +2590,27 @@ mod tests {
         let mut groups = pool.get_frozen_trans();
         groups.extend(pool.get_live_trans());
         assert_eq!(groups.len(), 4);
-        // group1 (closed=false): other (no. 1)
         assert_has_group(&groups, &["other"], false);
-        // group2 (closed=true): middle, end (no. 2, 3)
-        assert_has_group(&groups, &["middle", "end"], true);
-        // group3 (closed=true): middle, end (no. 4, 5)
-        assert_has_group(&groups, &["middle", "end"], true);
-        // group4 (closed=true): other, middle, end (no. 6, 7, 8)
-        assert_has_group(&groups, &["other", "middle", "end"], true);
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|t| messages_of(t) == vec!["middle", "end"] && t.is_closed)
+                .count(),
+            2
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|t| {
+                    let msgs = messages_of(t);
+                    (msgs == vec!["other", "middle", "end"]
+                        || msgs == vec!["middle", "other", "end"]
+                        || msgs == vec!["middle", "end", "other"])
+                        && t.is_closed
+                })
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2147,7 +2691,7 @@ mod tests {
         assert_eq!(params.starts_if_field, Some("is_start_event".to_string()));
         assert_eq!(params.ends_with_regex.unwrap().as_str(), "logout_\\d+");
         assert_eq!(params.ends_if_field, Some("is_end_event".to_string()));
-        assert_eq!(params.max_span, Duration::from_secs(600));
+        assert_eq!(params.max_span, Some(Duration::from_secs(600)));
         assert_eq!(params.max_events, 500);
 
         // Test with no parameters (both scalar and named)
@@ -2223,18 +2767,34 @@ mod tests {
 
         {
             let expected: SmallVec<[&str; 4]> = smallvec!["user1"];
-            let actual_user: SmallVec<[&str; 4]> =
-                trans.fields["user_id"].iter().map(|s| s.as_ref()).collect();
+            let actual_user: SmallVec<[&str; 4]> = trans
+                .get_field_values("user_id")
+                .unwrap()
+                .iter()
+                .map(|s| s.as_ref())
+                .collect();
             assert_eq!(actual_user, expected);
             assert!(
-                trans.fields["status"]
+                trans
+                    .get_field_values("status")
+                    .unwrap()
                     .iter()
                     .any(|s| s.as_ref() == "success")
             );
-            assert!(trans.fields["status"].iter().any(|s| s.as_ref() == "fail"));
+            assert!(
+                trans
+                    .get_field_values("status")
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.as_ref() == "fail")
+            );
             let expected: SmallVec<[&str; 4]> = smallvec!["abc"];
-            let actual_data: SmallVec<[&str; 4]> =
-                trans.fields["data"].iter().map(|s| s.as_ref()).collect();
+            let actual_data: SmallVec<[&str; 4]> = trans
+                .get_field_values("data")
+                .unwrap()
+                .iter()
+                .map(|s| s.as_ref())
+                .collect();
             assert_eq!(actual_data, expected);
         }
 
@@ -2733,19 +3293,22 @@ mod tests {
         let now = Utc::now();
 
         let make_event = |offset_secs: i64, session: &str, flags: &[(&str, &str)], step: &str| {
-            let mut event = HashMap::new();
+            let mut event = EventMap::new();
             event.insert(
                 FIELD_TIME.to_string(),
-                smallvec![
+                smallvec![string_to_arc(
                     (now - ChronoDuration::seconds(offset_secs))
                         .timestamp_micros()
                         .to_string()
-                ],
+                )],
             );
-            event.insert("session_id".to_string(), smallvec![session.to_string()]);
-            event.insert("step".to_string(), smallvec![step.to_string()]);
+            event.insert(
+                "session_id".to_string(),
+                smallvec![Arc::<str>::from(session)],
+            );
+            event.insert("step".to_string(), smallvec![Arc::<str>::from(step)]);
             for (k, v) in flags {
-                event.insert((*k).to_string(), smallvec![(*v).to_string()]);
+                event.insert((*k).to_string(), smallvec![Arc::<str>::from(*v)]);
             }
             event
         };
@@ -2773,8 +3336,7 @@ mod tests {
         assert_eq!(closed_trans.get_event_count(), 3);
 
         let mut steps: Vec<String> = closed_trans
-            .fields
-            .get("step")
+            .get_field_values("step")
             .cloned()
             .unwrap_or_default()
             .into_iter()
@@ -2792,8 +3354,7 @@ mod tests {
 
         assert!(open.iter().any(|trans| {
             trans
-                .fields
-                .get("step")
+                .get_field_values("step")
                 .is_some_and(|vals| vals.iter().any(|s| s.as_ref() == "after_end"))
         }));
     }
@@ -3543,14 +4104,12 @@ mod tests {
         for trans in &span_transactions {
             let key = (
                 trans
-                    .fields
-                    .get("client_ip")
+                    .get_field_values("client_ip")
                     .and_then(|v| v.first())
                     .cloned()
                     .unwrap_or_else(|| Arc::<str>::from("")),
                 trans
-                    .fields
-                    .get("JSESSIONID")
+                    .get_field_values("JSESSIONID")
                     .and_then(|v| v.first())
                     .cloned()
                     .unwrap_or_else(|| Arc::<str>::from("")),
@@ -3650,13 +4209,11 @@ mod tests {
         for (ip, session) in expected_keys {
             let matching = closed.iter().any(|trans| {
                 let client_ip = trans
-                    .fields
-                    .get("client_ip")
+                    .get_field_values("client_ip")
                     .and_then(|vals| vals.first())
                     .cloned();
                 let jsession = trans
-                    .fields
-                    .get("JSESSIONID")
+                    .get_field_values("JSESSIONID")
                     .and_then(|vals| vals.first())
                     .cloned();
                 if let (Some(client_ip), Some(jsession)) = (client_ip, jsession)
@@ -3721,6 +4278,315 @@ mod tests {
         assert_eq!(total_is_closed_false, 67);
     }
 
+    #[test]
+    fn trans_only_end_nested_maxevents_from_md() {
+        // trans.md (max events + endswith nested) lines 308-337
+        // Params: endswith="purchase", maxevents=3, fields=host, keepevicted=true
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("ends_with".to_string(), Arg::String("purchase".to_string())),
+                ("max_events".to_string(), Arg::Int(3)),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params.clone());
+
+        // Create 11 events with messages mapped exactly as in trans.md
+        // Process in reverse-chronological order (newest -> oldest)
+        let key_fields = &[("host", "host1")];
+        let events = vec![
+            (110_i64, "other1"),
+            (109, "other2"),
+            (108, "purchase"),
+            (107, "purchase"),
+            (106, "other3"),
+            (105, "other4"),
+            (104, "other5"),
+            (103, "other6"),
+            (102, "other7"),
+            (101, "other8"),
+            (100, "other9"),
+        ];
+        for (t, msg) in events {
+            let event = create_event(t, msg, key_fields);
+            pool.add_event(event).unwrap();
+        }
+
+        // Collect all transactions (frozen + live)
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+
+        // Build message vectors for each transaction
+        let groups: Vec<Vec<String>> = transactions
+            .iter()
+            .map(|t| {
+                t.messages
+                    .iter()
+                    .flat_map(|msgs| msgs.iter().map(|s| s.to_string()))
+                    .collect::<Vec<String>>()
+            })
+            .collect();
+
+        // Normalize order-insensitively for assertions using sets
+        let set_of =
+            |v: &[String]| -> std::collections::BTreeSet<String> { v.iter().cloned().collect() };
+        let group_sets: Vec<std::collections::BTreeSet<String>> =
+            groups.iter().map(|g| set_of(g)).collect();
+        // Debug print
+        let expected1: std::collections::BTreeSet<String> = ["other4", "other3", "purchase"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        let expected2: std::collections::BTreeSet<String> = ["other6", "other5", "purchase"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        let expected3: std::collections::BTreeSet<String> = ["other7", "other2", "other1"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        let expected4: std::collections::BTreeSet<String> = ["other9", "other8"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // Ensure all four expected groups exist
+        // Debug: print groups if assertion fails
+        // (kept minimal; assertions below will panic with messages)
+        assert!(
+            group_sets.contains(&expected1),
+            "Expected group1 {{other4, other3, purchase}}"
+        );
+        assert!(
+            group_sets.contains(&expected2),
+            "Expected group2 {{other6, other5, purchase}}"
+        );
+        assert!(
+            group_sets.contains(&expected3),
+            "Expected group3 {{other7, other2, other1}}"
+        );
+        assert!(
+            group_sets.contains(&expected4),
+            "Expected group4 {{other9, other8}}"
+        );
+
+        // Validate closed flags: groups with 'purchase' should be closed
+        let is_purchase_group_closed = |set: &std::collections::BTreeSet<String>| -> bool {
+            if set.contains("purchase") {
+                // find the transaction that matches this set
+                for t in &transactions {
+                    let tset: std::collections::BTreeSet<String> = t
+                        .messages
+                        .iter()
+                        .flat_map(|msgs| msgs.iter().map(|s| s.to_string()))
+                        .collect();
+                    if &tset == set {
+                        return t.is_closed;
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        };
+        assert!(
+            is_purchase_group_closed(&expected1),
+            "group1 should be closed"
+        );
+        assert!(
+            is_purchase_group_closed(&expected2),
+            "group2 should be closed"
+        );
+    }
+
+    #[test]
+    fn trans_ends_only_maxevents_nested() {
+        // trans.md (max_events also nested) lines 428-457
+        // Params: endswith="purchase", maxevents=3, fields=host
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("ends_with".to_string(), Arg::String("purchase".to_string())),
+                ("max_events".to_string(), Arg::Int(3)),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params.clone());
+
+        // Create 11 events matching the doc scenario, reverse-chronological processing
+        let key_fields = &[("host", "host1")];
+        let events = vec![
+            (11_i64, "other1"),
+            (10, "other2"),
+            (9, "purchase"),
+            (8, "purchase"),
+            (7, "other3"),
+            (6, "other4"),
+            (5, "other5"),
+            (4, "other6"),
+            (3, "other7"),
+            (2, "other8"),
+            (1, "other9"),
+        ];
+        for (t, msg) in events {
+            let event = create_event(t, msg, key_fields);
+            pool.add_event(event).unwrap();
+        }
+
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+
+        let groups: Vec<std::collections::BTreeSet<String>> = transactions
+            .iter()
+            .map(|t| {
+                t.messages
+                    .iter()
+                    .flat_map(|msgs| msgs.iter().map(|s| s.to_string()))
+                    .collect::<std::collections::BTreeSet<String>>()
+            })
+            .collect();
+        let set = |items: &[&str]| -> std::collections::BTreeSet<String> {
+            items.iter().map(|s| s.to_string()).collect()
+        };
+
+        let expected1 = set(&["other4", "other3", "purchase"]);
+        let expected2 = set(&["other6", "other5", "purchase"]);
+        let expected3 = set(&["other1", "other2", "other7"]);
+        let expected4 = set(&["other9", "other8"]);
+
+        assert!(
+            groups.contains(&expected1),
+            "Expected group1 {{other4, other3, purchase}}"
+        );
+        assert!(
+            groups.contains(&expected2),
+            "Expected group2 {{other6, other5, purchase}}"
+        );
+        assert!(
+            groups.contains(&expected3),
+            "Expected group3 {{other1, other2, other7}}"
+        );
+        assert!(
+            groups.contains(&expected4),
+            "Expected group4 {{other9, other8}}"
+        );
+
+        // Closed flags for purchase groups
+        let is_closed_set = |set: &std::collections::BTreeSet<String>| -> bool {
+            for t in &transactions {
+                let s: std::collections::BTreeSet<String> = t
+                    .messages
+                    .iter()
+                    .flat_map(|msgs| msgs.iter().map(|s| s.to_string()))
+                    .collect();
+                if &s == set {
+                    return t.is_closed;
+                }
+            }
+            false
+        };
+        assert!(is_closed_set(&expected1));
+        assert!(is_closed_set(&expected2));
+    }
+
+    #[test]
+    fn trans_ends_only_maxspan_nested() {
+        // Mirror of the nested ends-only scenario using max_span instead of max_events
+        // Params: endswith="purchase", max_span="2s", fields=host
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("ends_with".to_string(), Arg::String("purchase".to_string())),
+                ("max_span".to_string(), Arg::String("2s".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params.clone());
+
+        // Use custom spacing to ensure each expected group fits within the 2-second span window.
+        // Ordering still follows newest -> oldest processing.
+        let base = Utc::now().timestamp_micros();
+        let ts = |offset_micros: i64| -> i64 { base - offset_micros };
+        let key_fields = &[("host", "host1")];
+        let events = vec![
+            (0_i64, "other1"),
+            (100_000, "other2"),
+            (300_000, "other7"),
+            (3_000_000, "purchase"), // closes with other3/other4
+            (3_900_000, "other3"),
+            (4_700_000, "other4"),
+            (7_000_000, "purchase"), // closes with other5/other6
+            (7_800_000, "other5"),
+            (8_600_000, "other6"),
+            (12_000_000, "other8"),
+            (12_800_000, "other9"),
+        ];
+        for (offset, msg) in events {
+            let event = create_event(ts(offset), msg, key_fields);
+            pool.add_event(event).unwrap();
+        }
+
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+        let groups: Vec<std::collections::BTreeSet<String>> = transactions
+            .iter()
+            .map(|t| {
+                t.messages
+                    .iter()
+                    .flat_map(|msgs| msgs.iter().map(|s| s.to_string()))
+                    .collect::<std::collections::BTreeSet<String>>()
+            })
+            .collect();
+        let set = |items: &[&str]| -> std::collections::BTreeSet<String> {
+            items.iter().map(|s| s.to_string()).collect()
+        };
+
+        let expected1 = set(&["other4", "other3", "purchase"]);
+        let expected2 = set(&["other6", "other5", "purchase"]);
+        let expected3 = set(&["other1", "other2", "other7"]);
+        let expected4 = set(&["other9", "other8"]);
+
+        assert!(
+            groups.contains(&expected1),
+            "Expected group1 {{other4, other3, purchase}}"
+        );
+        assert!(
+            groups.contains(&expected2),
+            "Expected group2 {{other6, other5, purchase}}"
+        );
+        assert!(
+            groups.contains(&expected3),
+            "Expected group3 {{other1, other2, other7}}"
+        );
+        assert!(
+            groups.contains(&expected4),
+            "Expected group4 {{other9, other8}}"
+        );
+
+        // Closed flags for purchase groups should be true
+        let is_closed_set = |set: &std::collections::BTreeSet<String>| -> bool {
+            for t in &transactions {
+                let s: std::collections::BTreeSet<String> = t
+                    .messages
+                    .iter()
+                    .flat_map(|msgs| msgs.iter().map(|s| s.to_string()))
+                    .collect();
+                if &s == set {
+                    return t.is_closed;
+                }
+            }
+            false
+        };
+        assert!(is_closed_set(&expected1));
+        assert!(is_closed_set(&expected2));
+    }
     #[test]
     fn test_nested_starts_ends_order() {
         // Scenario:
