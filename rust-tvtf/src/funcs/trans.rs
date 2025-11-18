@@ -25,15 +25,6 @@ const FIELD_DURATION: &str = "_duration";
 const FIELD_EVENT_COUNT: &str = "_event_count";
 const FIELD_IS_CLOSED: &str = "_is_closed";
 
-// Trans specific fields that are not part of the original event's fields
-const TRANS_RESERVED_FIELDS: [&str; 5] = [
-    FIELD_TIME,
-    FIELD_MESSAGE,
-    FIELD_DURATION,
-    FIELD_EVENT_COUNT,
-    FIELD_IS_CLOSED,
-];
-
 pub type EventFieldValues = SmallVec<[Arc<str>; 4]>;
 pub type EventMap = HashMap<String, EventFieldValues>;
 
@@ -42,9 +33,20 @@ fn string_to_arc(s: String) -> Arc<str> {
     Arc::<str>::from(s.into_boxed_str())
 }
 
+fn build_key_index_map(
+    field_names: &Arc<[String]>,
+) -> Arc<HashMap<String, usize, ahash::RandomState>> {
+    let mut map = HashMap::with_capacity_and_hasher(field_names.len(), ahash::RandomState::new());
+    for (idx, name) in field_names.iter().enumerate() {
+        map.insert(name.clone(), idx);
+    }
+    Arc::new(map)
+}
+
 #[derive(Debug, Clone)]
 pub struct TransParams {
     pub fields: Arc<[String]>,
+    pub key_index_map: Arc<HashMap<String, usize, ahash::RandomState>>,
     pub starts_with: Option<String>,
     pub starts_with_regex: Option<Regex>,
     pub starts_if_field: Option<String>,
@@ -57,8 +59,10 @@ pub struct TransParams {
 
 impl Default for TransParams {
     fn default() -> Self {
+        let fields = Arc::from(Vec::<String>::new().into_boxed_slice());
         Self {
-            fields: Arc::from(Vec::<String>::new()),
+            key_index_map: build_key_index_map(&fields),
+            fields,
             starts_with: Default::default(),
             starts_with_regex: Default::default(),
             starts_if_field: Default::default(),
@@ -203,7 +207,12 @@ impl TransParams {
                 }
             }
         }
+        parsed_params.rebuild_key_index_map();
         Ok(parsed_params)
+    }
+
+    fn rebuild_key_index_map(&mut self) {
+        self.key_index_map = build_key_index_map(&self.fields);
     }
 
     fn check_boolean_field_condition(
@@ -275,7 +284,7 @@ impl TransParams {
 #[derive(Debug, Clone)]
 pub struct Transaction {
     key_names: Arc<[String]>,
-    key_index_map: HashMap<String, usize, ahash::RandomState>,
+    key_index_map: Arc<HashMap<String, usize, ahash::RandomState>>,
     key_slots: Vec<EventFieldValues>,
     extra_fields: HashMap<String, EventFieldValues, ahash::RandomState>,
     start_time: Option<DateTime<Utc>>,
@@ -289,12 +298,12 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    fn new(field_names: Arc<[String]>) -> Self {
-        let mut key_index_map =
-            HashMap::with_capacity_and_hasher(field_names.len(), ahash::RandomState::new());
+    fn new(
+        field_names: Arc<[String]>,
+        key_index_map: Arc<HashMap<String, usize, ahash::RandomState>>,
+    ) -> Self {
         let mut key_slots = Vec::with_capacity(field_names.len());
-        for (idx, k) in field_names.iter().enumerate() {
-            key_index_map.insert(k.clone(), idx);
+        for _ in 0..field_names.len() {
             key_slots.push(EventFieldValues::new());
         }
         Transaction {
@@ -318,24 +327,31 @@ impl Transaction {
             if message.is_empty() {
                 return;
             }
-            let mapped: EventFieldValues = message.iter().cloned().collect();
-            self.messages.push_front(mapped);
+            self.messages.push_front(message.clone());
         }
 
         for (k, v) in event {
-            if TRANS_RESERVED_FIELDS.contains(&k.as_str()) {
-                continue;
-            }
             if v.is_empty() {
                 continue;
+            }
+            match k.as_str() {
+                FIELD_TIME | FIELD_MESSAGE | FIELD_DURATION | FIELD_EVENT_COUNT
+                | FIELD_IS_CLOSED => continue,
+                _ => {}
             }
             if let Some(&idx) = self.key_index_map.get(k) {
                 let slot = &mut self.key_slots[idx];
                 slot.truncate(0);
                 slot.extend(v.iter().cloned());
             } else {
-                let entry = self.extra_fields.entry(k.clone()).or_default();
-                entry.extend(v.iter().cloned());
+                match self.extra_fields.raw_entry_mut().from_key(k.as_str()) {
+                    RawEntryMut::Occupied(mut occ) => {
+                        occ.get_mut().extend(v.iter().cloned());
+                    }
+                    RawEntryMut::Vacant(vacant) => {
+                        vacant.insert(k.clone(), v.clone());
+                    }
+                }
             }
         }
     }
@@ -883,7 +899,10 @@ impl TransactionPool {
         // - If there are start/end conditions: each event becomes a single open group,
         //   unless it simultaneously matches both start and end (then closed).
         if self.params.max_events == 0 || self.params.max_span.is_some_and(|d| d.as_secs() == 0) {
-            let mut single = Transaction::new(self.params.fields.clone());
+            let mut single = Transaction::new(
+                self.params.fields.clone(),
+                self.params.key_index_map.clone(),
+            );
             if has_start_conditions
                 && self
                     .params
@@ -915,26 +934,44 @@ impl TransactionPool {
         let trans_key_ref = self.make_trans_key_ref(&event);
 
         let message_values = event.get(FIELD_MESSAGE);
+        let matches_end =
+            has_end_conditions && self.params.matches_ends_with_cached(message_values, &event);
+        let matches_start = has_start_conditions
+            && self
+                .params
+                .matches_starts_with_cached(message_values, &event);
 
         if has_start_conditions || has_end_conditions {
             // When processing in reverse chronological order (as in SQL ORDER BY _time DESC),
             // END events go to stack waiting for START events to close them
-            if self.params.matches_ends_with_cached(message_values, &event) {
+            if matches_end {
                 if has_start_conditions {
                     // In bracket mode, always push END to the stack to be paired by a future START.
                     // Do not try to immediately attach END to any existing start-live in live_trans.
-                    let mut new_trans = Transaction::new(self.params.fields.clone());
+                    let mut new_trans = Transaction::new(
+                        self.params.fields.clone(),
+                        self.params.key_index_map.clone(),
+                    );
                     new_trans.has_end_marker = true;
                     new_trans.add_event(&event)?;
-                    let stack =
-                        Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
-                    stack.push(new_trans);
+                    if matches_start {
+                        new_trans.has_start_marker = true;
+                        new_trans.set_is_closed();
+                        self.frozen_trans.push(new_trans);
+                    } else {
+                        let stack =
+                            Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
+                        stack.push(new_trans);
+                    }
                 } else {
                     // ends_only mode:
                     // ends_only mode, always use nested/backfill behavior
                     let stack =
                         Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
-                    let mut end_only = Transaction::new(self.params.fields.clone());
+                    let mut end_only = Transaction::new(
+                        self.params.fields.clone(),
+                        self.params.key_index_map.clone(),
+                    );
                     end_only.has_end_marker = true;
                     end_only.add_event(&event)?;
                     stack.push(end_only);
@@ -962,9 +999,16 @@ impl TransactionPool {
                             {
                                 continue;
                             }
-                            if let Some(&candidate_time) = mut_buffer.times.front()
-                                && top.span_exceeds_with_candidate(candidate_time, span.as_secs())
-                            {
+                            if let Some(&candidate_time) = mut_buffer.times.front() {
+                                if let Some(end_time) = top.end_time
+                                    && candidate_time > end_time
+                                {
+                                    break;
+                                }
+                                if top.span_exceeds_with_candidate(candidate_time, span.as_secs()) {
+                                    break;
+                                }
+                            } else {
                                 break;
                             }
                             if let (Some(msgs), Some(ev_time)) = (
@@ -1017,10 +1061,7 @@ impl TransactionPool {
                     }
                     // buffer freeze handled above (span case only)
                 }
-            } else if self
-                .params
-                .matches_starts_with_cached(message_values, &event)
-            {
+            } else if matches_start {
                 if has_end_conditions {
                     // When a start event is encountered, try to match with most recent unmatched end event
                     let end_stack =
@@ -1060,7 +1101,10 @@ impl TransactionPool {
                             if existing_trans.has_start_marker {
                                 // Freeze previous start-only live, start a fresh one
                                 self.frozen_trans.push(existing_trans);
-                                let mut new_trans = Transaction::new(self.params.fields.clone());
+                                let mut new_trans = Transaction::new(
+                                    self.params.fields.clone(),
+                                    self.params.key_index_map.clone(),
+                                );
                                 new_trans.has_start_marker = true;
                                 new_trans.add_event(&event)?;
                                 let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
@@ -1079,7 +1123,10 @@ impl TransactionPool {
                                 self.live_trans.insert(owned, existing_trans);
                             }
                         } else {
-                            let mut new_trans = Transaction::new(self.params.fields.clone());
+                            let mut new_trans = Transaction::new(
+                                self.params.fields.clone(),
+                                self.params.key_index_map.clone(),
+                            );
                             new_trans.has_start_marker = true;
                             new_trans.add_event(&event)?;
                             let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
@@ -1108,7 +1155,10 @@ impl TransactionPool {
                             }
                             buffer
                         } else {
-                            let mut t = Transaction::new(self.params.fields.clone());
+                            let mut t = Transaction::new(
+                                self.params.fields.clone(),
+                                self.params.key_index_map.clone(),
+                            );
                             t.add_event(&event)?;
                             t
                         };
@@ -1143,7 +1193,10 @@ impl TransactionPool {
                         // Need to take ownership to freeze: remove then re-insert a new buffer
                         let taken = self.live_trans.remove(&trans_key_ref).unwrap();
                         self.frozen_trans.push(taken);
-                        let mut new_trans = Transaction::new(self.params.fields.clone());
+                        let mut new_trans = Transaction::new(
+                            self.params.fields.clone(),
+                            self.params.key_index_map.clone(),
+                        );
                         new_trans.add_event(&event)?;
                         let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
                         self.live_trans.insert(owned, new_trans);
@@ -1153,7 +1206,10 @@ impl TransactionPool {
                     }
                 } else {
                     // Start a new regular-live buffer
-                    let mut new_trans = Transaction::new(self.params.fields.clone());
+                    let mut new_trans = Transaction::new(
+                        self.params.fields.clone(),
+                        self.params.key_index_map.clone(),
+                    );
                     new_trans.add_event(&event)?;
                     let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
                     self.live_trans.insert(owned, new_trans);
@@ -1217,7 +1273,10 @@ impl TransactionPool {
                 } else if let Some(existing) = self.live_trans.get_mut(&trans_key_ref) {
                     existing.add_event(&event)?;
                 } else {
-                    let mut new_trans = Transaction::new(self.params.fields.clone());
+                    let mut new_trans = Transaction::new(
+                        self.params.fields.clone(),
+                        self.params.key_index_map.clone(),
+                    );
                     new_trans.add_event(&event)?;
                     let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
                     self.live_trans.insert(owned, new_trans);
@@ -1227,7 +1286,10 @@ impl TransactionPool {
                 if let Some(existing) = self.live_trans.get_mut(&trans_key_ref) {
                     existing.add_event(&event)?;
                 } else {
-                    let mut new_trans = Transaction::new(self.params.fields.clone());
+                    let mut new_trans = Transaction::new(
+                        self.params.fields.clone(),
+                        self.params.key_index_map.clone(),
+                    );
                     new_trans.add_event(&event)?;
                     let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
                     self.live_trans.insert(owned, new_trans);
@@ -1247,7 +1309,10 @@ impl TransactionPool {
                 }
             } else {
                 // No compatible transaction found, create new one with this key
-                let mut new_trans = Transaction::new(self.params.fields.clone());
+                let mut new_trans = Transaction::new(
+                    self.params.fields.clone(),
+                    self.params.key_index_map.clone(),
+                );
                 new_trans.add_event(&event)?;
                 let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
                 self.live_trans.insert(owned, new_trans);
@@ -1387,6 +1452,10 @@ impl TransactionPool {
     pub fn get_live_trans(&mut self) -> Vec<Transaction> {
         let mut live_transactions: Vec<Transaction> = Vec::new();
 
+        let has_start_conditions = self.has_start_conditions();
+        let has_end_conditions = self.has_end_conditions();
+        let simple_grouping = !has_start_conditions && !has_end_conditions;
+
         let has_start_only = self.params.ends_with.is_none()
             && self.params.ends_with_regex.is_none()
             && self.params.ends_if_field.is_none()
@@ -1415,7 +1484,10 @@ impl TransactionPool {
                 // Split open regular buffer into chunks of size max_events preserving deque order (front=oldest)
                 let max_k = self.params.max_events as usize;
                 while trans.get_event_count() > 0 {
-                    let mut chunk = Transaction::new(self.params.fields.clone());
+                    let mut chunk = Transaction::new(
+                        self.params.fields.clone(),
+                        self.params.key_index_map.clone(),
+                    );
                     for key_name in self.params.fields.iter() {
                         if let Some(vals) = trans.get_field_values(key_name) {
                             chunk.set_key_field_from(key_name, vals);
@@ -1456,6 +1528,13 @@ impl TransactionPool {
                     }
                 }
             } else if trans.get_event_count() > 0 {
+                if simple_grouping
+                    && let (Some(duration), Some(max_span)) =
+                        (trans.get_duration(), self.params.max_span)
+                    && duration >= max_span.as_secs_f64()
+                {
+                    trans.set_is_closed();
+                }
                 live_transactions.push(trans);
             }
         }
@@ -1659,6 +1738,22 @@ mod tests {
             .collect()
     }
 
+    fn assert_has_sorted_group(
+        groups: &[(bool, Vec<String>)],
+        closed: bool,
+        expected_messages: &[&str],
+        context: &str,
+    ) {
+        let mut target: Vec<String> = expected_messages.iter().map(|s| s.to_string()).collect();
+        target.sort();
+        assert!(
+            groups
+                .iter()
+                .any(|(is_closed, msgs)| *is_closed == closed && *msgs == target),
+            "Expected {context} closed={closed} with members {target:?}"
+        );
+    }
+
     // Helper function to create a simple event HashMap
     fn create_event(time_micros: i64, message: &str, other_fields: &[(&str, &str)]) -> EventMap {
         let mut event = EventMap::new();
@@ -1758,6 +1853,18 @@ mod tests {
             smallvec![Arc::<str>::from(jsessionid)],
         );
         event
+    }
+
+    fn transaction_with_fields(field_names: &[&str]) -> Transaction {
+        let fields: Arc<[String]> = Arc::from(
+            field_names
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        let key_index_map = build_key_index_map(&fields);
+        Transaction::new(fields, key_index_map)
     }
 
     fn sample_csv_events() -> Vec<EventMap> {
@@ -2787,7 +2894,7 @@ mod tests {
 
     #[test]
     fn test_transaction_add_event_and_merge() {
-        let mut trans = Transaction::new(Arc::from(vec!["user_id".to_string()].into_boxed_slice()));
+        let mut trans = transaction_with_fields(&["user_id"]);
         let now = Utc::now();
 
         let event1 = create_event(
@@ -2866,7 +2973,7 @@ mod tests {
 
     #[test]
     fn test_transaction_to_record_batch() {
-        let mut trans = Transaction::new(Arc::from(vec!["user_id".to_string()].into_boxed_slice()));
+        let mut trans = transaction_with_fields(&["user_id"]);
         let now = Utc::now();
         let event1_time = now - ChronoDuration::seconds(20);
         let event2_time = now - ChronoDuration::seconds(10);
@@ -4433,6 +4540,31 @@ mod tests {
             .collect()
     }
 
+    fn build_doc_max_span_starts_ends_same_line_events() -> Vec<EventMap> {
+        let base = Utc::now();
+        let sequence = [
+            ("category", 0),
+            ("product", 1),
+            ("addtocart purchase", 2),
+            ("addtocart purchase", 3),
+            ("addtocart", 4),
+            ("view", 5),
+            ("view", 6),
+            ("oldlink", 7),
+            ("addtocart", 8),
+            ("oldlink", 9),
+            ("view", 10),
+        ];
+        let key_fields = [("host", "host1")];
+        sequence
+            .iter()
+            .map(|(msg, offset)| {
+                let ts = (base - ChronoDuration::seconds(*offset)).timestamp_micros();
+                create_event(ts, msg, &key_fields)
+            })
+            .collect()
+    }
+
     fn build_host_sequence_events(labels: &[&str]) -> Vec<EventMap> {
         let base = Utc::now();
         let key_fields = [("host", "host1")];
@@ -4525,6 +4657,160 @@ mod tests {
                 "Expected group closed={closed} with members {target:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_max_span_doc_ten_seconds() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("max_span".to_string(), Arg::String("10s".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params);
+        for event in build_doc_max_span_events() {
+            pool.add_event(event).unwrap();
+        }
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+        assert_eq!(transactions.len(), 1, "Expected a single transaction");
+
+        let groups = collect_message_sets(&transactions);
+        assert_eq!(groups.len(), 1);
+        let (is_closed, messages) = &groups[0];
+        assert!(*is_closed, "Expected transaction to be closed");
+
+        let expected = BTreeSet::from([
+            "category".to_string(),
+            "product".to_string(),
+            "purchase".to_string(),
+            "purchase".to_string(),
+            "addtocart".to_string(),
+            "view".to_string(),
+            "view".to_string(),
+            "oldlink".to_string(),
+            "addtocart".to_string(),
+            "oldlink".to_string(),
+            "view".to_string(),
+        ]);
+        assert_eq!(messages, &expected);
+    }
+
+    #[test]
+    fn test_max_span_doc_six_seconds_ends_only() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                ("ends_with".to_string(), Arg::String("purchase".to_string())),
+                ("max_span".to_string(), Arg::String("6s".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params);
+        for event in build_doc_max_span_events() {
+            pool.add_event(event).unwrap();
+        }
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+        assert_eq!(transactions.len(), 4);
+
+        let groups = collect_sorted_messages(&transactions);
+
+        let closed_count = groups.iter().filter(|(c, _)| *c).count();
+        assert_eq!(closed_count, 2, "Expected two closed groups");
+        assert_has_sorted_group(
+            &groups,
+            false,
+            &["category", "product"],
+            "doc max_span=6s ends-only group1",
+        );
+        assert_has_sorted_group(
+            &groups,
+            true,
+            &["purchase"],
+            "doc max_span=6s ends-only group2",
+        );
+        assert_has_sorted_group(
+            &groups,
+            true,
+            &[
+                "addtocart",
+                "addtocart",
+                "oldlink",
+                "oldlink",
+                "purchase",
+                "view",
+                "view",
+            ],
+            "doc max_span=6s ends-only group3",
+        );
+        assert_has_sorted_group(
+            &groups,
+            false,
+            &["view"],
+            "doc max_span=6s ends-only group4",
+        );
+    }
+
+    #[test]
+    fn test_max_span_doc_six_seconds_starts_ends_same_line() {
+        let params = TransParams::new(
+            Some(vec![]),
+            vec![
+                ("fields".to_string(), Arg::String("host".to_string())),
+                (
+                    "starts_with".to_string(),
+                    Arg::String("addtocart".to_string()),
+                ),
+                ("ends_with".to_string(), Arg::String("purchase".to_string())),
+                ("max_span".to_string(), Arg::String("6s".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params);
+        for event in build_doc_max_span_starts_ends_same_line_events() {
+            pool.add_event(event).unwrap();
+        }
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+        assert_eq!(transactions.len(), 5);
+
+        let groups = collect_sorted_messages(&transactions);
+
+        let mut twin_target = vec!["addtocart purchase".to_string()];
+        twin_target.sort();
+        let twin_count = groups
+            .iter()
+            .filter(|(is_closed, msgs)| *is_closed && *msgs == twin_target)
+            .count();
+        assert_eq!(
+            twin_count, 2,
+            "Expected two closed groups with addtocart purchase"
+        );
+        assert_has_sorted_group(
+            &groups,
+            false,
+            &["addtocart", "category", "product"],
+            "doc max_span=6s starts/ends same line group3",
+        );
+        assert_has_sorted_group(
+            &groups,
+            false,
+            &["addtocart", "oldlink", "view", "view"],
+            "doc max_span=6s starts/ends same line group4",
+        );
+        assert_has_sorted_group(
+            &groups,
+            false,
+            &["oldlink", "view"],
+            "doc max_span=6s starts/ends same line group5",
+        );
     }
 
     #[test]
