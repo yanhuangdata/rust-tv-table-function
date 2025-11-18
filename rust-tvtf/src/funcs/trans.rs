@@ -4433,18 +4433,18 @@ mod tests {
             .collect()
     }
 
-fn build_host_sequence_events(labels: &[&str]) -> Vec<EventMap> {
-    let base = Utc::now();
-    let key_fields = [("host", "host1")];
-    labels
-        .iter()
-        .enumerate()
-        .map(|(idx, label)| {
-            let ts = event_time_for_index(base, (idx + 1) as i64);
-            create_event(ts, label, &key_fields)
-        })
-        .collect()
-}
+    fn build_host_sequence_events(labels: &[&str]) -> Vec<EventMap> {
+        let base = Utc::now();
+        let key_fields = [("host", "host1")];
+        labels
+            .iter()
+            .enumerate()
+            .map(|(idx, label)| {
+                let ts = event_time_for_index(base, (idx + 1) as i64);
+                create_event(ts, label, &key_fields)
+            })
+            .collect()
+    }
 
     #[test]
     fn test_max_span_doc_three_seconds() {
