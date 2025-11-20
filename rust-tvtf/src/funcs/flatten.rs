@@ -114,14 +114,11 @@ impl TableFunction for Flatten {
         }
 
         let mut list_lengths: Vec<Vec<usize>> = Vec::new();
-        let mut null_type_columns: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
 
-        for (col_idx, column) in &list_columns_info {
+        for (_col_idx, column) in &list_columns_info {
             let lengths = match column.data_type() {
                 DataType::Null => {
                     // For null type columns, treat each row as an empty list (length 0)
-                    null_type_columns.insert(*col_idx);
                     vec![0; column.len()]
                 }
                 DataType::List(_) => {
@@ -152,17 +149,7 @@ impl TableFunction for Flatten {
             .map(|row_idx| {
                 list_lengths
                     .iter()
-                    .enumerate()
-                    .map(|(list_idx, lens)| {
-                        let col_idx = list_columns_info[list_idx].0;
-                        if null_type_columns.contains(&col_idx) {
-                            // For null type columns, don't apply max(1) - use actual length (0)
-                            lens[row_idx]
-                        } else {
-                            // For other list types, use max(1) to handle empty lists correctly
-                            lens[row_idx].max(1)
-                        }
-                    })
+                    .map(|lens| lens[row_idx])
                     .product()
             })
             .collect();
@@ -242,38 +229,48 @@ impl TableFunction for Flatten {
                         let list_array = column.as_list_opt::<i32>().unwrap();
 
                         for row_idx in 0..input.num_rows() {
-                            if row_products[row_idx] == 0 {
+                            let row_product = row_products[row_idx];
+                            if row_product == 0 {
                                 continue;
                             }
 
-                            let list_values = list_array.value(row_idx);
+                            if list_array.is_null(row_idx) {
+                                for _ in 0..row_product {
+                                    flattened_values.push(None);
+                                }
+                                continue;
+                            }
 
                             let outer_repeat = list_lengths[..list_col_pos]
                                 .iter()
-                                .map(|lens| lens[row_idx].max(1))
+                                .map(|lens| lens[row_idx])
                                 .product::<usize>();
 
                             let inner_repeat = list_lengths[list_col_pos + 1..]
                                 .iter()
-                                .map(|lens| lens[row_idx].max(1))
+                                .map(|lens| lens[row_idx])
                                 .product::<usize>();
 
-                            if list_array.is_null(row_idx) {
-                                for _ in 0..row_products[row_idx] {
+                            let repeats = outer_repeat * inner_repeat;
+                            let list_values = list_array.value(row_idx);
+
+                            if list_values.is_empty() {
+                                for _ in 0..repeats {
                                     flattened_values.push(None);
                                 }
-                            } else {
-                                // Apply the Cartesian product pattern
-                                for _ in 0..outer_repeat {
-                                    for elem_idx in 0..list_values.len() {
-                                        for _ in 0..inner_repeat {
-                                            if list_values.is_null(elem_idx) {
-                                                flattened_values.push(None);
-                                            } else {
-                                                // This is a generic way to append a value from one array to a builder
-                                                flattened_values
-                                                    .push(Some(list_values.slice(elem_idx, 1)));
-                                            }
+                                continue;
+                            }
+
+                            // Apply the Cartesian product pattern
+                            for _ in 0..outer_repeat {
+                                for elem_idx in 0..list_values.len() {
+                                    for _ in 0..inner_repeat {
+                                        if list_values.is_null(elem_idx) {
+                                            flattened_values.push(None);
+                                        } else {
+                                            // This is a generic way to append a value from one array to a builder
+                                            flattened_values
+                                                .push(Some(list_values.slice(elem_idx, 1)));
                                         }
                                     }
                                 }
@@ -318,8 +315,19 @@ impl TableFunction for Flatten {
         }
 
         let new_schema = Arc::new(Schema::new(new_fields));
-        let output = RecordBatch::try_new(new_schema, new_columns)
-            .context("Failed to create output RecordBatch")?;
+        let expected_rows = total_rows;
+        let column_lengths: Vec<usize> = new_columns.iter().map(|col| col.len()).collect();
+        let schema_field_count = new_schema.fields().len();
+        let column_count = new_columns.len();
+
+        let output = RecordBatch::try_new(Arc::clone(&new_schema), new_columns).with_context(
+            || {
+                format!(
+                    "Failed to create output RecordBatch (fields: {}, columns: {}, expected rows: {}, column lengths: {:?})",
+                    schema_field_count, column_count, expected_rows, column_lengths
+                )
+            },
+        )?;
 
         Ok(Some(output))
     }
@@ -659,6 +667,77 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(flattened_col.values(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_flatten_empty_list_in_multi_column_row_skips_row() {
+        // list1: [[Alice, Bob], [Charlie, David]]
+        let user_values =
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "David"])) as ArrayRef;
+        let user_offsets = OffsetBuffer::from_lengths([2, 2]);
+        let user_list = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            user_offsets,
+            user_values,
+            None,
+        ));
+
+        // list2: [[], [Game, Music]]
+        let tag_values = Arc::new(StringArray::from(vec!["Game", "Music"])) as ArrayRef;
+        let tag_offsets = OffsetBuffer::from_lengths([0, 2]);
+        let tag_list = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            tag_offsets,
+            tag_values,
+            None,
+        ));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "user",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new(
+                "tag",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+
+        let input_batch = RecordBatch::try_new(
+            schema,
+            vec![user_list as Arc<dyn Array>, tag_list as Arc<dyn Array>],
+        )
+        .expect("Failed to create record batch");
+
+        let params = vec![Arg::String("user,tag".to_string())];
+        let mut flatten = Flatten::new(Some(params)).expect("Failed to create Flatten");
+        let output_batch_option = flatten.process(input_batch).expect("Processing failed");
+        let output_batch = output_batch_option.expect("Expected non-empty RecordBatch");
+
+        // First row had an empty tag list, so only the second row remains (2 users x 2 tags)
+        assert_eq!(output_batch.num_rows(), 4);
+
+        let user_col = output_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(user_col.value(0), "Charlie");
+        assert_eq!(user_col.value(1), "Charlie");
+        assert_eq!(user_col.value(2), "David");
+        assert_eq!(user_col.value(3), "David");
+
+        let tag_col = output_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(tag_col.value(0), "Game");
+        assert_eq!(tag_col.value(1), "Music");
+        assert_eq!(tag_col.value(2), "Game");
+        assert_eq!(tag_col.value(3), "Music");
     }
 
     #[test]
