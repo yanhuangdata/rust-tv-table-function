@@ -146,12 +146,7 @@ impl TableFunction for Flatten {
 
         // Calculate the product of list lengths for each row (size of Cartesian product per row)
         let row_products: Vec<usize> = (0..input.num_rows())
-            .map(|row_idx| {
-                list_lengths
-                    .iter()
-                    .map(|lens| lens[row_idx])
-                    .product()
-            })
+            .map(|row_idx| list_lengths.iter().map(|lens| lens[row_idx]).product())
             .collect();
 
         let total_rows: usize = row_products.iter().sum();
