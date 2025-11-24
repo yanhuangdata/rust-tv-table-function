@@ -768,11 +768,16 @@ impl TransactionPool {
         if max_span_secs == 0 {
             return;
         }
+        let max_span_micros_u64 = max_span_secs.saturating_mul(1_000_000);
+        let max_span_micros = if max_span_micros_u64 > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            max_span_micros_u64 as i64
+        };
 
         let Some(earliest_ts) = self.earliest_event_timestamp else {
             return;
         };
-        let max_span_limit = max_span_secs as i64;
         let has_start_conditions = self.has_start_conditions();
         let has_end_conditions = self.has_end_conditions();
 
@@ -780,8 +785,11 @@ impl TransactionPool {
         let old_live = std::mem::take(&mut self.live_trans);
         for (key, mut trans) in old_live.into_iter() {
             if let Some(end_time) = trans.end_time {
-                let elapsed = end_time.signed_duration_since(earliest_ts).num_seconds();
-                if elapsed > max_span_limit {
+                let elapsed = end_time
+                    .signed_duration_since(earliest_ts)
+                    .num_microseconds()
+                    .unwrap_or(i64::MAX);
+                if elapsed > max_span_micros {
                     mark_closed_for_flags(&mut trans, has_start_conditions, has_end_conditions);
                     self.frozen_trans.push(trans);
                     self.trans_complete_flag.remove(&key);
@@ -798,7 +806,11 @@ impl TransactionPool {
                 let expire = stack[idx]
                     .end_time
                     .map(|end_time| {
-                        end_time.signed_duration_since(earliest_ts).num_seconds() > max_span_limit
+                        end_time
+                            .signed_duration_since(earliest_ts)
+                            .num_microseconds()
+                            .unwrap_or(i64::MAX)
+                            > max_span_micros
                     })
                     .unwrap_or(false);
 
@@ -1703,8 +1715,10 @@ mod tests {
         TimestampMicrosecondArray,
     };
     use chrono::{Duration as ChronoDuration, Utc};
+    use serde_json::Value;
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs::File;
+    use std::io::{BufRead, BufReader};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -1795,6 +1809,39 @@ mod tests {
         event
     }
 
+    fn json_value_to_string(value: &Value) -> Option<String> {
+        match value {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        }
+    }
+
+    fn dataset_json_to_event(value: &Value) -> Option<EventMap> {
+        let time_str = value.get("_time")?.as_str()?;
+        let time = DateTime::parse_from_rfc3339(time_str)
+            .ok()?
+            .with_timezone(&Utc)
+            .timestamp_micros();
+
+        let mut event = EventMap::new();
+        event.insert(
+            FIELD_TIME.to_string(),
+            smallvec![string_to_arc(time.to_string())],
+        );
+
+        for field in ["id", "session", "action", "status"] {
+            if let Some(val) = value.get(field)
+                && let Some(text) = json_value_to_string(val)
+            {
+                event.insert(field.to_string(), smallvec![string_to_arc(text)]);
+            }
+        }
+
+        Some(event)
+    }
+
     /// Helper to extract values from a ListArray of StringArray.
     ///
     /// Correctly accesses the inner StringArray from the ListArray.
@@ -1865,6 +1912,560 @@ mod tests {
         );
         let key_index_map = build_key_index_map(&fields);
         Transaction::new(fields, key_index_map)
+    }
+
+    #[test]
+    fn test_simple_grouping_multi_fields_max_span() {
+        let params = TransParams::new(
+            None,
+            vec![
+                (
+                    "fields".to_string(),
+                    Arg::String("client_ip,session_id".to_string()),
+                ),
+                ("max_span".to_string(), Arg::String("5s".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params.clone());
+        let base = Utc
+            .with_ymd_and_hms(2024, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid time");
+
+        let mk = |offset_secs: i64, message: &str| -> EventMap {
+            create_event(
+                (base - ChronoDuration::seconds(offset_secs)).timestamp_micros(),
+                message,
+                &[("client_ip", "1.1.1.1"), ("session_id", "AAA")],
+            )
+        };
+        let mk_other = |offset_secs: i64, message: &str| -> EventMap {
+            create_event(
+                (base - ChronoDuration::seconds(offset_secs)).timestamp_micros(),
+                message,
+                &[("client_ip", "2.2.2.2"), ("session_id", "BBB")],
+            )
+        };
+
+        let events = vec![
+            mk(0, "first"),        // newest event
+            mk(2, "second"),       // within max_span, should stay in same transaction
+            mk_other(3, "other1"), // different key, shouldn't interfere
+            mk_other(4, "other2"),
+            mk(8, "third"), // exceeds max_span relative to "first", should start new transaction
+            mk(9, "fourth"),
+        ];
+
+        for event in events {
+            pool.add_event(event).unwrap();
+        }
+
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+
+        let mut groups: HashMap<(String, String), Vec<Vec<String>>> = HashMap::new();
+        for trans in transactions {
+            let key = (
+                trans
+                    .get_field_values("client_ip")
+                    .and_then(|vals| vals.first())
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                trans
+                    .get_field_values("session_id")
+                    .and_then(|vals| vals.first())
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            );
+            let messages: Vec<String> = trans
+                .messages
+                .iter()
+                .flat_map(|msgs| msgs.iter().map(|m| m.to_string()))
+                .collect();
+            groups.entry(key).or_default().push(messages);
+        }
+
+        let entry = groups
+            .get(&(String::from("1.1.1.1"), String::from("AAA")))
+            .expect("expected transactions for primary key");
+        assert_eq!(
+            entry.len(),
+            2,
+            "max_span should split transactions when events exceed 5 seconds apart"
+        );
+        assert!(
+            entry
+                .iter()
+                .any(|msgs| msgs == &["second".to_string(), "first".to_string()]),
+            "first transaction should contain the first two events"
+        );
+        assert!(
+            entry
+                .iter()
+                .any(|msgs| msgs == &["fourth".to_string(), "third".to_string()]),
+            "second transaction should contain the later events for the same key"
+        );
+
+        let other_entry = groups
+            .get(&(String::from("2.2.2.2"), String::from("BBB")))
+            .expect("expected transactions for secondary key");
+        assert_eq!(other_entry.len(), 1);
+        assert_eq!(
+            other_entry[0],
+            vec!["other2".to_string(), "other1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_simple_grouping_three_fields_nulls_max_span() {
+        let params = TransParams::new(
+            None,
+            vec![
+                (
+                    "fields".to_string(),
+                    Arg::String("client_ip,session_id,user_id".to_string()),
+                ),
+                ("max_span".to_string(), Arg::String("4s".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params.clone());
+        let base = Utc
+            .with_ymd_and_hms(2024, 2, 2, 15, 30, 0)
+            .single()
+            .expect("valid time");
+
+        let mk_primary = |offset_secs: i64, message: &str, user: Option<&str>| -> EventMap {
+            let mut fields = vec![("client_ip", "1.1.1.1"), ("session_id", "AAA")];
+            if let Some(u) = user {
+                fields.push(("user_id", u));
+            }
+            create_event(
+                (base - ChronoDuration::seconds(offset_secs)).timestamp_micros(),
+                message,
+                &fields,
+            )
+        };
+        let mk_secondary = |offset_secs: i64, message: &str| -> EventMap {
+            create_event(
+                (base - ChronoDuration::seconds(offset_secs)).timestamp_micros(),
+                message,
+                &[
+                    ("client_ip", "2.2.2.2"),
+                    ("session_id", "CCC"),
+                    ("user_id", "user-x"),
+                ],
+            )
+        };
+
+        let events = vec![
+            mk_primary(0, "latest-null-user", None),
+            mk_secondary(1, "beta"),
+            mk_primary(1, "second-null-user", None),
+            mk_secondary(3, "alpha"),
+            mk_primary(5, "older-with-user", Some("user1")),
+            mk_primary(6, "oldest-null", None),
+        ];
+
+        for event in events {
+            pool.add_event(event).unwrap();
+        }
+
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+
+        #[allow(clippy::type_complexity)]
+        let mut groups: HashMap<(String, String), Vec<(Option<String>, Vec<String>)>> =
+            HashMap::new();
+        for trans in transactions {
+            let ip = trans
+                .get_field_values("client_ip")
+                .and_then(|vals| vals.first())
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let session = trans
+                .get_field_values("session_id")
+                .and_then(|vals| vals.first())
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let user = trans
+                .get_field_values("user_id")
+                .and_then(|vals| vals.first())
+                .map(|v| v.to_string());
+            let messages: Vec<String> = trans
+                .messages
+                .iter()
+                .flat_map(|msgs| msgs.iter().map(|m| m.to_string()))
+                .collect();
+            groups
+                .entry((ip, session))
+                .or_default()
+                .push((user, messages));
+        }
+
+        let primary = groups
+            .get(&(String::from("1.1.1.1"), String::from("AAA")))
+            .expect("expected transactions for primary key");
+        assert_eq!(
+            primary.len(),
+            2,
+            "max_span should split primary key despite null user field"
+        );
+        assert!(
+            primary.iter().any(|(user, msgs)| {
+                user.is_none()
+                    && msgs
+                        == &[
+                            "second-null-user".to_string(),
+                            "latest-null-user".to_string(),
+                        ]
+            }),
+            "first transaction should retain the two newest events that both lack user_id"
+        );
+        assert!(
+            primary.iter().any(|(user, msgs)| {
+                user.as_deref() == Some("user1")
+                    && msgs == &["oldest-null".to_string(), "older-with-user".to_string()]
+            }),
+            "second transaction should contain the older events after max_span eviction"
+        );
+
+        let secondary = groups
+            .get(&(String::from("2.2.2.2"), String::from("CCC")))
+            .expect("expected transactions for secondary key");
+        assert_eq!(secondary.len(), 1);
+        assert_eq!(
+            secondary[0].1,
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_three_fields_with_null_slot_sample() {
+        let params = TransParams::new(
+            None,
+            vec![
+                (
+                    "fields".to_string(),
+                    Arg::String("client_ip,client_session,verb".to_string()),
+                ),
+                ("max_span".to_string(), Arg::String("1s".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params.clone());
+        let base = Utc
+            .with_ymd_and_hms(2024, 3, 1, 0, 0, 2)
+            .single()
+            .expect("valid timestamp");
+
+        let mk_event = |offset_ms: i64, verb: Option<&str>, message: &str| -> EventMap {
+            let mut fields = vec![("client_ip", "127.0.0.1"), ("client_session", "session1")];
+            if let Some(v) = verb {
+                fields.push(("verb", v));
+            }
+            create_event(
+                (base - ChronoDuration::milliseconds(offset_ms)).timestamp_micros(),
+                message,
+                &fields,
+            )
+        };
+
+        let events = vec![
+            mk_event(0, Some("offline"), "offline-newest"),
+            mk_event(500, None, "missing-verb-recent"),
+            mk_event(1000, Some("upload"), "upload-recent"),
+            mk_event(1500, None, "missing-verb-mid"),
+            mk_event(2000, Some("download"), "download-old"),
+            mk_event(2500, None, "missing-verb-old"),
+            mk_event(3000, Some("upload"), "upload-oldest"),
+        ];
+
+        for event in events {
+            pool.add_event(event).unwrap();
+        }
+
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+
+        let matched: Vec<Transaction> = transactions
+            .into_iter()
+            .filter(|t| {
+                t.get_field_values("client_ip")
+                    .and_then(|vals| vals.first())
+                    .map(|v| v.as_ref() == "127.0.0.1")
+                    .unwrap_or(false)
+                    && t.get_field_values("client_session")
+                        .and_then(|vals| vals.first())
+                        .map(|v| v.as_ref() == "session1")
+                        .unwrap_or(false)
+            })
+            .collect();
+
+        let mut message_sets: Vec<Vec<String>> = matched.iter().map(messages_of).collect();
+        message_sets.sort();
+        assert_eq!(
+            matched.len(),
+            message_sets.len(),
+            "message set count should match transaction count"
+        );
+        assert_eq!(
+            matched.len(),
+            4,
+            "verb slot + max_span should fan out into four buckets"
+        );
+        assert_eq!(
+            message_sets,
+            vec![
+                vec!["missing-verb-mid".to_string(), "upload-recent".to_string()],
+                vec!["missing-verb-old".to_string(), "download-old".to_string()],
+                vec![
+                    "missing-verb-recent".to_string(),
+                    "offline-newest".to_string()
+                ],
+                vec!["upload-oldest".to_string()]
+            ],
+            "Expected four transactions: the null verb rows bridge to whichever explicit verb they encounter until max_span forces a split"
+        );
+    }
+
+    #[test]
+    fn test_single_group_exceeds_max_span_creates_extra_chunk() {
+        let params = TransParams::new(
+            None,
+            vec![
+                (
+                    "fields".to_string(),
+                    Arg::String("client_ip,client_session".to_string()),
+                ),
+                ("max_span".to_string(), Arg::String("1s".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params.clone());
+        let base = Utc
+            .with_ymd_and_hms(2024, 4, 15, 10, 0, 0)
+            .single()
+            .expect("valid timestamp");
+
+        let mk = |offset_ms: i64, msg: &str| -> EventMap {
+            create_event(
+                (base - ChronoDuration::milliseconds(offset_ms)).timestamp_micros(),
+                msg,
+                &[("client_ip", "10.0.0.1"), ("client_session", "sess-1")],
+            )
+        };
+
+        let events = vec![
+            mk(0, "evt-newest"),
+            mk(300, "evt-mid1"),
+            mk(600, "evt-mid2"),
+            mk(2100, "evt-old1"),
+            mk(2400, "evt-old2"),
+        ];
+
+        for event in events {
+            pool.add_event(event).unwrap();
+        }
+
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+
+        let message_sets = transactions
+            .into_iter()
+            .filter(|t| {
+                t.get_field_values("client_ip")
+                    .and_then(|vals| vals.first())
+                    .map(|v| v.as_ref() == "10.0.0.1")
+                    .unwrap_or(false)
+            })
+            .map(|t| messages_of(&t))
+            .collect::<Vec<_>>();
+
+        let mut sorted_sets = message_sets;
+        sorted_sets.sort();
+        assert_eq!(
+            sorted_sets,
+            vec![
+                vec![
+                    "evt-mid2".to_string(),
+                    "evt-mid1".to_string(),
+                    "evt-newest".to_string()
+                ],
+                vec!["evt-old2".to_string(), "evt-old1".to_string()]
+            ],
+            "Events beyond 1s span should spill into a second transaction"
+        );
+    }
+
+    #[test]
+    fn test_dataset_two_event_transactions_when_env_present() {
+        let dataset_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("group_pairs.jsonl");
+
+        let file = match File::open(&dataset_path) {
+            Ok(f) => f,
+            Err(err) => {
+                eprintln!(
+                    "Skipping dataset test: failed to open {}: {err:?}",
+                    dataset_path.display()
+                );
+                return;
+            }
+        };
+
+        let reader = BufReader::new(file);
+        let params = TransParams::new(
+            None,
+            vec![
+                (
+                    "fields".to_string(),
+                    Arg::String("id,session,action".to_string()),
+                ),
+                ("max_span".to_string(), Arg::String("1s".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params);
+        let mut staged: Vec<(i64, EventMap)> = Vec::new();
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                continue;
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(value): Result<Value, _> = serde_json::from_str(&line) else {
+                continue;
+            };
+            if let Some(event) = dataset_json_to_event(&value) {
+                let time_micros = event
+                    .get(FIELD_TIME)
+                    .and_then(|vals| vals.first())
+                    .and_then(|s| atoi_simd::parse::<i64>(s.as_bytes()).ok());
+                if let Some(ts) = time_micros {
+                    staged.push((ts, event));
+                }
+            }
+        }
+
+        staged.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, event) in staged {
+            pool.add_event(event).unwrap();
+        }
+
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+
+        if transactions.is_empty() {
+            panic!("Dataset test enabled but produced no transactions");
+        }
+
+        let mut bad_transactions = Vec::new();
+        for trans in &transactions {
+            if trans.get_event_count() != 2 {
+                let mut key_summary = Vec::new();
+                for name in trans.key_names() {
+                    let value = trans
+                        .get_field_values(name)
+                        .and_then(|vals| vals.first())
+                        .map(|s| s.as_ref().to_string())
+                        .unwrap_or_else(|| "<null>".to_string());
+                    key_summary.push(format!("{name}={value}"));
+                }
+                bad_transactions.push((
+                    trans.get_event_count(),
+                    key_summary,
+                    trans.get_duration().unwrap_or_default(),
+                ));
+            }
+        }
+        assert!(
+            bad_transactions.is_empty(),
+            "Dataset transaction should contain exactly two events; offending entries: {bad_transactions:?}"
+        );
+    }
+
+    #[test]
+    fn test_three_fields_max_span_boundary_extra_group() {
+        let params = TransParams::new(
+            None,
+            vec![
+                (
+                    "fields".to_string(),
+                    Arg::String("client_ip,client_session,verb".to_string()),
+                ),
+                ("max_span".to_string(), Arg::String("1s".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let mut pool = TransactionPool::new(params.clone());
+        let base = Utc
+            .with_ymd_and_hms(2024, 5, 10, 9, 0, 0)
+            .single()
+            .expect("valid timestamp");
+
+        let mk_event = |offset_ms: i64, message: &str| -> EventMap {
+            create_event(
+                (base - ChronoDuration::milliseconds(offset_ms)).timestamp_micros(),
+                message,
+                &[
+                    ("client_ip", "127.0.0.1"),
+                    ("client_session", "sessionX"),
+                    ("verb", "upload"),
+                ],
+            )
+        };
+
+        // newest -> oldest (descending _time)
+        let events = vec![
+            mk_event(0, "newest-a"),
+            mk_event(400, "recent-b"),
+            mk_event(2100, "older-c"), // exceeds 2s when compared to newest-a (integer seconds)
+            mk_event(2500, "older-d"),
+            mk_event(4300, "oldest-e"), // exceeds 2s relative to older-c
+        ];
+
+        for event in events {
+            pool.add_event(event).unwrap();
+        }
+
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+
+        let mut message_sets: Vec<Vec<String>> = transactions
+            .into_iter()
+            .filter(|t| {
+                t.get_field_values("client_ip")
+                    .and_then(|vals| vals.first())
+                    .map(|v| v.as_ref() == "127.0.0.1")
+                    .unwrap_or(false)
+                    && t.get_field_values("client_session")
+                        .and_then(|vals| vals.first())
+                        .map(|v| v.as_ref() == "sessionX")
+                        .unwrap_or(false)
+            })
+            .map(|t| messages_of(&t))
+            .collect();
+
+        message_sets.sort();
+        assert_eq!(
+            message_sets,
+            vec![
+                vec!["older-d".to_string(), "older-c".to_string()],
+                vec!["oldest-e".to_string()],
+                vec!["recent-b".to_string(), "newest-a".to_string()],
+            ],
+            "Events that fall just beyond the 1s span should break into additional transactions even when all key fields match"
+        );
     }
 
     fn sample_csv_events() -> Vec<EventMap> {
