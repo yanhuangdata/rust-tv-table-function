@@ -79,6 +79,7 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
             .init(Arc::new(|ctx| {
                 Filldown::new(ctx.arguments).map(|f| Box::new(f) as Box<dyn TableFunction>)
             }))
+            .require_ordered(true)
             .signature(Signature::empty())
             .signature(
                 Signature::builder()

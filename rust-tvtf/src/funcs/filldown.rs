@@ -3,6 +3,7 @@ use arrow::{
     array::{Array, ArrayRef, RecordBatch, UInt32Array},
     compute::{concat, take},
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::DataType;
@@ -13,7 +14,7 @@ use rust_tvtf_api::arg::{Arg, Args};
 #[derive(Debug)]
 pub struct Filldown {
     column_names: Vec<String>,
-    last_values: Vec<Option<ArrayRef>>,
+    last_values: HashMap<String, Option<ArrayRef>>,
 }
 impl Filldown {
     pub fn new(params: Option<Args>) -> anyhow::Result<Filldown> {
@@ -47,14 +48,8 @@ impl Filldown {
 
         Ok(Filldown {
             column_names,
-            last_values: Vec::new(),
+            last_values: HashMap::new(),
         })
-    }
-
-    fn ensure_last_value_len(&mut self, ncols: usize) {
-        if self.last_values.len() < ncols {
-            self.last_values.resize_with(ncols, || None);
-        }
     }
 
     fn need_filldown(&self, col_name: &str) -> bool {
@@ -83,9 +78,7 @@ fn extract_last_value(col: &ArrayRef) -> anyhow::Result<Option<ArrayRef>> {
     }
     for i in (0..n).rev() {
         if col.is_valid(i) {
-            let idx_arr = Arc::new(arrow::array::UInt32Array::from(vec![i as u32])) as ArrayRef;
-            let single = take(col.as_ref(), idx_arr.as_ref(), None)
-                .context("Failed to extract last value for filldown")?;
+            let single = col.slice(i, 1);
             return Ok(Some(single));
         }
     }
@@ -100,19 +93,19 @@ impl TableFunction for Filldown {
         let num_rows = input.num_rows();
         let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(input.num_columns());
 
-        self.ensure_last_value_len(input.num_columns());
-
         for col_idx in 0..input.num_columns() {
             let col = input.column(col_idx).clone();
+            let col_name = schema.field(col_idx).name();
 
             // No nulls or column not specified for filldown; copy as is
-            if !self.need_filldown(schema.field(col_idx).name()) {
+            if !self.need_filldown(col_name) {
                 output_columns.push(col);
                 continue;
             }
 
             if col.null_count() == 0 {
-                self.last_values[col_idx] = extract_last_value(&col)?;
+                self.last_values
+                    .insert(col_name.to_string(), extract_last_value(&col)?);
                 output_columns.push(col);
                 continue;
             }
@@ -123,12 +116,12 @@ impl TableFunction for Filldown {
                     &DataType::Null,
                     num_rows,
                 )));
-                self.last_values[col_idx] = None;
+                self.last_values.insert(col_name.to_string(), None);
                 continue;
             }
 
             // Build source: optionally prepend saved last value
-            let (source_array, offset) = if let Some(prev) = &self.last_values[col_idx] {
+            let (source_array, offset) = if let Some(Some(prev)) = self.last_values.get(col_name) {
                 // concat requires &[&dyn Array]
                 let refs: Vec<&dyn Array> = vec![prev.as_ref(), col.as_ref()];
                 let concatenated = concat(&refs).context("Failed to concat arrays for filldown")?;
@@ -170,10 +163,11 @@ impl TableFunction for Filldown {
                 let idx_ref = Arc::new(idx_arr) as ArrayRef;
                 let last_single = take(source_array.as_ref(), idx_ref.as_ref(), None)
                     .context("Failed to take final last_value for filldown")?;
-                self.last_values[col_idx] = Some(last_single);
+                self.last_values
+                    .insert(col_name.to_string(), Some(last_single));
             } else {
                 // no non-null seen; keep previous (or set None) - here set None
-                self.last_values[col_idx] = None;
+                self.last_values.insert(col_name.to_string(), None);
             }
 
             output_columns.push(taken);
@@ -183,6 +177,10 @@ impl TableFunction for Filldown {
             .context("Failed to create output RecordBatch for filldown")?;
 
         Ok(Some(out_batch))
+    }
+    fn finalize(&mut self) -> anyhow::Result<Option<RecordBatch>> {
+        self.last_values.clear();
+        Ok(None)
     }
 }
 
