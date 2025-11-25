@@ -1311,15 +1311,40 @@ impl TransactionPool {
             // Enhanced simple grouping logic with null wildcard matching
             // If there are transactions with compatible keys (considering nulls as wildcards),
             // add to the best matching one based on non-null field matches and time proximity; otherwise create new
-            if let Some(best_matching_key) = self.find_best_matching_transaction_key(
+            let has_null_field = trans_key_ref.parts.iter().any(|part| part.is_none());
+            let mut matched_existing = false;
+
+            if !has_null_field {
+                if let Some(trans) = self.live_trans.get_mut(&trans_key_ref) {
+                    trans.add_event(&event)?;
+                    matched_existing = true;
+                } else if let Some(candidate_key) = self.find_best_matching_transaction_key(
+                    &self.live_trans,
+                    &trans_key_ref,
+                    Some(event_time_micros),
+                ) {
+                    let candidate_is_partial =
+                        candidate_key.parts.iter().any(|part| part.is_none());
+                    if candidate_is_partial
+                        && let Some(mut pending_trans) = self.live_trans.remove(&candidate_key)
+                    {
+                        pending_trans.add_event(&event)?;
+                        let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
+                        self.live_trans.insert(owned, pending_trans);
+                        matched_existing = true;
+                    }
+                }
+            } else if let Some(best_matching_key) = self.find_best_matching_transaction_key(
                 &self.live_trans,
                 &trans_key_ref,
                 Some(event_time_micros),
-            ) {
-                if let Some(trans) = self.live_trans.get_mut(&best_matching_key) {
-                    trans.add_event(&event)?;
-                }
-            } else {
+            ) && let Some(trans) = self.live_trans.get_mut(&best_matching_key)
+            {
+                trans.add_event(&event)?;
+                matched_existing = true;
+            }
+
+            if !matched_existing {
                 // No compatible transaction found, create new one with this key
                 let mut new_trans = Transaction::new(
                     self.params.fields.clone(),
@@ -1719,7 +1744,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs::File;
     use std::io::{BufRead, BufReader};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     fn collect_message_sets(transactions: &[Transaction]) -> Vec<(bool, BTreeSet<String>)> {
@@ -1837,6 +1862,14 @@ mod tests {
             {
                 event.insert(field.to_string(), smallvec![string_to_arc(text)]);
             }
+        }
+
+        if let Some(seq_val) = value.get("seq")
+            && let Some(seq_text) = json_value_to_string(seq_val)
+        {
+            let seq_arc = string_to_arc(seq_text);
+            event.insert("seq".to_string(), smallvec![seq_arc.clone()]);
+            event.insert(FIELD_MESSAGE.to_string(), smallvec![seq_arc]);
         }
 
         Some(event)
@@ -2391,6 +2424,177 @@ mod tests {
             bad_transactions.is_empty(),
             "Dataset transaction should contain exactly two events; offending entries: {bad_transactions:?}"
         );
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FixtureGroupSummary {
+        event_count: u64,
+        seq_values: Vec<String>,
+    }
+
+    fn summarize_fixture_transactions(
+        transactions: &[Transaction],
+    ) -> BTreeMap<(String, String, String), FixtureGroupSummary> {
+        let mut summary = BTreeMap::new();
+        for trans in transactions {
+            let id = trans
+                .get_field_values("id")
+                .and_then(|vals| vals.first())
+                .map(|v| v.as_ref().to_string())
+                .unwrap_or_else(|| "<null>".to_string());
+            let session = trans
+                .get_field_values("session")
+                .and_then(|vals| vals.first())
+                .map(|v| v.as_ref().to_string())
+                .unwrap_or_else(|| "<null>".to_string());
+            let action = trans
+                .get_field_values("action")
+                .and_then(|vals| vals.first())
+                .map(|v| v.as_ref().to_string())
+                .unwrap_or_else(|| "<null>".to_string());
+
+            let mut seq_values = trans
+                .get_field_values("seq")
+                .map(|vals| {
+                    vals.iter()
+                        .map(|s| s.as_ref().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            seq_values.sort();
+
+            summary.insert(
+                (id, session, action),
+                FixtureGroupSummary {
+                    event_count: trans.get_event_count(),
+                    seq_values,
+                },
+            );
+        }
+        summary
+    }
+
+    fn load_trans_three_null_expectations(
+        path: &Path,
+    ) -> BTreeMap<(String, String, String), FixtureGroupSummary> {
+        let file = File::open(path).expect("trans_three_null-result.csv should exist");
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(file);
+        let mut expected = BTreeMap::new();
+        for record in reader.records() {
+            let record = record.expect("valid csv record");
+            let action = record.get(0).unwrap_or_default().trim().to_string();
+            let event_count = record
+                .get(1)
+                .unwrap_or("0")
+                .trim()
+                .parse::<u64>()
+                .expect("eventcount must be integer");
+            let id = record.get(2).unwrap_or_default().trim().to_string();
+            let seq_field = record.get(3).unwrap_or_default();
+            let session = record.get(4).unwrap_or_default().trim().to_string();
+            let mut seq_values = seq_field
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>();
+            seq_values.sort();
+            expected.insert(
+                (id, session, action),
+                FixtureGroupSummary {
+                    event_count,
+                    seq_values,
+                },
+            );
+        }
+        expected
+    }
+
+    #[test]
+    fn test_trans_three_null_fixture_handles_consecutive_nulls() {
+        let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let input_path = fixtures_dir.join("trans_three_null.jsonl");
+        let expected_path = fixtures_dir.join("trans_three_null-result.csv");
+
+        let input_file =
+            File::open(&input_path).expect("trans_three_null.jsonl fixture must be readable");
+        let reader = BufReader::new(input_file);
+
+        let mut staged: Vec<(i64, EventMap)> = Vec::new();
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                continue;
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(value): Result<Value, _> = serde_json::from_str(&line) else {
+                continue;
+            };
+            if let Some(event) = dataset_json_to_event(&value) {
+                let time_micros = event
+                    .get(FIELD_TIME)
+                    .and_then(|vals| vals.first())
+                    .and_then(|s| atoi_simd::parse::<i64>(s.as_bytes()).ok());
+                if let Some(ts) = time_micros {
+                    staged.push((ts, event));
+                }
+            }
+        }
+
+        staged.sort_by(|a, b| b.0.cmp(&a.0));
+        let params = TransParams::new(
+            None,
+            vec![(
+                "fields".to_string(),
+                Arg::String("id,session,action".to_string()),
+            )],
+        )
+        .unwrap();
+        let mut pool = TransactionPool::new(params);
+        for (_, event) in staged {
+            pool.add_event(event).unwrap();
+        }
+
+        let mut transactions = pool.get_frozen_trans();
+        transactions.extend(pool.get_live_trans());
+        assert!(
+            !transactions.is_empty(),
+            "Fixture should produce at least one transaction"
+        );
+
+        let actual = summarize_fixture_transactions(&transactions);
+        let expected = load_trans_three_null_expectations(&expected_path);
+
+        if actual.len() != expected.len() {
+            eprintln!("actual groups: {actual:?}");
+            eprintln!("expected groups: {expected:?}");
+        }
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "Unexpected number of grouped transactions"
+        );
+
+        for (key, expected_group) in expected {
+            let actual_group = actual.get(&key).unwrap_or_else(|| {
+                eprintln!("actual groups (missing key): {actual:?}");
+                panic!(
+                    "Missing transaction for key {:?}: expected {:?}",
+                    key, expected_group
+                )
+            });
+            assert_eq!(
+                actual_group.event_count, expected_group.event_count,
+                "Event count mismatch for key {:?}",
+                key
+            );
+            assert_eq!(
+                actual_group.seq_values, expected_group.seq_values,
+                "Sequence membership mismatch for key {:?}",
+                key
+            );
+        }
     }
 
     #[test]
