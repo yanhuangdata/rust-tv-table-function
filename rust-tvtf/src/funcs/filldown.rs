@@ -1,12 +1,12 @@
 use anyhow::Context;
+use arrow::array::AsArray;
 use arrow::{
     array::{Array, ArrayRef, RecordBatch, UInt32Array},
     compute::{concat, take},
 };
+use arrow_schema::DataType;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-use arrow_schema::DataType;
 
 use crate::TableFunction;
 use rust_tvtf_api::arg::{Arg, Args};
@@ -71,20 +71,6 @@ impl Filldown {
     }
 }
 
-fn extract_last_value(col: &ArrayRef) -> anyhow::Result<Option<ArrayRef>> {
-    let n = col.len();
-    if n == 0 {
-        return Ok(None);
-    }
-    for i in (0..n).rev() {
-        if col.is_valid(i) {
-            let single = col.slice(i, 1);
-            return Ok(Some(single));
-        }
-    }
-    Ok(None)
-}
-
 impl TableFunction for Filldown {
     fn process(&mut self, input: RecordBatch) -> anyhow::Result<Option<RecordBatch>> {
         // create a new RecordBatch with same schema as input,
@@ -103,20 +89,12 @@ impl TableFunction for Filldown {
                 continue;
             }
 
-            if col.null_count() == 0 {
-                self.last_values
-                    .insert(col_name.to_string(), extract_last_value(&col)?);
-                output_columns.push(col);
-                continue;
-            }
-
             // If column type is `Null`, just produce a null array of same length
             if schema.field(col_idx).data_type() == &DataType::Null {
                 output_columns.push(Arc::new(arrow::array::new_null_array(
                     &DataType::Null,
                     num_rows,
                 )));
-                self.last_values.insert(col_name.to_string(), None);
                 continue;
             }
 
@@ -139,9 +117,28 @@ impl TableFunction for Filldown {
                 }
             }
 
+            let is_union = matches!(col.data_type(), DataType::Union(_, _));
             let mut indices: Vec<Option<u32>> = Vec::with_capacity(num_rows);
             for row in 0..num_rows {
-                if col.is_valid(row) {
+                // check row type if col type is union
+                let mut is_valid_value = col.is_valid(row);
+                if is_valid_value && is_union {
+                    let union_array = col.as_union();
+                    let type_id = union_array.type_id(row);
+                    if matches!(
+                        col.data_type(),
+                        DataType::Union(union_fields, _)
+                            if union_fields
+                                .iter()
+                                .find(|(id, _)| *id == type_id)
+                                .map(|(_, field)| matches!(field.data_type(), DataType::Null))
+                                .unwrap_or(false)
+                    ) {
+                        is_valid_value = false;
+                    }
+                }
+
+                if is_valid_value {
                     let idx = (row as u32) + offset;
                     last_idx = Some(idx);
                     indices.push(Some(idx));
@@ -163,11 +160,10 @@ impl TableFunction for Filldown {
                 let idx_ref = Arc::new(idx_arr) as ArrayRef;
                 let last_single = take(source_array.as_ref(), idx_ref.as_ref(), None)
                     .context("Failed to take final last_value for filldown")?;
-                self.last_values
-                    .insert(col_name.to_string(), Some(last_single));
-            } else {
-                // no non-null seen; keep previous (or set None) - here set None
-                self.last_values.insert(col_name.to_string(), None);
+                if last_single.as_ref().is_valid(0) {
+                    self.last_values
+                        .insert(col_name.to_string(), Some(last_single));
+                }
             }
 
             output_columns.push(taken);
@@ -187,10 +183,12 @@ impl TableFunction for Filldown {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::ArrayRef;
+    use arrow::array::{ArrayRef, UnionArray};
     use arrow::array::{Int32Array, StringArray};
+    use arrow::buffer::ScalarBuffer;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use arrow_schema::{UnionFields, UnionMode};
     use rust_tvtf_api::TableFunction;
     use std::sync::Arc;
 
@@ -218,7 +216,7 @@ mod tests {
 
         // create Filldown table function
         let params = Args::from(vec![Arg::String("".to_string())]);
-        let mut filldown = super::Filldown::new(Some(params)).expect("Failed to create Filldown");
+        let mut filldown = Filldown::new(Some(params)).expect("Failed to create Filldown");
         // process input batch
         let output_batch = filldown
             .process(input_batch)
@@ -274,7 +272,7 @@ mod tests {
 
         // create Filldown table function
         let params = Args::from(vec![Arg::String("city".to_string())]);
-        let mut filldown = super::Filldown::new(Some(params)).expect("Failed to create Filldown");
+        let mut filldown = Filldown::new(Some(params)).expect("Failed to create Filldown");
         // process input batch
         let output_batch = filldown
             .process(input_batch)
@@ -331,7 +329,7 @@ mod tests {
 
         // create Filldown table function
         let params = Args::from(vec![Arg::String("c*".to_string())]);
-        let mut filldown = super::Filldown::new(Some(params)).expect("Failed to create Filldown");
+        let mut filldown = Filldown::new(Some(params)).expect("Failed to create Filldown");
         // process input batch
         let output_batch = filldown
             .process(input_batch)
@@ -379,7 +377,7 @@ mod tests {
 
         // create Filldown table function
         let params = Args::from(vec![Arg::String("".to_string())]);
-        let mut filldown = super::Filldown::new(Some(params)).expect("Failed to create Filldown");
+        let mut filldown = Filldown::new(Some(params)).expect("Failed to create Filldown");
 
         // process first input batch
         let output_batch1 = filldown
@@ -412,6 +410,77 @@ mod tests {
         assert_eq!(
             output_batch2.column(1).as_ref(),
             expected_name_array2.as_ref()
+        );
+    }
+
+    #[test]
+    fn test_filldown_union() {
+        // 1. Define child arrays
+        let null_child = Arc::new(arrow::array::new_null_array(&DataType::Null, 3)) as ArrayRef;
+        let int_child = Arc::new(Int32Array::from(vec![Some(1), Some(3)])) as ArrayRef;
+        let string_child = Arc::new(StringArray::from(vec![Some("a"), Some("c")])) as ArrayRef;
+
+        // 2. Define UnionFields
+        let union_fields = UnionFields::new(
+            vec![0, 1, 2],
+            vec![
+                Field::new("0", DataType::Null, true),
+                Field::new("int", DataType::Int32, true),
+                Field::new("string", DataType::Utf8, true),
+            ],
+        );
+
+        // 3. Create UnionArray
+        // Logical view: [1, null, "a", 3, null, "c", null]
+        let type_ids = ScalarBuffer::from(vec![1, 0, 2, 1, 0, 2, 0]);
+        let value_offsets = ScalarBuffer::from(vec![0, 0, 0, 1, 0, 1, 1]);
+
+        let children = vec![null_child.clone(), int_child.clone(), string_child.clone()];
+
+        let union_array = UnionArray::try_new(
+            union_fields.clone(),
+            type_ids,
+            Some(value_offsets),
+            children,
+        )
+        .expect("Failed to construct UnionArray for test");
+
+        let union_array_ref = Arc::new(union_array) as ArrayRef;
+
+        // 4. Create RecordBatch
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "union_col",
+            DataType::Union(union_fields.clone(), UnionMode::Dense),
+            true,
+        )]));
+        let input_batch = RecordBatch::try_new(schema, vec![union_array_ref]).unwrap();
+
+        // 5. Create and run Filldown
+        let params = Args::from(vec![Arg::String("".to_string())]);
+        let mut filldown = Filldown::new(Some(params)).expect("Failed to create Filldown");
+        let output_batch = filldown
+            .process(input_batch)
+            .expect("Failed to process batch")
+            .expect("No output batch");
+
+        // 6. Verify output
+        // Expected logical view: [1, 1, "a", 3, 3, "c", "c"]
+        let expected_type_ids = ScalarBuffer::from(vec![1, 1, 2, 1, 1, 2, 2]);
+        let expected_value_offsets = ScalarBuffer::from(vec![0, 0, 0, 1, 1, 1, 1]);
+
+        let expected_children = vec![null_child, int_child, string_child];
+
+        let expected_union_array = UnionArray::try_new(
+            union_fields.clone(),
+            expected_type_ids,
+            Some(expected_value_offsets),
+            expected_children,
+        )
+        .expect("Failed to construct UnionArray for test");
+
+        assert_eq!(
+            output_batch.column(0).as_ref(),
+            &expected_union_array as &dyn Array
         );
     }
 }
