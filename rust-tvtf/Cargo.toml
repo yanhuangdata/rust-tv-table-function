@@ -1,6 +1,6 @@
 [package]
 name = "rust-tvtf"
-version = "0.2.34"
+version = "0.2.35"
 edition = "2024"
 
 [lib]
@@ -31,7 +31,7 @@ zngur = { workspace = true }
 [dev-dependencies]
 csv.workspace = true
 tempfile = { workspace = true }
-criterion = "0.7"
+criterion = "0.8"
 
 [[bench]]
 name = "trans_bench"
