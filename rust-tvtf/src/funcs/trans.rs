@@ -24,6 +24,8 @@ const FIELD_MESSAGE: &str = "_message";
 const FIELD_DURATION: &str = "_duration";
 const FIELD_EVENT_COUNT: &str = "_event_count";
 const FIELD_IS_CLOSED: &str = "_is_closed";
+const FIELD_STARTS_WITH_FLAG: &str = "$transaction_starts_with$";
+const FIELD_ENDS_WITH_FLAG: &str = "$transaction_ends_with$";
 
 pub type EventFieldValues = SmallVec<[Arc<str>; 4]>;
 pub type EventMap = HashMap<String, EventFieldValues>;
@@ -31,6 +33,11 @@ pub type EventMap = HashMap<String, EventFieldValues>;
 #[inline]
 fn string_to_arc(s: String) -> Arc<str> {
     Arc::<str>::from(s.into_boxed_str())
+}
+
+#[inline]
+fn is_internal_marker_field(name: &str) -> bool {
+    matches!(name, FIELD_STARTS_WITH_FLAG | FIELD_ENDS_WITH_FLAG)
 }
 
 fn build_key_index_map(
@@ -337,6 +344,7 @@ impl Transaction {
             match k.as_str() {
                 FIELD_TIME | FIELD_MESSAGE | FIELD_DURATION | FIELD_EVENT_COUNT
                 | FIELD_IS_CLOSED => continue,
+                _ if is_internal_marker_field(k) => continue,
                 _ => {}
             }
             if let Some(&idx) = self.key_index_map.get(k) {
@@ -525,6 +533,9 @@ fn to_record_batch(
     }
     for transaction in transactions {
         for field_name in transaction.extra_fields.keys() {
+            if is_internal_marker_field(field_name) {
+                continue;
+            }
             all_field_names.insert(field_name.clone());
         }
     }
