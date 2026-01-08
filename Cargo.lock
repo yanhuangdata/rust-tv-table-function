@@ -1103,6 +1103,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "predict"
+version = "0.1.0"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1226,6 +1230,7 @@ dependencies = [
  "csv",
  "hashbrown 0.15.5",
  "parking_lot",
+ "predict",
  "regex",
  "rust-tvtf-api",
  "serde",

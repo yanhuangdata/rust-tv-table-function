@@ -8,6 +8,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rust-tvtf-api = { path = "../rust-tvtf-api" }
+predict = { path = "../lib/predict" }
 
 arrow = { workspace = true }
 arrow-csv = { workspace = true }
