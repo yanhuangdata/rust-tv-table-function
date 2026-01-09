@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["rust-tvtf-api", "rust-tvtf", "rust-tvtf-example"]
+members = ["rust-tvtf-api", "rust-tvtf", "rust-tvtf-example", "lib/predict"]
 
 [workspace.dependencies]
 arrow = { version = "=55.2.0", features = ["chrono-tz", "ffi"] }

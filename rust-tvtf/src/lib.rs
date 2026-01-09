@@ -89,6 +89,35 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
             )
             .build()
             .context("create `filldown` registry failed")?,
+        FunctionRegistry::builder()
+            .name("predict")
+            .init(Arc::new(|ctx| {
+                Predict::new(ctx.arguments, ctx.named_arguments)
+                    .map(|f| Box::new(f) as Box<dyn TableFunction>)
+            }))
+            .require_ordered(true)
+            .signature(
+                Signature::builder()
+                    .parameter(ArgType::String) // field name(s)
+                    .parameter((Some("algorithm"), ArgType::String, Some("LLP5")))
+                    .parameter((Some("period"), ArgType::Int, None::<i64>))
+                    .parameter((Some("future_timespan"), ArgType::Int, Some(10)))
+                    .parameter((Some("holdback"), ArgType::Int, Some(0)))
+                    .parameter((Some("upper90"), ArgType::Float, None::<f64>))
+                    .parameter((Some("upper95"), ArgType::Float, None::<f64>))
+                    .parameter((Some("upper97"), ArgType::Float, None::<f64>))
+                    .parameter((Some("upper99"), ArgType::Float, None::<f64>))
+                    .parameter((Some("lower90"), ArgType::Float, None::<f64>))
+                    .parameter((Some("lower95"), ArgType::Float, None::<f64>))
+                    .parameter((Some("lower97"), ArgType::Float, None::<f64>))
+                    .parameter((Some("lower99"), ArgType::Float, None::<f64>))
+                    .parameter((Some("correlate"), ArgType::String, None::<String>))
+                    .parameter((Some("alias"), ArgType::String, None::<String>))
+                    .build()
+                    .context("Failed to build signature parameters")?,
+            )
+            .build()
+            .context("create `predict` registry failed")?,
     ])
 }
 
