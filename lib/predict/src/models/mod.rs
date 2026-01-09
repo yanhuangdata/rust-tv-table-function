@@ -1,6 +1,8 @@
 //! State space models module
-//! 
+//!
 //! Provides implementations of univariate and multivariate state space models
+
+use anyhow::Error;
 
 pub mod univariate;
 pub mod multivariate;
@@ -30,9 +32,10 @@ pub trait MultivarModel {
     fn datalen(&self) -> usize;
     fn least_num_data(&self) -> usize;
     fn first_forecast_index(&self) -> usize;
-    fn predict(&mut self, predict_var: usize, start: usize) {
+    fn predict(&mut self, predict_var: usize, start: usize) -> Result<(), Error> {
         // Default empty implementation, some models can override
         let _ = (predict_var, start);
+        Ok(())
     }
 }
 

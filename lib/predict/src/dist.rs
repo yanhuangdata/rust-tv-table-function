@@ -1,8 +1,9 @@
 //! Statistical distributions module
-//! 
+//!
 //! Implements Gamma distribution, Chi-square distribution, F distribution and other statistical distributions
 
 use std::f64;
+use anyhow::{Error, bail};
 
 /// Machine precision
 const EPS: f64 = 2.22045e-16;
@@ -75,9 +76,13 @@ const GAULEG_W: [f64; 18] = [
 ];
 
 /// Calculate ln(Gamma(x))
-pub fn gammln(xx: f64) -> f64 {
+/// 
+/// # Errors
+/// 
+/// Returns an error if x is not positive.
+pub fn gammln(xx: f64) -> Result<f64, Error> {
     if xx <= 0.0 {
-        panic!("gammln: argument must be positive");
+        bail!("Gamma distribution error: argument must be positive, got {}", xx);
     }
     
     let mut y = xx;
@@ -91,46 +96,54 @@ pub fn gammln(xx: f64) -> f64 {
         ser += GAMMA_COF[j] / y;
     }
     
-    tmp + (2.5066282746310005 * ser / x).ln()
+    Ok(tmp + (2.5066282746310005 * ser / x).ln())
 }
 
 /// Incomplete Gamma function P(a, x)
-pub fn gammp(a: f64, x: f64) -> f64 {
+/// 
+/// # Errors
+/// 
+/// Returns an error if a <= 0 or x < 0.
+pub fn gammp(a: f64, x: f64) -> Result<f64, Error> {
     if x < 0.0 || a <= 0.0 {
-        panic!("gammp: invalid arguments");
+        bail!("Gamma distribution error: invalid arguments: a={}, x={} (a must be > 0 and x >= 0)", a, x);
     }
     if x == 0.0 {
-        return 0.0;
+        return Ok(0.0);
     }
     if a >= ASWITCH {
-        return gammpapprox(a, x, 1);
+        Ok(gammpapprox(a, x, 1)?)
     } else if x < a + 1.0 {
-        return gser(a, x);
+        Ok(gser(a, x)?)
     } else {
-        return 1.0 - gcf(a, x);
+        Ok(1.0 - gcf(a, x)?)
     }
 }
 
 /// Incomplete Gamma function Q(a, x) = 1 - P(a, x)
-pub fn gammq(a: f64, x: f64) -> f64 {
+/// 
+/// # Errors
+/// 
+/// Returns an error if a <= 0 or x < 0.
+pub fn gammq(a: f64, x: f64) -> Result<f64, Error> {
     if x < 0.0 || a <= 0.0 {
-        panic!("gammq: invalid arguments");
+        bail!("Gamma distribution error: invalid arguments: a={}, x={} (a must be > 0 and x >= 0)", a, x);
     }
     if x == 0.0 {
-        return 1.0;
+        return Ok(1.0);
     }
     if a >= ASWITCH {
-        return gammpapprox(a, x, 0);
+        Ok(gammpapprox(a, x, 0)?)
     } else if x < a + 1.0 {
-        return 1.0 - gser(a, x);
+        Ok(1.0 - gser(a, x)?)
     } else {
-        return gcf(a, x);
+        Ok(gcf(a, x)?)
     }
 }
 
 /// Gamma function series expansion
-fn gser(a: f64, x: f64) -> f64 {
-    let gln = gammln(a);
+fn gser(a: f64, x: f64) -> Result<f64, Error> {
+    let gln = gammln(a)?;
     let mut ap = a;
     let mut delta = 1.0 / a;
     let mut sum = delta;
@@ -140,19 +153,20 @@ fn gser(a: f64, x: f64) -> f64 {
         delta *= x / ap;
         sum += delta;
         if delta.abs() < sum.abs() * EPS {
-            return sum * (-x + a * x.ln() - gln).exp();
+            return Ok(sum * (-x + a * x.ln() - gln).exp());
         }
     }
 }
 
 /// Gamma function continued fraction
-fn gcf(a: f64, x: f64) -> f64 {
-    let gln = gammln(a);
+fn gcf(a: f64, x: f64) -> Result<f64, Error> {
+    let gln = gammln(a)?;
     let mut b = x + 1.0 - a;
     let mut c = 1.0 / FPMIN;
     let mut d = 1.0 / b;
     let mut h = d;
-    let mut i = 1;
+    let mut i: i32 = 1;
+    const MAX_ITER: i32 = 10000;
     
     loop {
         let an = -(i as f64) * ((i as f64) - a);
@@ -172,17 +186,21 @@ fn gcf(a: f64, x: f64) -> f64 {
             break;
         }
         i += 1;
+        if i > MAX_ITER {
+            // If we haven't converged, return an error
+            bail!("Gamma function continued fraction did not converge after {} iterations", MAX_ITER);
+        }
     }
     
-    (-x + a * x.ln() - gln).exp() * h
+    Ok((-x + a * x.ln() - gln).exp() * h)
 }
 
 /// Gamma function approximation
-fn gammpapprox(a: f64, x: f64, psig: i32) -> f64 {
+fn gammpapprox(a: f64, x: f64, psig: i32) -> Result<f64, Error> {
     let a1 = a - 1.0;
     let lna1 = a1.ln();
     let sqrta1 = a1.sqrt();
-    let gln = gammln(a);
+    let gln = gammln(a)?;
     
     let xu = if x > a1 {
         (a1 + 11.5 * sqrta1).max(x + 6.0 * sqrta1)
@@ -200,15 +218,15 @@ fn gammpapprox(a: f64, x: f64, psig: i32) -> f64 {
     
     if psig == 1 {
         if ans > 0.0 {
-            1.0 - ans
+            Ok(1.0 - ans)
         } else {
-            -ans
+            Ok(-ans)
         }
     } else {
         if ans >= 0.0 {
-            ans
+            Ok(ans)
         } else {
-            1.0 + ans
+            Ok(1.0 + ans)
         }
     }
 }
@@ -220,53 +238,79 @@ pub struct Chisqdist {
 }
 
 impl Chisqdist {
-    pub fn new(nnu: f64) -> Self {
+    /// Create a new Chi-square distribution
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if degrees of freedom is not positive.
+    pub fn new(nnu: f64) -> Result<Self, Error> {
         if nnu <= 0.0 {
-            panic!("Chisqdist: degrees of freedom must be positive");
+            bail!("Chi-square distribution error: degrees of freedom must be positive, got {}", nnu)
         }
-        let fac = 0.693147180559945309 * (0.5 * nnu) + gammln(0.5 * nnu);
-        Self { nu: nnu, fac }
+        let fac = 0.693147180559945309 * (0.5 * nnu) + gammln(0.5 * nnu)?;
+        Ok(Self { nu: nnu, fac })
+    }
+    
+    /// Create a new Chi-square distribution (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if degrees of freedom is not positive.
+    pub fn new_or_panic(nnu: f64) -> Self {
+        Self::new(nnu).expect("Failed to create Chi-square distribution")
     }
 
     /// Probability density function
-    pub fn pdf(&self, x2: f64) -> f64 {
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if x2 is not positive.
+    pub fn pdf(&self, x2: f64) -> Result<f64, Error> {
         if x2 <= 0.0 {
-            panic!("Chisqdist::pdf: argument must be positive");
+            bail!("Chi-square distribution error: argument must be positive, got {}", x2)
         }
-        (-0.5 * (x2 - (self.nu - 2.0) * x2.ln()) - self.fac).exp()
+        Ok((-0.5 * (x2 - (self.nu - 2.0) * x2.ln()) - self.fac).exp())
     }
 
     /// Cumulative distribution function
-    pub fn cdf(&self, x2: f64) -> f64 {
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if x2 is negative.
+    pub fn cdf(&self, x2: f64) -> Result<f64, Error> {
         if x2 < 0.0 {
-            panic!("Chisqdist::cdf: argument must be non-negative");
+            bail!("Chi-square distribution error: argument must be non-negative, got {}", x2)
         }
         gammp(0.5 * self.nu, 0.5 * x2)
     }
 
     /// Inverse cumulative distribution function
-    pub fn invcdf(&self, p: f64) -> f64 {
-        if p < 0.0 || p >= 1.0 {
-            panic!("Chisqdist::invcdf: probability must be in [0, 1)");
-        }
-        2.0 * invgammp(p, 0.5 * self.nu)
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if p is not in [0, 1).
+    pub fn invcdf(&self, p: f64) -> Result<f64, Error> {
+    if p < 0.0 || p >= 1.0 {
+            bail!("Chi-square distribution error: probability must be in [0, 1), got {}", p)
     }
+    Ok(2.0 * invgammp(p, 0.5 * self.nu)?)
+}
 }
 
 /// Inverse incomplete Gamma function
-fn invgammp(p: f64, a: f64) -> f64 {
+fn invgammp(p: f64, a: f64) -> Result<f64, Error> {
     let a1 = a - 1.0;
     let eps = 1e-8;
-    let gln = gammln(a);
+    let gln = gammln(a)?;
     
     if a <= 0.0 {
-        panic!("invgammp: a must be positive");
+            bail!("Gamma distribution error: a must be positive for inverse Gamma, got {}", a)
     }
     if p >= 1.0 {
-        return (100.0f64).max(a + 100.0 * a.sqrt());
+        return Ok((100.0f64).max(a + 100.0 * a.sqrt()));
     }
     if p <= 0.0 {
-        return 0.0;
+        return Ok(0.0);
     }
     
     let (mut x, afac, lna1_opt) = if a > 1.0 {
@@ -292,9 +336,9 @@ fn invgammp(p: f64, a: f64) -> f64 {
     
     for _j in 0..12 {
         if x <= 0.0 {
-            return 0.0;
+            return Ok(0.0);
         }
-        let err = gammp(a, x) - p;
+        let err = gammp(a, x)? - p;
         let t = if a > 1.0 {
             let lna1 = lna1_opt.unwrap();
             afac * (-(x - a1) + a1 * (x.ln() - lna1)).exp()
@@ -312,7 +356,7 @@ fn invgammp(p: f64, a: f64) -> f64 {
         }
     }
     
-    x
+    Ok(x)
 }
 
 /// F distribution
@@ -323,33 +367,55 @@ pub struct Fdist {
 }
 
 impl Fdist {
-    pub fn new(nnu1: f64, nnu2: f64) -> Self {
+    /// Create a new F distribution
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if either degrees of freedom is not positive.
+    pub fn new(nnu1: f64, nnu2: f64) -> Result<Self, Error> {
         if nnu1 <= 0.0 || nnu2 <= 0.0 {
-            panic!("Fdist: degrees of freedom must be positive");
+            bail!("F distribution error: degrees of freedom must be positive, got nu1={}, nu2={}", nnu1, nnu2)
         }
         let nu1 = nnu1;
         let nu2 = nnu2;
         let fac = 0.5 * (nu1 * nu1.ln() + nu2 * nu2.ln())
-            + gammln(0.5 * (nu1 + nu2))
-            - gammln(0.5 * nu1)
-            - gammln(0.5 * nu2);
-        Self { nu1, nu2, fac }
+            + gammln(0.5 * (nu1 + nu2))?
+            - gammln(0.5 * nu1)?
+            - gammln(0.5 * nu2)?;
+        Ok(Self { nu1, nu2, fac })
+    }
+    
+    /// Create a new F distribution (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if either degrees of freedom is not positive.
+    pub fn new_or_panic(nnu1: f64, nnu2: f64) -> Self {
+        Self::new(nnu1, nnu2).expect("Failed to create F distribution")
     }
 
     /// Probability density function
-    pub fn pdf(&self, f: f64) -> f64 {
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if f is not positive.
+    pub fn pdf(&self, f: f64) -> Result<f64, Error> {
         if f <= 0.0 {
-            panic!("Fdist::pdf: argument must be positive");
+            bail!("F distribution error: argument must be positive, got {}", f)
         }
         let nu1 = self.nu1;
         let nu2 = self.nu2;
-        ((0.5 * nu1 - 1.0) * f.ln() - 0.5 * (nu1 + nu2) * (nu2 + nu1 * f).ln() + self.fac).exp()
+        Ok(((0.5 * nu1 - 1.0) * f.ln() - 0.5 * (nu1 + nu2) * (nu2 + nu1 * f).ln() + self.fac).exp())
     }
 
     /// Cumulative distribution function
-    pub fn cdf(&self, f: f64) -> f64 {
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if f is negative.
+    pub fn cdf(&self, f: f64) -> Result<f64, Error> {
         if f < 0.0 {
-            panic!("Fdist::cdf: argument must be non-negative");
+            bail!("F distribution error: argument must be non-negative, got {}", f)
         }
         let nu1 = self.nu1;
         let nu2 = self.nu2;
@@ -357,39 +423,47 @@ impl Fdist {
     }
 
     /// Inverse cumulative distribution function
-    pub fn invcdf(&self, p: f64) -> f64 {
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if p is not in (0, 1).
+    pub fn invcdf(&self, p: f64) -> Result<f64, Error> {
         if p <= 0.0 || p >= 1.0 {
-            panic!("Fdist::invcdf: probability must be in (0, 1)");
+            bail!("F distribution error: probability must be in (0, 1), got {}", p)
         }
         let nu1 = self.nu1;
         let nu2 = self.nu2;
-        let x = invbetai(p, 0.5 * nu1, 0.5 * nu2);
-        nu2 * x / (nu1 * (1.0 - x))
+        let x = invbetai(p, 0.5 * nu1, 0.5 * nu2)?;
+        Ok(nu2 * x / (nu1 * (1.0 - x)))
     }
 }
 
 /// Incomplete Beta function
-fn betai(a: f64, b: f64, x: f64) -> f64 {
+/// 
+/// # Errors
+/// 
+/// Returns an error if a <= 0, b <= 0, or x not in [0, 1].
+fn betai(a: f64, b: f64, x: f64) -> Result<f64, Error> {
     if a <= 0.0 || b <= 0.0 {
-        panic!("betai: parameters must be positive");
+            bail!("Beta distribution error: parameters must be positive, got a={}, b={}", a, b)
     }
     if x < 0.0 || x > 1.0 {
-        panic!("betai: x must be in [0, 1]");
+            bail!("Beta distribution error: x must be in [0, 1], got {}", x)
     }
     if x == 0.0 || x == 1.0 {
-        return x;
+        return Ok(x);
     }
     
     const SWITCH: f64 = 3000.0;
     if a > SWITCH && b > SWITCH {
-        return betaiapprox(a, b, x);
+        return Ok(betaiapprox(a, b, x)?);
     }
     
-    let bt = (gammln(a + b) - gammln(a) - gammln(b) + a * x.ln() + b * (1.0 - x).ln()).exp();
+    let bt = (gammln(a + b)? - gammln(a)? - gammln(b)? + a * x.ln() + b * (1.0 - x).ln()).exp();
     if x < (a + 1.0) / (a + b + 2.0) {
-        bt * betacf(a, b, x) / a
+        Ok(bt * betacf(a, b, x) / a)
     } else {
-        1.0 - bt * betacf(b, a, 1.0 - x) / b
+        Ok(1.0 - bt * betacf(b, a, 1.0 - x) / b)
     }
 }
 
@@ -440,7 +514,7 @@ fn betacf(a: f64, b: f64, x: f64) -> f64 {
 }
 
 /// Beta function approximation
-fn betaiapprox(a: f64, b: f64, x: f64) -> f64 {
+fn betaiapprox(a: f64, b: f64, x: f64) -> Result<f64, Error> {
     let a1 = a - 1.0;
     let b1 = b - 1.0;
     let mu = a / (a + b);
@@ -450,12 +524,12 @@ fn betaiapprox(a: f64, b: f64, x: f64) -> f64 {
     
     let xu = if x > a / (a + b) {
         if x >= 1.0 {
-            return 1.0;
+            return Ok(1.0);
         }
         (1.0f64).min((mu + 10.0 * t).max(x + 5.0 * t))
     } else {
         if x <= 0.0 {
-            return 0.0;
+            return Ok(0.0);
         }
         (0.0f64).max((mu - 10.0 * t).min(x - 5.0 * t))
     };
@@ -466,26 +540,33 @@ fn betaiapprox(a: f64, b: f64, x: f64) -> f64 {
         sum += GAULEG_W[j] * (a1 * (t.ln() - lnmu) + b1 * ((1.0 - t).ln() - lnmuc)).exp();
     }
     
+    let gln_a = gammln(a)?;
+    let gln_b = gammln(b)?;
+    let gln_ab = gammln(a + b)?;
     let ans = sum * (xu - x)
-        * (a1 * lnmu - gammln(a) + b1 * lnmuc - gammln(b) + gammln(a + b)).exp();
+        * (a1 * lnmu - gln_a + b1 * lnmuc - gln_b + gln_ab).exp();
     
     if ans > 0.0 {
-        1.0 - ans
+        Ok(1.0 - ans)
     } else {
-        -ans
+        Ok(-ans)
     }
 }
 
 /// Inverse incomplete Beta function
-fn invbetai(p: f64, a: f64, b: f64) -> f64 {
+/// 
+/// # Errors
+/// 
+/// Returns an error if the computation fails to converge.
+fn invbetai(p: f64, a: f64, b: f64) -> Result<f64, Error> {
     let a1 = a - 1.0;
     let b1 = b - 1.0;
     
     if p <= 0.0 {
-        return 0.0;
+        return Ok(0.0);
     }
     if p >= 1.0 {
-        return 1.0;
+        return Ok(1.0);
     }
     
     let mut x = if a >= 1.0 && b >= 1.0 {
@@ -513,13 +594,13 @@ fn invbetai(p: f64, a: f64, b: f64) -> f64 {
         }
     };
     
-    let afac = -gammln(a) - gammln(b) + gammln(a + b);
+    let afac = -gammln(a)? - gammln(b)? + gammln(a + b)?;
     
-    for _j in 0..10 {
+    for j in 0..10 {
         if x == 0.0 || x == 1.0 {
-            return x;
+            return Ok(x);
         }
-        let err = betai(a, b, x) - p;
+        let err = betai(a, b, x)? - p;
         let t = (a1 * x.ln() + b1 * (1.0 - x).ln() + afac).exp();
         let u = err / t;
         let t = u / (1.0 - 0.5 * (1.0f64).min(u * (a1 / x - b1 / (1.0 - x))));
@@ -530,12 +611,12 @@ fn invbetai(p: f64, a: f64, b: f64) -> f64 {
         if x >= 1.0 {
             x = 0.5 * (x + t + 1.0);
         }
-        if t.abs() < EPS * x && _j > 0 {
+        if t.abs() < EPS * x && j > 0 {
             break;
         }
     }
     
-    x
+    Ok(x)
 }
 
 /// Error function class
@@ -681,15 +762,29 @@ pub struct Normaldist {
 }
 
 impl Normaldist {
-    pub fn new(mmu: f64, ssig: f64) -> Self {
+    /// Create a new Normal distribution
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if sigma is not positive.
+    pub fn new(mmu: f64, ssig: f64) -> Result<Self, Error> {
         if ssig <= 0.0 {
-            panic!("Normaldist: sigma must be positive");
+            bail!("Normal distribution error: sigma must be positive, got {}", ssig)
         }
-        Self {
+        Ok(Self {
             mu: mmu,
             sig: ssig,
             erf: Erf::new(),
-        }
+        })
+    }
+    
+    /// Create a new Normal distribution (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if sigma is not positive.
+    pub fn new_or_panic(mmu: f64, ssig: f64) -> Self {
+        Self::new(mmu, ssig).expect("Failed to create Normal distribution")
     }
 
     /// Probability density function
@@ -707,25 +802,29 @@ impl Normaldist {
     }
 
     /// Inverse cumulative distribution function
-    pub fn invcdf(&self, p: f64) -> f64 {
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if p is not in (0, 1).
+    pub fn invcdf(&self, p: f64) -> Result<f64, Error> {
         if p <= 0.0 || p >= 1.0 {
-            panic!("Normaldist::invcdf: probability must be in (0, 1)");
+            bail!("Normal distribution error: probability must be in (0, 1), got {}", p)
         }
         let mu = self.mu;
         let sig = self.sig;
-        -1.41421356237309505 * sig * self.erf.inverfc(2.0 * p) + mu
+        Ok(-1.41421356237309505 * sig * self.erf.inverfc(2.0 * p) + mu)
     }
 }
 
 impl Default for Normaldist {
     fn default() -> Self {
-        Self::new(0.0, 1.0)
+        Self::new_or_panic(0.0, 1.0)
     }
 }
 
 /// Normality critical value
 pub fn normality_critical_val() -> f64 {
-    Chisqdist::new(2.0).invcdf(0.95)
+    Chisqdist::new(2.0).expect("Failed to create Chi-square distribution").invcdf(0.95).expect("Failed to compute inverse CDF")
 }
 
 #[cfg(test)]
@@ -736,51 +835,51 @@ mod tests {
     fn test_gammln() {
         // Test some known values
         // Gamma(1) = 1, ln(Gamma(1)) = 0
-        assert!((gammln(1.0) - 0.0).abs() < 1e-10);
+        assert!((gammln(1.0).expect("gammln(1.0) failed") - 0.0).abs() < 1e-10);
         // Gamma(2) = 1, ln(Gamma(2)) = 0
-        assert!((gammln(2.0) - 0.0).abs() < 1e-10);
+        assert!((gammln(2.0).expect("gammln(2.0) failed") - 0.0).abs() < 1e-10);
         // Gamma(3) = 2, ln(Gamma(3)) = ln(2)
-        assert!((gammln(3.0) - 2.0f64.ln()).abs() < 1e-10);
+        assert!((gammln(3.0).expect("gammln(3.0) failed") - 2.0f64.ln()).abs() < 1e-10);
     }
 
     #[test]
     fn test_gammp() {
         // gammp(1, 0) = 0
-        assert!((gammp(1.0, 0.0) - 0.0).abs() < 1e-10);
+        assert!((gammp(1.0, 0.0).expect("gammp(1, 0) failed") - 0.0).abs() < 1e-10);
         // gammp(1, inf) = 1 (approximately)
-        assert!((gammp(1.0, 100.0) - 1.0).abs() < 0.01);
+        assert!((gammp(1.0, 100.0).expect("gammp(1, 100) failed") - 1.0).abs() < 0.01);
     }
 
     #[test]
     fn test_chisqdist() {
-        let chi2 = Chisqdist::new(2.0);
+        let chi2 = Chisqdist::new(2.0).expect("Failed to create Chisqdist");
         // Chi-square distribution critical value
-        let crit = chi2.invcdf(0.95);
+        let crit = chi2.invcdf(0.95).expect("invcdf failed");
         assert!(crit > 0.0);
         assert!(crit < 10.0);
         
         // CDF should be monotonically increasing
-        assert!(chi2.cdf(1.0) < chi2.cdf(2.0));
+        assert!(chi2.cdf(1.0).expect("cdf failed") < chi2.cdf(2.0).expect("cdf failed"));
     }
 
     #[test]
     fn test_fdist() {
-        let f = Fdist::new(2.0, 2.0);
+        let f = Fdist::new(2.0, 2.0).expect("Failed to create Fdist");
         // F distribution CDF should be in [0, 1]
-        assert!(f.cdf(1.0) > 0.0);
-        assert!(f.cdf(1.0) < 1.0);
+        assert!(f.cdf(1.0).expect("cdf failed") > 0.0);
+        assert!(f.cdf(1.0).expect("cdf failed") < 1.0);
     }
 
     #[test]
     fn test_gammq() {
         // gammq(1, 0) = 1
-        assert!((gammq(1.0, 0.0) - 1.0).abs() < 1e-10);
+        assert!((gammq(1.0, 0.0).expect("gammq(1, 0) failed") - 1.0).abs() < 1e-10);
         // gammq(1, inf) = 0 (approximately)
-        assert!(gammq(1.0, 100.0) < 0.01);
+        assert!(gammq(1.0, 100.0).expect("gammq(1, 100) failed") < 0.01);
         // gammp + gammq = 1
         let a = 2.0;
         let x = 1.5;
-        assert!((gammp(a, x) + gammq(a, x) - 1.0).abs() < 1e-10);
+        assert!((gammp(a, x).expect("gammp failed") + gammq(a, x).expect("gammq failed") - 1.0).abs() < 1e-10);
     }
 
     #[test]
@@ -799,7 +898,7 @@ mod tests {
 
     #[test]
     fn test_normaldist() {
-        let norm = Normaldist::new(0.0, 1.0);
+        let norm = Normaldist::new(0.0, 1.0).expect("Failed to create Normaldist");
         // Standard normal distribution CDF(0) = 0.5
         assert!((norm.cdf(0.0) - 0.5).abs() < 1e-10);
         // PDF should be non-negative
@@ -808,7 +907,7 @@ mod tests {
         // CDF should be monotonically increasing
         assert!(norm.cdf(0.0) < norm.cdf(1.0));
         // invcdf(0.5) ≈ 0
-        assert!(norm.invcdf(0.5).abs() < 0.1);
+        assert!((norm.invcdf(0.5).expect("invcdf failed")).abs() < 0.1);
     }
 
     #[test]

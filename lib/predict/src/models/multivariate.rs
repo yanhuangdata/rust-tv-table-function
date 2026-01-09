@@ -1,10 +1,11 @@
 //! Multivariate state space models module
-//! 
+//!
 //! Implements various multivariate time series state space models
 
 use crate::optimize::{dfpmin, DFP_TOLERANCE};
 use crate::utils::MAX_LAG;
 use crate::models::MultivarModel;
+use anyhow::{Error, bail};
 use std::f64;
 
 /// Bivariate Local Level model (BiLL)
@@ -21,9 +22,14 @@ pub struct BiLL {
 impl BiLL {
     const EPS: f64 = 1e-12;
     
-    pub fn new(data: Vec<Vec<f64>>, data_len: usize, forecast_len: usize) -> Self {
+    /// Create a new BiLL (Bivariate Local Level) model
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if the data is empty.
+    pub fn new(data: Vec<Vec<f64>>, data_len: usize, forecast_len: usize) -> Result<Self, Error> {
         if data.is_empty() {
-            panic!("BiLL::new: data is empty");
+            bail!("Invalid data: BiLL model requires non-empty data")
         }
         let mut bill = Self {
             data: data.clone(),
@@ -59,13 +65,23 @@ impl BiLL {
                 }
             }
         }
-        bill
+        Ok(bill)
+    }
+    
+    /// Create a new BiLL model (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if the data is empty.
+    pub fn new_or_panic(data: Vec<Vec<f64>>, data_len: usize, forecast_len: usize) -> Self {
+        Self::new(data, data_len, forecast_len)
+            .expect("Failed to create BiLL model: data is empty")
     }
     
     pub fn instance(var1: &[f64], var2: &[f64], forecast_len: usize) -> Self {
         let data = vec![var1.to_vec(), var2.to_vec()];
         let data_len = var1.len().min(var2.len());
-        Self::new(data, data_len, forecast_len)
+        Self::new(data, data_len, forecast_len).expect("Failed to create BiLL model")
     }
     
     pub fn least_num_data() -> usize {
@@ -260,8 +276,9 @@ impl MultivarModel for BiLL {
         Self::first_forecast_index()
     }
     
-    fn predict(&mut self, _predict_var: usize, _start: usize) {
+    fn predict(&mut self, _predict_var: usize, _start: usize) -> Result<(), Error> {
         // BiLL does not support predict method
+        Ok(())
     }
 }
 
@@ -277,9 +294,14 @@ pub struct BiLLmv {
 }
 
 impl BiLLmv {
-    pub fn new(data: Vec<Vec<Option<f64>>>, data_len: usize, forecast_len: usize) -> Self {
+    /// Create a new BiLLmv (BiLL with missing values) model
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if the data is empty.
+    pub fn new(data: Vec<Vec<Option<f64>>>, data_len: usize, forecast_len: usize) -> Result<Self, Error> {
         if data.is_empty() {
-            panic!("BiLLmv::new: data is empty");
+            bail!("Invalid data: BiLLmv model requires non-empty data")
         }
         let mut billmv = Self {
             data: data.clone(),
@@ -335,13 +357,23 @@ impl BiLLmv {
                 }
             }
         }
-        billmv
+        Ok(billmv)
+    }
+    
+    /// Create a new BiLLmv model (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if the data is empty.
+    pub fn new_or_panic(data: Vec<Vec<Option<f64>>>, data_len: usize, forecast_len: usize) -> Self {
+        Self::new(data, data_len, forecast_len)
+            .expect("Failed to create BiLLmv model: data is empty")
     }
     
     pub fn instance(var1: &[Option<f64>], var2: &[Option<f64>], forecast_len: usize) -> Self {
         let data = vec![var1.to_vec(), var2.to_vec()];
         let data_len = var1.len().min(var2.len());
-        Self::new(data, data_len, forecast_len)
+        Self::new(data, data_len, forecast_len).expect("Failed to create BiLLmv model")
     }
     
     pub fn least_num_data() -> usize {
@@ -519,8 +551,9 @@ impl MultivarModel for BiLLmv {
         Self::first_forecast_index()
     }
     
-    fn predict(&mut self, _predict_var: usize, _start: usize) {
+    fn predict(&mut self, _predict_var: usize, _start: usize) -> Result<(), Error> {
         // BiLLmv does not support predict method
+        Ok(())
     }
 }
 
@@ -538,9 +571,14 @@ pub struct BiLLmv2 {
 impl BiLLmv2 {
     const EPS: f64 = 1e-12;
     
-    pub fn new(data: Vec<Vec<Option<f64>>>, data_len: usize, forecast_len: usize) -> Self {
+    /// Create a new BiLLmv2 model
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if the data is empty.
+    pub fn new(data: Vec<Vec<Option<f64>>>, data_len: usize, forecast_len: usize) -> Result<Self, Error> {
         if data.is_empty() {
-            panic!("BiLLmv2::new: data is empty");
+            bail!("Invalid data: BiLLmv2 model requires non-empty data")
         }
         let mut billmv2 = Self {
             data: data.clone(),
@@ -596,13 +634,23 @@ impl BiLLmv2 {
                 }
             }
         }
-        billmv2
+        Ok(billmv2)
+    }
+    
+    /// Create a new BiLLmv2 model (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if the data is empty.
+    pub fn new_or_panic(data: Vec<Vec<Option<f64>>>, data_len: usize, forecast_len: usize) -> Self {
+        Self::new(data, data_len, forecast_len)
+            .expect("Failed to create BiLLmv2 model: data is empty")
     }
     
     pub fn instance(var1: &[Option<f64>], var2: &[Option<f64>], forecast_len: usize) -> Self {
         let data = vec![var1.to_vec(), var2.to_vec()];
         let data_len = var1.len().min(var2.len());
-        Self::new(data, data_len, forecast_len)
+        Self::new(data, data_len, forecast_len).expect("Failed to create BiLLmv2 model")
     }
     
     pub fn least_num_data() -> usize {
@@ -780,8 +828,9 @@ impl MultivarModel for BiLLmv2 {
         Self::first_forecast_index()
     }
     
-    fn predict(&mut self, _predict_var: usize, _start: usize) {
+    fn predict(&mut self, _predict_var: usize, _start: usize) -> Result<(), Error> {
         // BiLLmv2 does not support predict method
+        Ok(())
     }
 }
 
@@ -802,9 +851,14 @@ pub struct LLB {
 impl LLB {
     const EPS: f64 = 1e-12;
     
-    pub fn new(data: Vec<Vec<f64>>, data_len: usize, forecast_len: usize) -> Self {
+    /// Create a new LLB model
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if the data is empty or data_len is 0.
+    pub fn new(data: Vec<Vec<f64>>, data_len: usize, forecast_len: usize) -> Result<Self, Error> {
         if data.is_empty() || data_len == 0 {
-            panic!("LLB::new: invalid data");
+            bail!("Invalid data: LLB model requires non-empty data with positive data_len")
         }
         let mut llb = Self {
             data: data.clone(),
@@ -825,12 +879,22 @@ impl LLB {
         };
         let (_, _) = dfpmin(&mut func, &mut psi, DFP_TOLERANCE);
         llb.update_all(&psi);
-        llb
+        Ok(llb)
+    }
+    
+    /// Create a new LLB model (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if the data is empty or data_len is 0.
+    pub fn new_or_panic(data: Vec<Vec<f64>>, data_len: usize, forecast_len: usize) -> Self {
+        Self::new(data, data_len, forecast_len)
+            .expect("Failed to create LLB model: invalid data")
     }
     
     pub fn instance(var1: &[f64], var2: &[f64], data_len: usize, forecast_len: usize) -> Self {
         let data = vec![var1.to_vec(), var2.to_vec()];
-        Self::new(data, data_len, forecast_len)
+        Self::new(data, data_len, forecast_len).expect("Failed to create LLB model")
     }
     
     pub fn instance_with_opt(var1: &[Option<f64>], var2: &[Option<f64>], data_len: usize, forecast_len: usize) -> Self {
@@ -840,7 +904,7 @@ impl LLB {
             .iter()
             .map(|row| row.iter().map(|x| x.unwrap_or(0.0)).collect())
             .collect();
-        Self::new(data, data_len, forecast_len)
+        Self::new(data, data_len, forecast_len).expect("Failed to create LLB model")
     }
     
     pub fn least_num_data() -> usize {
@@ -968,9 +1032,14 @@ impl LLB {
         }
     }
     
-    pub fn predict(&mut self, predict_var: usize, start: usize) {
+    /// Make predictions using the LLB model
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if predict_var is not 0 or 1.
+    pub fn predict(&mut self, predict_var: usize, start: usize) -> Result<(), Error> {
         if predict_var != 0 && predict_var != 1 {
-            panic!("LLB::predict: predict_var must be 0 or 1");
+            bail!("Invalid parameter 'predict_var': {} - predict_var must be 0 or 1", predict_var);
         }
         let n = self.data_len;
         let corvar = 1 - predict_var;
@@ -1000,6 +1069,7 @@ impl LLB {
         // Store prediction results
         self.fc = Some(fc);
         self.var_arr = Some(var_arr);
+        Ok(())
     }
     
     pub fn state(&self, ts_idx: usize, i: usize) -> f64 {
@@ -1050,7 +1120,12 @@ pub struct LLBmv {
 }
 
 impl LLBmv {
-    pub fn new(data: Vec<Vec<Option<f64>>>, data_len: usize, forecast_len: usize) -> Self {
+    /// Create a new LLBmv model (LLB with missing values)
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if the underlying LLB model creation fails.
+    pub fn new(data: Vec<Vec<Option<f64>>>, data_len: usize, forecast_len: usize) -> Result<Self, Error> {
         let data_f64: Vec<Vec<f64>> = data
             .iter()
             .map(|row| {
@@ -1059,13 +1134,23 @@ impl LLBmv {
                     .collect()
             })
             .collect();
-        let llb = LLB::new(data_f64, data_len, forecast_len);
-        Self { llb }
+        let llb = LLB::new(data_f64, data_len, forecast_len)?;
+        Ok(Self { llb })
+    }
+    
+    /// Create a new LLBmv model (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if the underlying LLB model creation fails.
+    pub fn new_or_panic(data: Vec<Vec<Option<f64>>>, data_len: usize, forecast_len: usize) -> Self {
+        Self::new(data, data_len, forecast_len)
+            .expect("Failed to create LLBmv model")
     }
     
     pub fn instance(var1: &[Option<f64>], var2: &[Option<f64>], data_len: usize, forecast_len: usize) -> Self {
         let data = vec![var1.to_vec(), var2.to_vec()];
-        Self::new(data, data_len, forecast_len)
+        Self::new(data, data_len, forecast_len).expect("Failed to create LLBmv model")
     }
     
     pub fn state(&self, ts_idx: usize, i: usize) -> f64 {
@@ -1110,8 +1195,8 @@ impl MultivarModel for LLBmv {
         LLB::first_forecast_index()
     }
     
-    fn predict(&mut self, predict_var: usize, start: usize) {
-        self.llb.predict(predict_var, start);
+    fn predict(&mut self, predict_var: usize, start: usize) -> Result<(), Error> {
+        self.llb.predict(predict_var, start)
     }
 }
 
@@ -1160,12 +1245,20 @@ impl MultivarModel for LLB {
         Self::first_forecast_index()
     }
     
-    fn predict(&mut self, predict_var: usize, start: usize) {
-        LLB::predict(self, predict_var, start);
+    fn predict(&mut self, predict_var: usize, start: usize) -> Result<(), Error> {
+        LLB::predict(self, predict_var, start)
     }
 }
 
 impl Multivar {
+    /// Create a new Multivar model
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if:
+    /// - The period is greater than MAX_LAG
+    /// - The algorithm is unsupported
+    /// - Data is insufficient for the selected algorithm
     pub fn new(
         algorithm: &str,
         data: Vec<Vec<f64>>,
@@ -1174,10 +1267,10 @@ impl Multivar {
         forecast_len: usize,
         correlate: Option<&[f64]>,
         missing_valued: bool,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         if let Some(p) = period {
             if p > MAX_LAG as i32 {
-                panic!("Multivar: period can't be greater than {}", MAX_LAG);
+                bail!("Invalid parameter 'period': {} - period cannot be greater than {}", p, MAX_LAG);
             }
         }
         
@@ -1202,53 +1295,83 @@ impl Multivar {
                 } else {
                     // If no correlate, use first two columns of data
                     if data.len() < 2 {
-                        panic!("LLBmv: need at least 2 variables in data or provide correlate");
+                        bail!("Insufficient data: required at least 2 data points, got {}", data.len());
                     }
                     let data_opt: Vec<Vec<Option<f64>>> = data
                         .iter()
                         .map(|row| row.iter().map(|x| Some(*x)).collect())
                         .collect();
-                    Box::new(LLBmv::new(data_opt, data_end, forecast_len))
+                    Box::new(LLBmv::new(data_opt, data_end, forecast_len)?)
                 }
             } else {
                 // LLB algorithm
                 if let Some(corr) = correlate {
                     // Use instance method, pass var1 and var2 (correlate)
-                    let var1 = if !data.is_empty() { &data[0] } else { panic!("LLB: data is empty") };
+                    let var1 = if !data.is_empty() { &data[0] } else {
+                        bail!("Invalid data: LLB model requires non-empty data")
+                    };
                     Box::new(LLB::instance(var1, corr, data_end, forecast_len))
                 } else {
                     // If no correlate, use first two columns of data
                     if data.len() < 2 {
-                        panic!("LLB: need at least 2 variables in data or provide correlate");
+                        bail!("Insufficient data: required at least 2 data points, got {}", data.len());
                     }
-                    Box::new(LLB::new(data, data_end, forecast_len))
+                    Box::new(LLB::new(data, data_end, forecast_len)?)
                 }
             }
         } else if algo_name == "BiLL" {
-            Box::new(BiLL::new(data, data_end, forecast_len))
+            Box::new(BiLL::new(data, data_end, forecast_len)?)
         } else if algo_name == "BiLLmv" {
             let data_opt: Vec<Vec<Option<f64>>> = data
                 .iter()
                 .map(|row| row.iter().map(|x| Some(*x)).collect())
                 .collect();
-            Box::new(BiLLmv::new(data_opt, data_end, forecast_len))
+            Box::new(BiLLmv::new(data_opt, data_end, forecast_len)?)
         } else {
-            panic!("Multivar: Unknown algorithm {}", algo_name);
+            let _supported = vec![
+                "LLB".to_string(), "LLBmv".to_string(),
+                "BiLL".to_string(), "BiLLmv".to_string()
+            ];
+            bail!("Unsupported algorithm. Supported: supported")
         };
         
-        Self {
+        Ok(Self {
             algo,
             datalength: data_end,
             period,
             forecast_len,
             algorithm: algo_name,
-        }
+        })
     }
     
-    pub fn predict(&mut self, predict_var: usize, start: usize) {
+    /// Create a new Multivar model (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if the algorithm is unsupported or data is invalid.
+    pub fn new_or_panic(
+        algorithm: &str,
+        data: Vec<Vec<f64>>,
+        data_end: usize,
+        period: Option<i32>,
+        forecast_len: usize,
+        correlate: Option<&[f64]>,
+        missing_valued: bool,
+    ) -> Self {
+        Self::new(algorithm, data, data_end, period, forecast_len, correlate, missing_valued)
+            .expect("Failed to create Multivar model")
+    }
+    
+    /// Make predictions using the Multivar model
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if the underlying model's predict method fails.
+    pub fn predict(&mut self, predict_var: usize, start: usize) -> Result<(), Error> {
         if self.algorithm.starts_with("LLB") {
-            self.algo.predict(predict_var, start);
+            self.algo.predict(predict_var, start)?;
         }
+        Ok(())
     }
     
     pub fn state(&self, ts_idx: usize, i: usize) -> f64 {
@@ -1296,7 +1419,7 @@ mod tests {
     #[test]
     fn test_bill_basic() {
         let data = vec![vec![1.0, 2.0, 3.0], vec![2.0, 3.0, 4.0]];
-        let bill = BiLL::new(data, 3, 3);
+        let bill = BiLL::new(data, 3, 3).expect("Failed to create BiLL model");
         
         assert!(bill.state(0, 0).is_finite());
         assert!(bill.state(1, 0).is_finite());
@@ -1307,7 +1430,7 @@ mod tests {
     #[test]
     fn test_billmv_basic() {
         let data = vec![vec![Some(1.0), Some(2.0), Some(3.0)], vec![Some(2.0), Some(3.0), Some(4.0)]];
-        let billmv = BiLLmv::new(data, 3, 3);
+        let billmv = BiLLmv::new(data, 3, 3).expect("Failed to create BiLLmv model");
         
         assert!(billmv.state(0, 0).is_finite());
         assert!(billmv.state(1, 0).is_finite());
@@ -1317,7 +1440,7 @@ mod tests {
     #[test]
     fn test_billmv2_basic() {
         let data = vec![vec![Some(1.0), Some(2.0), Some(3.0)], vec![Some(2.0), Some(3.0), Some(4.0)]];
-        let billmv2 = BiLLmv2::new(data, 3, 3);
+        let billmv2 = BiLLmv2::new(data, 3, 3).expect("Failed to create BiLLmv2 model");
         
         assert!(billmv2.state(0, 0).is_finite());
         assert!(billmv2.state(1, 0).is_finite());
@@ -1327,7 +1450,7 @@ mod tests {
     #[test]
     fn test_llb_basic() {
         let data = vec![vec![1.0, 2.0, 3.0], vec![2.0, 3.0, 4.0], vec![3.0, 4.0, 5.0]];
-        let llb = LLB::new(data, 3, 3);
+        let llb = LLB::new(data, 3, 3).expect("Failed to create LLB model");
         
         assert!(llb.state(0, 0).is_finite());
         assert!(llb.state(1, 0).is_finite());
@@ -1342,7 +1465,7 @@ mod tests {
             vec![Some(2.0), Some(3.0), Some(4.0)], 
             vec![Some(3.0), Some(4.0), Some(5.0)]
         ];
-        let llbmv = LLBmv::new(data, 3, 3);
+        let llbmv = LLBmv::new(data, 3, 3).expect("Failed to create LLBmv model");
         
         assert!(llbmv.state(0, 0).is_finite());
         assert!(llbmv.state(1, 0).is_finite());
@@ -1353,7 +1476,7 @@ mod tests {
     #[test]
     fn test_multivar_bill() {
         let data = vec![vec![1.0, 2.0, 3.0, 4.0], vec![2.0, 3.0, 4.0, 5.0]];
-        let multivar = Multivar::new("BiLL", data, 4, None, 3, None, false);
+        let multivar = Multivar::new("BiLL", data, 4, None, 3, None, false).expect("Failed to create Multivar model");
         
         assert!(multivar.state(0, 0).is_finite());
         assert!(multivar.state(1, 0).is_finite());
@@ -1364,7 +1487,7 @@ mod tests {
     #[test]
     fn test_multivar_llb() {
         let data = vec![vec![1.0, 2.0, 3.0], vec![2.0, 3.0, 4.0], vec![3.0, 4.0, 5.0]];
-        let multivar = Multivar::new("LLB", data, 3, None, 3, None, false);
+        let multivar = Multivar::new("LLB", data, 3, None, 3, None, false).expect("Failed to create Multivar model");
         
         assert!(multivar.state(0, 0).is_finite());
         assert!(multivar.state(1, 0).is_finite());
@@ -1376,7 +1499,7 @@ mod tests {
     #[test]
     fn test_multivar_model_trait_bill() {
         let data = vec![vec![1.0, 2.0, 3.0], vec![2.0, 3.0, 4.0]];
-        let bill = BiLL::new(data, 3, 3);
+        let bill = BiLL::new(data, 3, 3).expect("Failed to create BiLL model");
         
         // Test trait methods
         assert_eq!(bill.least_num_data(), 1);
@@ -1386,7 +1509,7 @@ mod tests {
     #[test]
     fn test_multivar_model_trait_llb() {
         let data = vec![vec![1.0, 2.0, 3.0], vec![2.0, 3.0, 4.0], vec![3.0, 4.0, 5.0]];
-        let llb = LLB::new(data, 3, 3);
+        let llb = LLB::new(data, 3, 3).expect("Failed to create LLB model");
         
         // LLB's least_num_data returns 2 (need at least 2 data points to calculate covariance)
         assert_eq!(llb.least_num_data(), 2);
@@ -1397,7 +1520,7 @@ mod tests {
     #[test]
     fn test_bill_state_consistency() {
         let data = vec![vec![1.0, 2.0, 3.0], vec![2.0, 3.0, 4.0]];
-        let bill = BiLL::new(data, 3, 3);
+        let bill = BiLL::new(data, 3, 3).expect("Failed to create BiLL model");
         
         // Test state of two time series
         for ts_idx in 0..2 {
@@ -1411,7 +1534,7 @@ mod tests {
     #[test]
     fn test_bill_var_consistency() {
         let data = vec![vec![1.0, 2.0, 3.0], vec![2.0, 3.0, 4.0]];
-        let bill = BiLL::new(data, 3, 3);
+        let bill = BiLL::new(data, 3, 3).expect("Failed to create BiLL model");
         
         // Variance should be non-negative
         for ts_idx in 0..2 {
@@ -1430,7 +1553,7 @@ mod tests {
             vec![3.0, 4.0, 5.0],
             vec![4.0, 5.0, 6.0],
         ];
-        let llb = LLB::new(data, 3, 3);
+        let llb = LLB::new(data, 3, 3).expect("Failed to create LLB model");
         
         // Test multiple time series
         for ts_idx in 0..4 {
@@ -1443,7 +1566,7 @@ mod tests {
     #[test]
     fn test_multivar_period() {
         let data = vec![vec![1.0, 2.0, 3.0], vec![2.0, 3.0, 4.0]];
-        let multivar = Multivar::new("BiLL", data, 3, Some(2), 3, None, false);
+        let multivar = Multivar::new("BiLL", data, 3, Some(2), 3, None, false).expect("Failed to create Multivar model");
         
         // Test period setting
         let period = multivar.period();
@@ -1453,7 +1576,7 @@ mod tests {
     #[test]
     fn test_multivar_least_num_data() {
         let data = vec![vec![1.0, 2.0, 3.0], vec![2.0, 3.0, 4.0]];
-        let multivar = Multivar::new("BiLL", data, 3, None, 3, None, false);
+        let multivar = Multivar::new("BiLL", data, 3, None, 3, None, false).expect("Failed to create Multivar model");
         
         assert!(multivar.least_num_data() >= 1);
     }

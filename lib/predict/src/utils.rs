@@ -1,8 +1,9 @@
 //! Utility functions module
-//! 
+//!
 //! Provides utility functions for missing value handling, autocovariance, correlogram, period finding, etc.
 
 use std::f64;
+use anyhow::{Error, bail};
 
 /// Maximum lag
 pub const MAX_LAG: usize = 2000;
@@ -96,7 +97,11 @@ fn autocovariance0(data: &[f64], start: usize, end: usize, mean: f64, k: usize) 
 }
 
 /// Calculate correlogram
-fn correlogram0(data: &[f64], start: usize, end: usize, n: usize) -> Vec<f64> {
+/// 
+/// # Errors
+/// 
+/// Returns an error if the variance is zero (all data points are the same).
+fn correlogram0(data: &[f64], start: usize, end: usize, n: usize) -> Result<Vec<f64>, Error> {
     let n_data = end - start;
     let mut mean = 0.0;
     for i in start..end {
@@ -107,14 +112,14 @@ fn correlogram0(data: &[f64], start: usize, end: usize, n: usize) -> Vec<f64> {
     let n_lag = if n == 0 || n >= n_data { n_data - 1 } else { n };
     let var = autocovariance0(data, start, end, mean, 0);
     if var == 0.0 {
-        panic!("correlogram0: variance is zero");
+        bail!("numerical error: variance is zero - all data points may be identical");
     }
 
     let mut result = vec![1.0];
     for i in 1..=n_lag {
         result.push(autocovariance0(data, start, end, mean, i) / var);
     }
-    result
+    Ok(result)
 }
 
 /// Find period
@@ -128,7 +133,10 @@ pub fn find_period0(data: &[f64], start: usize, end: usize) -> i32 {
         end
     };
 
-    let cor = correlogram0(data, start, end, MAX_LAG);
+    let cor = match correlogram0(data, start, end, MAX_LAG) {
+        Ok(c) => c,
+        Err(_) => return -1, // Return -1 if correlogram calculation fails
+    };
     if cor.len() < 2 {
         return 1;
     }
@@ -162,7 +170,7 @@ pub fn autocovariance(data: &[f64], mean: f64, k: usize) -> f64 {
 
 /// Correlogram wrapper function
 pub fn correlogram(data: &[f64], n: usize) -> Vec<f64> {
-    correlogram0(data, 0, data.len(), n)
+    correlogram0(data, 0, data.len(), n).unwrap_or_default()
 }
 
 /// Period finding wrapper function
@@ -386,32 +394,40 @@ impl Iterator for Datafeed {
 /// # Returns
 /// - `(lower, upper)`: Lower and upper bounds of confidence interval
 /// 
+/// # Errors
+/// 
+/// Returns an error if:
+/// - `variance` is negative
+/// - `confidence` is not in the range (0, 1)
+/// 
 /// # Examples
 /// ```
 /// use predict::utils::prediction_interval;
 /// 
 /// let prediction = 100.0;
 /// let variance = 4.0;
-/// let (lower, upper) = prediction_interval(prediction, variance, 0.95);
+/// let (lower, upper) = prediction_interval(prediction, variance, 0.95).unwrap();
+/// assert!(lower < prediction);
+/// assert!(upper > prediction);
 /// ```
-pub fn prediction_interval(prediction: f64, variance: f64, confidence: f64) -> (f64, f64) {
+pub fn prediction_interval(prediction: f64, variance: f64, confidence: f64) -> Result<(f64, f64), Error> {
     if variance < 0.0 {
-        panic!("prediction_interval: variance must be non-negative");
+        bail!("invalid parameter 'variance': {} - variance must be non-negative", variance);
     }
     if confidence <= 0.0 || confidence >= 1.0 {
-        panic!("prediction_interval: confidence must be in (0, 1)");
+        bail!("invalid parameter 'confidence': {} - confidence must be in (0, 1)", confidence);
     }
     
     let std_dev = variance.sqrt();
     let std_norm = crate::dist::Normaldist::default();
     // For two-sided confidence interval, need (1 + confidence) / 2 quantile
     // For example, 95% confidence interval needs 97.5% quantile
-    let z_score = std_norm.invcdf((1.0 + confidence) / 2.0);
+    let z_score = std_norm.invcdf((1.0 + confidence) / 2.0)?;
     
     let lower = prediction - z_score * std_dev;
     let upper = prediction + z_score * std_dev;
     
-    (lower, upper)
+    Ok((lower, upper))
 }
 
 /// Calculate 95% confidence interval for prediction values (convenience function)
@@ -423,15 +439,21 @@ pub fn prediction_interval(prediction: f64, variance: f64, confidence: f64) -> (
 /// # Returns
 /// - `(lower95, upper95)`: Lower and upper bounds of 95% confidence interval
 /// 
+/// # Errors
+/// 
+/// Returns an error if variance is negative.
+/// 
 /// # Examples
 /// ```
 /// use predict::utils::prediction_interval_95;
 /// 
 /// let prediction = 100.0;
 /// let variance = 4.0;
-/// let (lower95, upper95) = prediction_interval_95(prediction, variance);
+/// let (lower95, upper95) = prediction_interval_95(prediction, variance).unwrap();
+/// assert!(lower95 < prediction);
+/// assert!(upper95 > prediction);
 /// ```
-pub fn prediction_interval_95(prediction: f64, variance: f64) -> (f64, f64) {
+pub fn prediction_interval_95(prediction: f64, variance: f64) -> Result<(f64, f64), Error> {
     prediction_interval(prediction, variance, 0.95)
 }
 
@@ -668,7 +690,7 @@ mod tests {
         let variance = 4.0; // Standard deviation is 2.0
         
         // Test 95% confidence interval
-        let (lower95, upper95) = prediction_interval_95(prediction, variance);
+        let (lower95, upper95) = prediction_interval_95(prediction, variance).expect("prediction_interval_95 failed");
         assert!(lower95 < prediction);
         assert!(upper95 > prediction);
         // 95% confidence interval should be approximately [96.08, 103.92] (100 ± 1.96 * 2)
@@ -676,7 +698,7 @@ mod tests {
         assert!((upper95 - 103.92).abs() < 0.1);
         
         // Test 90% confidence interval
-        let (lower90, upper90) = prediction_interval(prediction, variance, 0.90);
+        let (lower90, upper90) = prediction_interval(prediction, variance, 0.90).expect("prediction_interval failed");
         assert!(lower90 < prediction);
         assert!(upper90 > prediction);
         // 90% confidence interval should be narrower than 95% confidence interval
@@ -684,7 +706,7 @@ mod tests {
         assert!(upper90 < upper95);
         
         // Test 99% confidence interval
-        let (lower99, upper99) = prediction_interval(prediction, variance, 0.99);
+        let (lower99, upper99) = prediction_interval(prediction, variance, 0.99).expect("prediction_interval failed");
         assert!(lower99 < prediction);
         assert!(upper99 > prediction);
         // 99% confidence interval should be wider than 95% confidence interval
@@ -695,13 +717,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "variance must be non-negative")]
     fn test_prediction_interval_negative_variance() {
-        prediction_interval(100.0, -1.0, 0.95);
+        prediction_interval(100.0, -1.0, 0.95).unwrap();
     }
 
     #[test]
     #[should_panic(expected = "confidence must be in")]
     fn test_prediction_interval_invalid_confidence() {
-        prediction_interval(100.0, 4.0, 1.5);
+        prediction_interval(100.0, 4.0, 1.5).unwrap();
     }
 }
 

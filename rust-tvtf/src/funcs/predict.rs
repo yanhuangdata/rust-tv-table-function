@@ -343,12 +343,12 @@ impl Predict {
                 data_end,
                 period,
                 self.future_timespan,
-            );
+            ).expect("Failed to create Univar model");
 
             for i in 0..training_data.len() + self.future_timespan {
                 let state = model.state(0, i);
                 let variance = model.var(0, i);
-                let (lower, upper) = prediction_interval(state, variance, confidence);
+                let (lower, upper) = prediction_interval(state, variance, confidence).expect("prediction_interval failed");
                 predictions.push((state, lower, upper));
             }
         } else if is_multivariate_algorithm(algorithm_name) {
@@ -379,12 +379,12 @@ impl Predict {
                     data_end,
                     period,
                     self.future_timespan,
-                );
+                ).expect("Failed to create Univar model");
 
                 for i in 0..training_data.len() + self.future_timespan {
                     let state = model.state(0, i);
                     let variance = model.var(0, i);
-                    let (lower, upper) = prediction_interval(state, variance, confidence);
+                    let (lower, upper) = prediction_interval(state, variance, confidence).expect("prediction_interval failed");
                     predictions.push((state, lower, upper));
                 }
 
@@ -410,12 +410,12 @@ impl Predict {
                 self.future_timespan,
                 correlate_ref,
                 use_mv,
-            );
+            ).expect("Failed to create Multivar model");
 
             for i in 0..training_data.len() + self.future_timespan {
                 let state = model.state(0, i);
                 let variance = model.var(0, i);
-                let (lower, upper) = prediction_interval(state, variance, confidence);
+                let (lower, upper) = prediction_interval(state, variance, confidence).expect("prediction_interval failed");
                 predictions.push((state, lower, upper));
             }
         } else {
@@ -428,12 +428,12 @@ impl Predict {
                 data_end,
                 period,
                 self.future_timespan,
-            );
+            ).expect("Failed to create Univar model");
             
             for i in 0..training_data.len() + self.future_timespan {
                 let state = model.state(0, i);
                 let variance = model.var(0, i);
-                let (lower, upper) = prediction_interval(state, variance, confidence);
+                let (lower, upper) = prediction_interval(state, variance, confidence).expect("prediction_interval failed");
                 predictions.push((state, lower, upper));
             }
         }

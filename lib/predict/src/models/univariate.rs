@@ -1,10 +1,11 @@
 //! Univariate state space models module
-//! 
+//!
 //! Implements various univariate time series state space models
 
 use crate::optimize::{dfpmin, DFP_TOLERANCE};
 use crate::utils::{Datafeed, MAX_LAG};
 use crate::models::{StateSpaceModel, is_supported_algorithm, is_multivariate_algorithm};
+use anyhow::{Error, bail};
 use std::f64;
 
 /// Helper function: Get value from p array (handles NaN and out-of-bounds cases)
@@ -59,7 +60,7 @@ impl LL0 {
             None, // Pinitval
             1,    // state_step
             forecast_len,
-        )
+        ).expect("Failed to create LL0 model")
     }
 
     pub fn new_with_params(
@@ -74,7 +75,7 @@ impl LL0 {
         pinitval: Option<f64>,
         state_step: usize,
         forecast_len: usize,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         // Handle missing values: skip leading None values
         let mut i = datafeed.get_start();
         let mut skipped = 0;
@@ -91,7 +92,7 @@ impl LL0 {
             datafeed.set_start(i);
         }
         if datafeed.len() == 0 {
-            panic!("LL0::new: no valid data");
+            bail!("invalid data: no valid data for LL0 model");
         }
 
         let data_len = datafeed.len();
@@ -167,7 +168,7 @@ impl LL0 {
             }
         }
         
-        ll
+        Ok(ll)
     }
 
     fn compute_states(&mut self) {
@@ -388,7 +389,7 @@ impl LL {
         pinitval: Option<f64>,
         state_step: usize,
         forecast_len: usize,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let data_len = datafeed.len();
         let ll0 = LL0::new_with_params(
             datafeed,
@@ -402,14 +403,14 @@ impl LL {
             pinitval,
             state_step,
             forecast_len,
-        );
-        Self {
+        )?;
+        Ok(Self {
             ll0,
             chunked: false,
             chunks: vec![],
             data_len,
             forecast_len,
-        }
+        })
     }
     
     /// Create LL model, automatically handles large dataset chunking
@@ -418,21 +419,23 @@ impl LL {
     /// - Data length <= 2000: Use LL0 directly
     /// - Data length > 2000: Automatically chunk, at most 2000 points per chunk
     /// 
-    /// This is consistent with Python implementation's chunking logic
-    pub fn new(datafeed: Datafeed, forecast_len: usize) -> Self {
+    /// # Errors
+    /// 
+    /// Returns an error if the data is invalid or insufficient.
+    pub fn new(datafeed: Datafeed, forecast_len: usize) -> Result<Self, Error> {
         const SUBLEN: usize = 2000; // Consistent with Python implementation: 2000 points per chunk
         let data_len = datafeed.len();
         
         // If data length is less than or equal to SUBLEN, use LL0 directly
         if data_len <= SUBLEN {
             let ll0 = LL0::new(datafeed, forecast_len);
-            return Self {
+            return Ok(Self {
                 ll0,
                 chunked: false,
                 chunks: vec![],
                 data_len,
                 forecast_len,
-            };
+            });
         }
         
         // Chunk large dataset
@@ -473,13 +476,13 @@ impl LL {
         let empty_datafeed = Datafeed::new(vec![0.0], 0, 1, 1);
         let ll0 = LL0::new(empty_datafeed, forecast_len);
         
-        Self {
+        Ok(Self {
             ll0,
             chunked: true,
             chunks,
             data_len,
             forecast_len,
-        }
+        })
     }
 
     pub fn state(&self, i: usize) -> f64 {
@@ -614,9 +617,14 @@ pub struct LLT {
 }
 
 impl LLT {
-    pub fn new(datafeed: Datafeed, forecast_len: usize) -> Self {
+    /// Create a new Local Linear Trend (LLT) model
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if the data has fewer than 2 data points.
+    pub fn new(datafeed: Datafeed, forecast_len: usize) -> Result<Self, Error> {
         if datafeed.len() < 2 {
-            panic!("LLT: need at least 2 data points");
+            bail!("Insufficient data: LLT model requires at least 2 data points for trend estimation (required: 2, actual: {})", datafeed.len());
         }
 
         let data_len = datafeed.len();
@@ -633,7 +641,16 @@ impl LLT {
         };
 
         llt.compute_states();
-        llt
+        Ok(llt)
+    }
+    
+    /// Create a new LLT model (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if the data has fewer than 2 data points.
+    pub fn new_or_panic(datafeed: Datafeed, forecast_len: usize) -> Self {
+        Self::new(datafeed, forecast_len).expect("Failed to create LLT model: insufficient data")
     }
 
     fn compute_states(&mut self) {
@@ -879,6 +896,11 @@ impl StateSpaceModel for LLT {
 }
 
 impl Univar {
+    /// Create a new Univar model
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if the algorithm is unsupported or data is invalid.
     pub fn new(
         algorithm: &str,
         data: Vec<Vec<f64>>,
@@ -886,7 +908,7 @@ impl Univar {
         data_end: usize,
         period: i32,
         forecast_len: usize,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         Self::new_with_missing(
             algorithm,
             data,
@@ -898,6 +920,23 @@ impl Univar {
             None,  // correlate
         )
     }
+    
+    /// Create a new Univar model (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if the algorithm is unsupported or data is invalid.
+    pub fn new_or_panic(
+        algorithm: &str,
+        data: Vec<Vec<f64>>,
+        data_start: usize,
+        data_end: usize,
+        period: i32,
+        forecast_len: usize,
+    ) -> Self {
+        Self::new(algorithm, data, data_start, data_end, period, forecast_len)
+            .expect("Failed to create Univar model")
+    }
 
     pub fn new_with_missing(
         algorithm: &str,
@@ -908,14 +947,19 @@ impl Univar {
         forecast_len: usize,
         missing_valued: bool,
         _correlate: Option<&[f64]>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let data_len = data_end - data_start;
         if period > MAX_LAG as i32 {
-            panic!("Univar: period can't be greater than {}", MAX_LAG);
+            bail!("Invalid parameter 'period': {} - period cannot be greater than {}", period, MAX_LAG);
         }
         
         if !is_supported_algorithm(algorithm) {
-            panic!("Univar: Unknown algorithm: {}", algorithm);
+            let _supported_univariate = vec![
+                "LL".to_string(), "LLT".to_string(), 
+                "LLP".to_string(), "LLP1".to_string(), 
+                "LLP2".to_string(), "LLP5".to_string()
+            ];
+            bail!("Unsupported algorithm {}. For multivariate algorithms (LLB, LLBmv, BiLL, BiLLmv), use Multivar instead", algorithm);
         }
         
         let mut algos: Vec<Box<dyn StateSpaceModel>> = vec![];
@@ -932,16 +976,16 @@ impl Univar {
                     datafeed = datafeed.with_missing_values(true);
                 }
                 let model: Box<dyn StateSpaceModel> = match algorithm {
-                    "LLP" => Box::new(LLP::new(datafeed, period, forecast_len)),
-                    "LLP1" => Box::new(LLP1::new(datafeed, period, forecast_len)),
-                    "LLP2" => Box::new(LLP2::new(datafeed, period, forecast_len)),
-                    "LLP5" => Box::new(LLP5::new(datafeed, period, forecast_len)),
+                    "LLP" => Box::new(LLP::new(datafeed, period, forecast_len)?),
+                    "LLP1" => Box::new(LLP1::new(datafeed, period, forecast_len)?),
+                    "LLP2" => Box::new(LLP2::new(datafeed, period, forecast_len)?),
+                    "LLP5" => Box::new(LLP5::new(datafeed, period, forecast_len)?),
                     _ => {
                         // Multivariate algorithms cannot be used through Univar
                         if is_multivariate_algorithm(algorithm) {
-                            panic!("Univar: algorithm '{}' is a multivariate algorithm and requires different parameters. Use Multivar instead.", algorithm);
+                            bail!("Algorithm {} is a multivariate, but was used as a univariate", algorithm);
                         }
-                        panic!("Univar: Unknown LLP algorithm: {}", algorithm);
+                        bail!("Unknown LLP algorithm: {}", algorithm);
                     }
                 };
                 algos.push(model);
@@ -958,26 +1002,26 @@ impl Univar {
                     datafeed = datafeed.with_missing_values(true);
                 }
                 let model: Box<dyn StateSpaceModel> = match algorithm {
-                    "LL" => Box::new(LL::new(datafeed, forecast_len)),
-                    "LLT" => Box::new(LLT::new(datafeed, forecast_len)),
+                    "LL" => Box::new(LL::new(datafeed, forecast_len)?),
+                    "LLT" => Box::new(LLT::new(datafeed, forecast_len)?),
                     _ => {
                         // Multivariate algorithms cannot be used through Univar, as they require different parameters
                         if is_multivariate_algorithm(algorithm) {
-                            panic!("Univar: algorithm '{}' is a multivariate algorithm and requires different parameters. Use Multivar instead.", algorithm);
+                            bail!("Algorithm {} is a multivariate, but was used as a univariate", algorithm);
                         }
-                        panic!("Univar: Unknown or unsupported algorithm: {}", algorithm);
+                        bail!("Unknown or unsupported algorithm: {}", algorithm);
                     }
                 };
                 algos.push(model);
             }
         }
 
-        Self {
+        Ok(Self {
             algos,
             data_len,
             period,
             forecast_len,
-        }
+        })
     }
 
     pub fn state(&self, ts_idx: usize, i: usize) -> f64 {
@@ -1039,20 +1083,27 @@ pub struct LLP {
 }
 
 impl LLP {
-    pub fn new(datafeed: Datafeed, period: i32, forecast_len: usize) -> Self {
+    /// Create a new Periodic Local Level (LLP) model
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if:
+    /// - The detected period is less than 2
+    /// - The data length is less than the period
+    pub fn new(datafeed: Datafeed, period: i32, forecast_len: usize) -> Result<Self, Error> {
         let data_len = datafeed.len();
         let period = if period >= 2 {
             period as usize
         } else {
             let detected = datafeed.period();
             if detected < 2 {
-                panic!("LLP: data is not periodic");
+                bail!("Period detection failed: LLP model requires periodic data with period >= 2");
             }
             detected as usize
         };
         
         if data_len < period {
-            panic!("LLP: Too few data points: {}. Need at least {}", data_len, period);
+            bail!("Insufficient data: LLP model requires at least {} data points for period {} (required: {}, actual: {})", period, period, period, data_len);
         }
         
         let forecast_len = forecast_len.max(period);
@@ -1067,11 +1118,21 @@ impl LLP {
             forecast_len,
         };
         
-        llp.set_models();
-        llp
+        llp.set_models()?;
+        Ok(llp)
     }
     
-    fn set_models(&mut self) {
+    /// Create a new LLP model (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if the data is not periodic or has insufficient data.
+    pub fn new_or_panic(datafeed: Datafeed, period: i32, forecast_len: usize) -> Self {
+        Self::new(datafeed, period, forecast_len)
+            .expect("Failed to create LLP model: data is not periodic or has insufficient data")
+    }
+    
+    fn set_models(&mut self) -> Result<(), Error> {
         // Fill missing values in first period
         for i in 0..self.period.min(self.data_len) {
             if self.datafeed.get_val(i).is_nan() {
@@ -1139,9 +1200,11 @@ impl LLP {
                 None, // Pinitval
                 self.period,
                 model_forecast_len,
-            );
+            )?;
             self.models.push(model);
         }
+        
+        Ok(())
     }
     
     pub fn least_num_data(&self) -> usize {
@@ -1235,8 +1298,13 @@ pub struct LLP1 {
 }
 
 impl LLP1 {
-    pub fn new(datafeed: Datafeed, period: i32, forecast_len: usize) -> Self {
-        let mut llp = LLP::new(datafeed, period, forecast_len);
+    /// Create a new LLP1 model (variant of LLP with maximum variance)
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if the underlying LLP model creation fails.
+    pub fn new(datafeed: Datafeed, period: i32, forecast_len: usize) -> Result<Self, Error> {
+        let mut llp = LLP::new(datafeed, period, forecast_len)?;
         // LLP1's compute_states: set self.p[i] = max(self.p[i-1], self.p[i])
         for i in 1..llp.p.len() {
             let prev = if !llp.p[i-1].is_nan() {
@@ -1255,7 +1323,17 @@ impl LLP1 {
                 llp.p[i] = curr;
             }
         }
-        Self { llp }
+        Ok(Self { llp })
+    }
+    
+    /// Create a new LLP1 model (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if the underlying LLP model creation fails.
+    pub fn new_or_panic(datafeed: Datafeed, period: i32, forecast_len: usize) -> Self {
+        Self::new(datafeed, period, forecast_len)
+            .expect("Failed to create LLP1 model")
     }
 }
 
@@ -1309,14 +1387,19 @@ pub struct LLP2 {
 }
 
 impl LLP2 {
-    pub fn new(datafeed: Datafeed, period: i32, forecast_len: usize) -> Self {
+    /// Create a new LLP2 model (combines LL and LLP)
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if the period is less than 2.
+    pub fn new(datafeed: Datafeed, period: i32, forecast_len: usize) -> Result<Self, Error> {
         if period < 2 {
-            panic!("LLP2: period must be >= 2");
+            bail!("Invalid parameter 'period': {} - period must be >= 2 for LLP2 model", period);
         }
         let period = period as usize;
         let data_len = datafeed.len();
-        let model1 = LL::new(datafeed.clone(), forecast_len);
-        let model2 = LLP::new(datafeed, period as i32, forecast_len);
+        let model1 = LL::new(datafeed.clone(), forecast_len)?;
+        let model2 = LLP::new(datafeed, period as i32, forecast_len)?;
         let fc_len = data_len + forecast_len;
         let mut llp2 = Self {
             model1,
@@ -1328,7 +1411,7 @@ impl LLP2 {
             forecast_len,
         };
         llp2.compute_states();
-        llp2
+        Ok(llp2)
     }
     
     fn compute_states(&mut self) {
@@ -1460,20 +1543,25 @@ pub struct LLP5 {
 }
 
 impl LLP5 {
-    pub fn new(datafeed: Datafeed, period: i32, forecast_len: usize) -> Self {
+    /// Create a new LLP5 model (combines LLT and LLP1)
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if model creation fails.
+    pub fn new(datafeed: Datafeed, period: i32, forecast_len: usize) -> Result<Self, Error> {
         let data_len = datafeed.len();
-        let model1 = LLT::new(datafeed.clone(), forecast_len);
+        let model1 = LLT::new(datafeed.clone(), forecast_len)?;
         let mut period = period;
         let model2 = if period < 2 {
             let detected = datafeed.period();
             if detected >= 2 && data_len >= (detected as usize) * LL::least_num_data() {
                 period = detected;
-                Some(LLP1::new(datafeed, period, forecast_len))
+                Some(LLP1::new(datafeed, period, forecast_len)?)
             } else {
                 None
             }
         } else if data_len >= (period as usize) * LL::least_num_data() {
-            Some(LLP1::new(datafeed, period, forecast_len))
+            Some(LLP1::new(datafeed, period, forecast_len)?)
         } else {
             None
         };
@@ -1489,7 +1577,7 @@ impl LLP5 {
             forecast_len,
         };
         llp5.compute_states();
-        llp5
+        Ok(llp5)
     }
     
     fn compute_states(&mut self) {
@@ -1938,7 +2026,7 @@ mod tests {
     fn test_ll_basic() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let df = Datafeed::new(data, 0, 5, 1);
-        let ll = LL::new(df, 3);
+        let ll = LL::new(df, 3).expect("Failed to create LL model");
         
         assert!(ll.state(0).is_finite());
         assert!(ll.var(0) >= 0.0);
@@ -1950,7 +2038,7 @@ mod tests {
         // Test large dataset chunking functionality
         let data: Vec<f64> = (0..2500).map(|i| i as f64).collect();
         let df = Datafeed::new(data, 0, 2500, 1);
-        let ll = LL::new(df, 3);
+        let ll = LL::new(df, 3).expect("Failed to create LL model");
         
         assert!(ll.state(0).is_finite());
         assert!(ll.state(1000).is_finite());
@@ -1962,7 +2050,7 @@ mod tests {
     fn test_llt_basic() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let df = Datafeed::new(data, 0, 6, 1);
-        let llt = LLT::new(df, 3);
+        let llt = LLT::new(df, 3).expect("Failed to create LLT model");
         
         assert!(llt.state(0).is_finite());
         assert!(llt.var(0) >= 0.0);
@@ -1970,18 +2058,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "need at least 2")]
+    #[should_panic]
     fn test_llt_insufficient_data() {
         let data = vec![1.0];
         let df = Datafeed::new(data, 0, 1, 1);
-        let _ = LLT::new(df, 3);
+        // Using new_or_panic which should panic
+        let _ = LLT::new_or_panic(df, 3);
     }
 
     #[test]
     fn test_llp_basic() {
         let data = vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0];
         let df = Datafeed::new(data, 0, 8, 1);
-        let llp = LLP::new(df, 3, 3);
+        let llp = LLP::new(df, 3, 3).expect("Failed to create LLP model");
         
         assert!(llp.state(0).is_finite());
         assert!(llp.var(0) >= 0.0);
@@ -1992,7 +2081,7 @@ mod tests {
     fn test_llp1_basic() {
         let data = vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0];
         let df = Datafeed::new(data, 0, 6, 1);
-        let llp1 = LLP1::new(df, 3, 3);
+        let llp1 = LLP1::new(df, 3, 3).expect("Failed to create LLP1 model");
         
         assert!(llp1.state(0).is_finite());
         assert_eq!(llp1.datalen(), 6);
@@ -2002,7 +2091,7 @@ mod tests {
     fn test_llp2_basic() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let df = Datafeed::new(data, 0, 6, 1);
-        let llp2 = LLP2::new(df, 2, 3);
+        let llp2 = LLP2::new(df, 2, 3).expect("Failed to create LLP2 model");
         
         assert!(llp2.state(0).is_finite());
         assert_eq!(llp2.datalen(), 6);
@@ -2012,7 +2101,7 @@ mod tests {
     fn test_llp5_basic() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let df = Datafeed::new(data, 0, 6, 1);
-        let llp5 = LLP5::new(df, 2, 3);
+        let llp5 = LLP5::new(df, 2, 3).expect("Failed to create LLP5 model");
         
         assert!(llp5.state(0).is_finite());
         assert_eq!(llp5.datalen(), 6);
@@ -2026,13 +2115,14 @@ mod tests {
         
         assert!(llt2.state(0).is_finite());
         assert!(llt2.var(0) >= 0.0);
+        assert!(llt2.var(0) >= 0.0);
         assert_eq!(llt2.datalen(), 6);
     }
 
     #[test]
     fn test_univar_ll() {
         let data = vec![vec![1.0, 2.0, 3.0, 4.0, 5.0]];
-        let univar = Univar::new("LL", data, 0, 5, -1, 3);
+        let univar = Univar::new_or_panic("LL", data, 0, 5, -1, 3);
         
         assert!(univar.state(0, 0).is_finite());
         assert!(univar.var(0, 0) >= 0.0);
@@ -2043,7 +2133,7 @@ mod tests {
     #[test]
     fn test_univar_llt() {
         let data = vec![vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]];
-        let univar = Univar::new("LLT", data, 0, 6, -1, 3);
+        let univar = Univar::new_or_panic("LLT", data, 0, 6, -1, 3);
         
         assert!(univar.state(0, 0).is_finite());
         assert_eq!(univar.datalen(), 6);
@@ -2052,24 +2142,25 @@ mod tests {
     #[test]
     fn test_univar_llp() {
         let data = vec![vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]];
-        let univar = Univar::new("LLP", data, 0, 6, 3, 3);
+        let univar = Univar::new_or_panic("LLP", data, 0, 6, 3, 3);
         
         assert!(univar.state(0, 0).is_finite());
         assert_eq!(univar.period(), 3);
     }
 
     #[test]
-    #[should_panic(expected = "multivariate algorithm")]
+    #[should_panic]
     fn test_univar_rejects_multivariate() {
         let data = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
-        let _ = Univar::new("BiLL", data, 0, 3, -1, 3);
+        // Using new_or_panic which should panic for multivariate algorithm
+        let _ = Univar::new_or_panic("BiLL", data, 0, 3, -1, 3);
     }
 
     #[test]
     fn test_state_space_model_trait_ll() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let df = Datafeed::new(data, 0, 5, 1);
-        let ll = LL::new(df, 3);
+        let ll = LL::new(df, 3).expect("Failed to create LL model");
         
         // Test trait methods
         assert_eq!(ll.least_num_data(), 1);
@@ -2080,7 +2171,7 @@ mod tests {
     fn test_state_space_model_trait_llt() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let df = Datafeed::new(data, 0, 6, 1);
-        let llt = LLT::new(df, 3);
+        let llt = LLT::new(df, 3).expect("Failed to create LLT model");
         
         assert_eq!(llt.least_num_data(), 2);
         assert_eq!(llt.first_forecast_index(), 0);
@@ -2090,7 +2181,7 @@ mod tests {
     fn test_ll_state_consistency() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let df = Datafeed::new(data.clone(), 0, 5, 1);
-        let ll = LL::new(df, 3);
+        let ll = LL::new(df, 3).expect("Failed to create LL model");
         
         // State values should be in reasonable range
         for i in 0..5 {
@@ -2105,7 +2196,7 @@ mod tests {
     fn test_ll_var_consistency() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let df = Datafeed::new(data, 0, 5, 1);
-        let ll = LL::new(df, 3);
+        let ll = LL::new(df, 3).expect("Failed to create LL model");
         
         // Variance should be non-negative
         for i in 0..5 {

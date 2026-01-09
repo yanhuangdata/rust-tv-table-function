@@ -1,9 +1,10 @@
 //! Optimization algorithms module
-//! 
+//!
 //! Implements DFP, BFGS and other optimization algorithms
 
 use std::f64;
 use std::ops::{Add, Sub, Mul, Div, Neg, Index, IndexMut};
+use anyhow::{Error, bail};
 
 const EPS: f64 = 1.0e-10;
 const TAB: usize = 10;
@@ -32,9 +33,13 @@ pub struct Mat {
 
 impl Mat {
     /// Create matrix from array
-    pub fn new(mut a: Vec<f64>, nrow: usize, ncol: usize) -> Self {
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if nrow or ncol is zero.
+    pub fn new(mut a: Vec<f64>, nrow: usize, ncol: usize) -> Result<Self, Error> {
         if nrow == 0 || ncol == 0 {
-            panic!("Mat::new: dimensions must be positive");
+            bail!("matrix dimensions must be positive");
         }
         if a.len() < nrow * ncol {
             a.extend(vec![0.0; nrow * ncol - a.len()]);
@@ -47,70 +52,126 @@ impl Mat {
             }
         }
 
-        Self { cols, nrow, ncol }
+        Ok(Self { cols, nrow, ncol })
+    }
+    
+    /// Create matrix from array (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if nrow or ncol is zero.
+    pub fn new_or_panic(a: Vec<f64>, nrow: usize, ncol: usize) -> Self {
+        Self::new(a, nrow, ncol).expect("Failed to create matrix")
     }
 
     /// Create matrix from 2D array
-    pub fn from_array(ar: Vec<Vec<f64>>) -> Self {
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if the array is empty or columns have different lengths.
+    pub fn from_array(ar: Vec<Vec<f64>>) -> Result<Self, Error> {
         if ar.is_empty() || ar[0].is_empty() {
-            panic!("Mat::from_array: array must be non-empty");
+            bail!("array must be non-empty");
         }
         let ncol = ar.len();
         let nrow = ar[0].len();
         for col in &ar {
             if col.len() != nrow {
-                panic!("Mat::from_array: all columns must have same length");
+                bail!("all columns must have the same length");
             }
         }
-        Self {
+        Ok(Self {
             cols: ar,
             nrow,
             ncol,
-        }
+        })
+    }
+    
+    /// Create matrix from 2D array (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if the array is empty or columns have different lengths.
+    pub fn from_array_or_panic(ar: Vec<Vec<f64>>) -> Self {
+        Self::from_array(ar).expect("Failed to create matrix from array")
     }
 
     /// Create identity matrix
-    pub fn id(n: usize) -> Self {
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if n is zero.
+    pub fn id(n: usize) -> Result<Self, Error> {
         if n == 0 {
-            panic!("Mat::id: dimension must be positive");
+            bail!("matrix dimension must be positive");
         }
         let mut cols = vec![vec![0.0; n]; n];
         for i in 0..n {
             cols[i][i] = 1.0;
         }
-        Self {
+        Ok(Self {
             cols,
             nrow: n,
             ncol: n,
-        }
+        })
+    }
+    
+    /// Create identity matrix (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if n is zero.
+    pub fn id_or_panic(n: usize) -> Self {
+        Self::id(n).expect("Failed to create identity matrix")
     }
 
     /// Create zero matrix
-    pub fn zero(nrow: usize, ncol: usize) -> Self {
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if nrow or ncol is zero.
+    pub fn zero(nrow: usize, ncol: usize) -> Result<Self, Error> {
         if nrow == 0 || ncol == 0 {
-            panic!("Mat::zero: dimensions must be positive");
+            bail!("matrix dimensions must be positive");
         }
-        Self {
+        Ok(Self {
             cols: vec![vec![0.0; nrow]; ncol],
             nrow,
             ncol,
-        }
+        })
+    }
+    
+    /// Create zero matrix (panics on error)
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if nrow or ncol is zero.
+    pub fn zero_or_panic(nrow: usize, ncol: usize) -> Self {
+        Self::zero(nrow, ncol).expect("Failed to create zero matrix")
     }
 
     /// Get row
-    pub fn row(&self, i: usize) -> Vec<f64> {
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if the row index is out of bounds.
+    pub fn row(&self, i: usize) -> Result<Vec<f64>, Error> {
         if i >= self.nrow {
-            panic!("Mat::row: index out of bounds");
+            bail!("row index {} out of bounds (nrow = {})", i, self.nrow);
         }
-        self.cols.iter().map(|col| col[i]).collect()
+        Ok(self.cols.iter().map(|col| col[i]).collect())
     }
 
     /// Get column
-    pub fn col(&self, i: usize) -> &Vec<f64> {
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if the column index is out of bounds.
+    pub fn col(&self, i: usize) -> Result<&Vec<f64>, Error> {
         if i >= self.ncol {
-            panic!("Mat::col: index out of bounds");
+            bail!("column index {} out of bounds (ncol = {})", i, self.ncol);
         }
-        &self.cols[i]
+        Ok(&self.cols[i])
     }
 
     /// Transpose
@@ -129,11 +190,15 @@ impl Mat {
     }
 
     /// Trace
-    pub fn tr(&self) -> f64 {
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if the matrix is not square.
+    pub fn tr(&self) -> Result<f64, Error> {
         if self.nrow != self.ncol {
-            panic!("Mat::tr: matrix must be square");
+            bail!("trace requires a square matrix");
         }
-        (0..self.nrow).map(|i| self.cols[i][i]).sum()
+        Ok((0..self.nrow).map(|i| self.cols[i][i]).sum())
     }
 
     /// p-norm
@@ -164,7 +229,7 @@ impl Mat {
                 ar[i][j] = self.cols[col_idx][row_idx];
             }
         }
-        Self::from_array(ar)
+        Self::from_array_or_panic(ar)
     }
 }
 
@@ -279,7 +344,7 @@ impl Mul<&Mat> for &Mat {
         if self.ncol != other.nrow {
             panic!("Mat::mul: dimensions must match for multiplication");
         }
-        let mut m = Mat::zero(self.nrow, other.ncol);
+        let mut m = Mat::zero_or_panic(self.nrow, other.ncol);
         for i in 0..m.nrow {
             for j in 0..m.ncol {
                 for k in 0..self.ncol {
@@ -370,7 +435,7 @@ impl VecOps for OptVec {
     }
 
     fn t(&self, other: &[f64]) -> Mat {
-        let mut m = Mat::zero(self.len(), other.len());
+        let mut m = Mat::zero_or_panic(self.len(), other.len());
         for i in 0..self.len() {
             for j in 0..other.len() {
                 m[(i, j)] = self[i] * other[j];
@@ -406,7 +471,10 @@ pub fn norm_vec(v: &[f64]) -> f64 {
 
 /// Trace
 pub fn tr(m: &Mat) -> f64 {
-    m.tr()
+    if m.nrow != m.ncol {
+        panic!("Mat::tr: matrix must be square");
+    }
+    (0..m.nrow).map(|i| m.cols[i][i]).sum()
 }
 
 /// 2x2 matrix determinant
@@ -425,7 +493,7 @@ pub fn inv(m: &Mat, det_val: f64) -> Mat {
     if det_val == 0.0 {
         panic!("inv: determinant is zero");
     }
-    Mat::from_array(vec![
+    Mat::from_array_or_panic(vec![
         vec![m[(1, 1)] / det_val, -m[(0, 1)] / det_val],
         vec![-m[(1, 0)] / det_val, m[(0, 0)] / det_val],
     ])
@@ -876,7 +944,7 @@ where
     F: FnMut(&[f64]) -> f64,
 {
     let n = x0.len();
-    let i = Mat::id(n);
+    let i = Mat::id(n).expect("Failed to create identity matrix");
     let mut h = i.clone();
     let mut x1 = x0;
     let mut grad1 = grad(&mut fn_, &x1, 0.001);
@@ -884,7 +952,7 @@ where
     let mut ct = 0;
 
     while norm_vec(&grad1) > er {
-        let p = apply(&(-&h), &grad1);
+        let p = apply(&h, &grad1);
         let x1_clone = x1.clone();
         let p_clone = p.clone();
         let fn_mut = &mut fn_;
@@ -961,14 +1029,14 @@ mod tests {
     #[test]
     fn test_mat() {
         // Test matrix creation
-        let m = Mat::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2);
+        let m = Mat::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2).expect("Failed to create matrix");
         assert_eq!(m[(0, 0)], 1.0);
         assert_eq!(m[(0, 1)], 2.0);
         assert_eq!(m[(1, 0)], 3.0);
         assert_eq!(m[(1, 1)], 4.0);
 
         // Test identity matrix
-        let id = Mat::id(3);
+        let id = Mat::id(3).expect("Failed to create identity matrix");
         assert_eq!(id[(0, 0)], 1.0);
         assert_eq!(id[(1, 1)], 1.0);
         assert_eq!(id[(2, 2)], 1.0);
@@ -981,13 +1049,13 @@ mod tests {
         assert_eq!(m_t[(0, 1)], 3.0);
         assert_eq!(m_t[(1, 1)], 4.0);
 
-        // Test trace
-        assert!((m.tr() - 5.0).abs() < 1e-10);
+        // Test trace (method returns Result)
+        assert!((m.tr().expect("tr failed") - 5.0).abs() < 1e-10);
     }
 
     #[test]
     fn test_apply() {
-        let m = Mat::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2);
+        let m = Mat::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2).expect("Failed to create matrix");
         let v = vec![1.0, 2.0];
         let result = apply(&m, &v);
         assert_eq!(result.len(), 2);
@@ -1004,7 +1072,7 @@ mod tests {
 
     #[test]
     fn test_tr() {
-        let m = Mat::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], 3, 3);
+        let m = Mat::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], 3, 3).expect("Failed to create matrix");
         let trace = tr(&m);
         assert!((trace - 15.0).abs() < 1e-10); // 1 + 5 + 9 = 15
     }
@@ -1012,12 +1080,12 @@ mod tests {
     #[test]
     fn test_det() {
         // Test determinant of 2x2 matrix
-        let m = Mat::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2);
+        let m = Mat::new(vec![1.0, 2.0, 3.0, 4.0], 2, 2).expect("Failed to create matrix");
         let det_val = det(&m);
         assert!((det_val - (-2.0)).abs() < 1e-10); // 1*4 - 2*3 = -2
 
         // Test determinant of identity matrix (2x2)
-        let id = Mat::id(2);
+        let id = Mat::id(2).expect("Failed to create identity matrix");
         let det_id = det(&id);
         assert!((det_id - 1.0).abs() < 1e-10);
     }
@@ -1026,7 +1094,7 @@ mod tests {
     fn test_inv() {
         // Test inverse of 2x2 matrix
         // Use a simple invertible matrix [2, 1; 1, 1], its inverse is [1, -1; -1, 2]
-        let m = Mat::new(vec![2.0, 1.0, 1.0, 1.0], 2, 2);
+        let m = Mat::new(vec![2.0, 1.0, 1.0, 1.0], 2, 2).expect("Failed to create matrix");
         let det_val = det(&m);
         assert!((det_val - 1.0).abs() < 1e-10); // 2*1 - 1*1 = 1
         let m_inv = inv(&m, det_val);
