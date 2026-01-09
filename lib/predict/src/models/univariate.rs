@@ -29,11 +29,7 @@ pub struct LL0 {
     fc: Vec<f64>,      // Filtered state
     p: Vec<f64>,       // Prediction variance
     fcstart: usize,
-    #[allow(dead_code)]
-    fcend: usize,
     pstart: usize,
-    #[allow(dead_code)]
-    pend: usize,
     state_step: usize,
     forecast_len: usize,
     sigma: f64,
@@ -142,9 +138,7 @@ impl LL0 {
             fc: fc_vec,
             p: p_vec,
             fcstart,
-            fcend,
             pstart,
-            pend,
             state_step,
             forecast_len,
             sigma: 0.0,
@@ -371,8 +365,6 @@ pub struct LL {
     chunked: bool,
     chunks: Vec<LL0>,
     data_len: usize,
-    #[allow(dead_code)]
-    forecast_len: usize,
 }
 
 impl LL {
@@ -409,7 +401,6 @@ impl LL {
             chunked: false,
             chunks: vec![],
             data_len,
-            forecast_len,
         })
     }
     
@@ -434,7 +425,6 @@ impl LL {
                 chunked: false,
                 chunks: vec![],
                 data_len,
-                forecast_len,
             });
         }
         
@@ -481,7 +471,6 @@ impl LL {
             chunked: true,
             chunks,
             data_len,
-            forecast_len,
         })
     }
 
@@ -832,8 +821,6 @@ pub struct Univar {
     algos: Vec<Box<dyn StateSpaceModel>>,
     data_len: usize,
     period: i32,
-    #[allow(dead_code)]
-    forecast_len: usize,
 }
 
 // StateSpaceModel trait is defined in models/mod.rs
@@ -1020,7 +1007,6 @@ impl Univar {
             algos,
             data_len,
             period,
-            forecast_len,
         })
     }
 
@@ -1078,8 +1064,6 @@ pub struct LLP {
     models: Vec<LL>,
     period: usize,
     data_len: usize,
-    #[allow(dead_code)]
-    forecast_len: usize,
 }
 
 impl LLP {
@@ -1115,7 +1099,6 @@ impl LLP {
             models: vec![],
             period,
             data_len,
-            forecast_len,
         };
         
         llp.set_models()?;
@@ -1379,11 +1362,7 @@ pub struct LLP2 {
     model2: LLP,
     fc: Vec<f64>,
     p: Vec<f64>,
-    #[allow(dead_code)]
-    period: usize,
     data_len: usize,
-    #[allow(dead_code)]
-    forecast_len: usize,
 }
 
 impl LLP2 {
@@ -1406,9 +1385,7 @@ impl LLP2 {
             model2,
             fc: vec![0.0; fc_len],
             p: vec![0.0; fc_len],
-            period,
             data_len,
-            forecast_len,
         };
         llp2.compute_states();
         Ok(llp2)
@@ -1535,11 +1512,7 @@ pub struct LLP5 {
     model2: Option<LLP1>,
     fc: Vec<f64>,
     p: Vec<f64>,
-    #[allow(dead_code)]
-    period: i32,
     data_len: usize,
-    #[allow(dead_code)]
-    forecast_len: usize,
 }
 
 impl LLP5 {
@@ -1572,9 +1545,7 @@ impl LLP5 {
             model2,
             fc: vec![0.0; fc_len],
             p: vec![0.0; fc_len],
-            period,
             data_len,
-            forecast_len,
         };
         llp5.compute_states();
         Ok(llp5)

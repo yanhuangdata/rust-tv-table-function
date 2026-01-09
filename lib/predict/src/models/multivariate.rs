@@ -838,8 +838,6 @@ impl MultivarModel for BiLLmv2 {
 pub struct LLB {
     data: Vec<Vec<f64>>,
     data_len: usize,
-    #[allow(dead_code)]
-    forecast_len: usize,
     q: [f64; 3],
     p: Vec<[f64; 3]>,
     a: Vec<[f64; 2]>,
@@ -863,7 +861,6 @@ impl LLB {
         let mut llb = Self {
             data: data.clone(),
             data_len,
-            forecast_len,
             q: [0.0; 3],
             p: vec![[0.0; 3]; data_len + forecast_len],
             a: vec![[0.0; 2]; data_len + forecast_len],
@@ -1203,11 +1200,7 @@ impl MultivarModel for LLBmv {
 /// Multivariate model wrapper
 pub struct Multivar {
     algo: Box<dyn MultivarModel>,
-    #[allow(dead_code)]
-    datalength: usize,
     period: Option<i32>,
-    #[allow(dead_code)]
-    forecast_len: usize,
     algorithm: String,
 }
 
@@ -1337,9 +1330,7 @@ impl Multivar {
         
         Ok(Self {
             algo,
-            datalength: data_end,
             period,
-            forecast_len,
             algorithm: algo_name,
         })
     }
