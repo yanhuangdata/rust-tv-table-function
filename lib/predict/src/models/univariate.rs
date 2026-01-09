@@ -2,9 +2,9 @@
 //!
 //! Implements various univariate time series state space models
 
-use crate::optimize::{dfpmin, DFP_TOLERANCE};
+use crate::models::{StateSpaceModel, is_multivariate_algorithm, is_supported_algorithm};
+use crate::optimize::{DFP_TOLERANCE, dfpmin};
 use crate::utils::{Datafeed, MAX_LAG};
-use crate::models::{StateSpaceModel, is_supported_algorithm, is_multivariate_algorithm};
 use anyhow::{Error, bail};
 use std::f64;
 
@@ -13,11 +13,7 @@ use std::f64;
 fn get_p_value(p: &[f64], i: usize) -> f64 {
     if i < p.len() {
         let val = p[i];
-        if val.is_nan() {
-            f64::NAN
-        } else {
-            val
-        }
+        if val.is_nan() { f64::NAN } else { val }
     } else {
         f64::NAN
     }
@@ -26,8 +22,8 @@ fn get_p_value(p: &[f64], i: usize) -> f64 {
 /// Local Level model (LL0)
 pub struct LL0 {
     datafeed: Datafeed,
-    fc: Vec<f64>,      // Filtered state
-    p: Vec<f64>,       // Prediction variance
+    fc: Vec<f64>, // Filtered state
+    p: Vec<f64>,  // Prediction variance
     fcstart: usize,
     pstart: usize,
     state_step: usize,
@@ -36,14 +32,11 @@ pub struct LL0 {
     nu: f64,
     var: f64,
     cur_state_end: usize,
-    fc_init_set: bool, 
+    fc_init_set: bool,
 }
 
 impl LL0 {
-    pub fn new(
-        datafeed: Datafeed,
-        forecast_len: usize,
-    ) -> Self {
+    pub fn new(datafeed: Datafeed, forecast_len: usize) -> Self {
         Self::new_with_params(
             datafeed,
             None, // fc
@@ -56,9 +49,11 @@ impl LL0 {
             None, // Pinitval
             1,    // state_step
             forecast_len,
-        ).expect("Failed to create LL0 model")
+        )
+        .expect("Failed to create LL0 model")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_params(
         mut datafeed: Datafeed,
         mut fc: Option<&mut Vec<f64>>,
@@ -76,7 +71,7 @@ impl LL0 {
         let mut i = datafeed.get_start();
         let mut skipped = 0;
         datafeed.reset();
-        while let Some(val) = datafeed.next() {
+        for val in datafeed.by_ref() {
             if val.is_nan() {
                 i += state_step;
                 skipped += 1;
@@ -87,7 +82,7 @@ impl LL0 {
         if skipped > 0 {
             datafeed.set_start(i);
         }
-        if datafeed.len() == 0 {
+        if datafeed.is_empty() {
             bail!("invalid data: no valid data for LL0 model");
         }
 
@@ -122,15 +117,15 @@ impl LL0 {
 
         // If initial values are provided, set them
         let fc_init_set = fcinitval.is_some();
-        if let Some(init_val) = fcinitval {
-            if fcstart < fc_vec.len() {
-                fc_vec[fcstart] = init_val;
-            }
+        if let Some(init_val) = fcinitval
+            && fcstart < fc_vec.len()
+        {
+            fc_vec[fcstart] = init_val;
         }
-        if let Some(init_val) = pinitval {
-            if pstart < p_vec.len() {
-                p_vec[pstart] = init_val;
-            }
+        if let Some(init_val) = pinitval
+            && pstart < p_vec.len()
+        {
+            p_vec[pstart] = init_val;
         }
 
         let mut ll = Self {
@@ -149,19 +144,17 @@ impl LL0 {
         };
 
         ll.compute_states();
-        
+
         // If external arrays are provided, write results back (only write relevant range)
         if let Some(ref mut fc_ref) = fc {
-            for i in fcstart..fcend.min(fc_ref.len()).min(ll.fc.len()) {
-                fc_ref[i] = ll.fc[i];
-            }
+            let end = fcend.min(fc_ref.len()).min(ll.fc.len());
+            fc_ref[fcstart..end].copy_from_slice(&ll.fc[fcstart..end]);
         }
         if let Some(ref mut p_ref) = p {
-            for i in pstart..pend.min(p_ref.len()).min(ll.p.len()) {
-                p_ref[i] = ll.p[i];
-            }
+            let end = pend.min(p_ref.len()).min(ll.p.len());
+            p_ref[pstart..end].copy_from_slice(&ll.p[pstart..end]);
         }
-        
+
         Ok(ll)
     }
 
@@ -223,22 +216,23 @@ impl LL0 {
     fn llh(&self, q: f64) -> f64 {
         let mut datafeed = self.datafeed.clone();
         datafeed.reset();
-        
+
         // Prefer using self.fc[fcstart] as initial state (if explicitly set), otherwise take first value from data stream
         // This is consistent with Python implementation: check self.fc[self.fcstart] to determine initial state
-        let (mut a, mut p, numdatataken) = if self.fc_init_set && self.fcstart < self.fc.len() && self.pstart < self.p.len() {
-            // If fc is set, use initial values from fc and p
-            let a_val = self.fc[self.fcstart];
-            let p_val = if !self.p[self.pstart].is_nan() {
-                self.p[self.pstart]
+        let (mut a, mut p, numdatataken) =
+            if self.fc_init_set && self.fcstart < self.fc.len() && self.pstart < self.p.len() {
+                // If fc is set, use initial values from fc and p
+                let a_val = self.fc[self.fcstart];
+                let p_val = if !self.p[self.pstart].is_nan() {
+                    self.p[self.pstart]
+                } else {
+                    1.0 + q
+                };
+                (a_val, p_val, 0)
             } else {
-                1.0 + q
+                // Otherwise take first value from data stream
+                (datafeed.next().unwrap_or(0.0), 1.0 + q, 1)
             };
-            (a_val, p_val, 0)
-        } else {
-            // Otherwise take first value from data stream
-            (datafeed.next().unwrap_or(0.0), 1.0 + q, 1)
-        };
 
         let mut t1 = 0.0;
         let mut t2 = 0.0;
@@ -260,32 +254,33 @@ impl LL0 {
     fn update_all(&mut self, q: f64) {
         let mut datafeed = self.datafeed.clone();
         datafeed.reset();
-        
+
         // Prefer using self.fc[fcstart] as initial state (if explicitly set), otherwise take first value from data stream
         // This is consistent with Python implementation: check self.fc[self.fcstart] to determine initial state
-        let (mut a, mut p, mut i, b) = if self.fc_init_set && self.fcstart < self.fc.len() && self.pstart < self.p.len() {
-            // If fc is set, use initial values from fc and p
-            let a_val = self.fc[self.fcstart];
-            let p_val = if !self.p[self.pstart].is_nan() {
-                self.p[self.pstart]
+        let (mut a, mut p, mut i, b) =
+            if self.fc_init_set && self.fcstart < self.fc.len() && self.pstart < self.p.len() {
+                // If fc is set, use initial values from fc and p
+                let a_val = self.fc[self.fcstart];
+                let p_val = if !self.p[self.pstart].is_nan() {
+                    self.p[self.pstart]
+                } else {
+                    1.0 + q
+                };
+                (a_val, p_val, 0, 0)
             } else {
-                1.0 + q
+                // Otherwise take first value from data stream
+                let first_val = datafeed.next().unwrap_or(0.0);
+                // If obtained from data stream, also set to fc[fcstart]
+                if self.fcstart < self.fc.len() {
+                    self.fc[self.fcstart] = first_val;
+                }
+                let p_val = 1.0 + q;
+                if self.pstart < self.p.len() {
+                    self.p[self.pstart] = p_val;
+                }
+                (first_val, p_val, self.state_step, self.state_step)
             };
-            (a_val, p_val, 0, 0)
-        } else {
-            // Otherwise take first value from data stream
-            let first_val = datafeed.next().unwrap_or(0.0);
-            // If obtained from data stream, also set to fc[fcstart]
-            if self.fcstart < self.fc.len() {
-                self.fc[self.fcstart] = first_val;
-            }
-            let p_val = 1.0 + q;
-            if self.pstart < self.p.len() {
-                self.p[self.pstart] = p_val;
-            }
-            (first_val, p_val, self.state_step, self.state_step)
-        };
-        
+
         let mut sigma = 0.0;
 
         for x in datafeed {
@@ -316,11 +311,7 @@ impl LL0 {
     }
 
     pub fn state(&self, i: usize) -> f64 {
-        if i < self.fc.len() {
-            self.fc[i]
-        } else {
-            0.0
-        }
+        if i < self.fc.len() { self.fc[i] } else { 0.0 }
     }
 
     pub fn var(&self, i: usize) -> f64 {
@@ -369,6 +360,7 @@ pub struct LL {
 
 impl LL {
     /// Create LL model, supports shared fc and p arrays (for LLP and other models)
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_params(
         datafeed: Datafeed,
         fc: Option<&mut Vec<f64>>,
@@ -403,20 +395,20 @@ impl LL {
             data_len,
         })
     }
-    
+
     /// Create LL model, automatically handles large dataset chunking
-    /// 
+    ///
     /// # Chunking Strategy
     /// - Data length <= 2000: Use LL0 directly
     /// - Data length > 2000: Automatically chunk, at most 2000 points per chunk
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the data is invalid or insufficient.
     pub fn new(datafeed: Datafeed, forecast_len: usize) -> Result<Self, Error> {
         const SUBLEN: usize = 2000; // Consistent with Python implementation: 2000 points per chunk
         let data_len = datafeed.len();
-        
+
         // If data length is less than or equal to SUBLEN, use LL0 directly
         if data_len <= SUBLEN {
             let ll0 = LL0::new(datafeed, forecast_len);
@@ -427,7 +419,7 @@ impl LL {
                 data_len,
             });
         }
-        
+
         // Chunk large dataset
         let divide = (data_len / SUBLEN).max(1);
         let chunk_size = data_len / divide;
@@ -435,7 +427,7 @@ impl LL {
         let start = datafeed.get_start();
         let end = datafeed.get_end();
         let step = datafeed.get_step();
-        
+
         // Create chunked models
         for i in 0..divide {
             let chunk_start = start + i * chunk_size * step;
@@ -444,28 +436,25 @@ impl LL {
             } else {
                 start + (i + 1) * chunk_size * step
             };
-            
-            let chunk_datafeed = datafeed.clone_with_params(
-                Some(chunk_start),
-                Some(chunk_end),
-                Some(step),
-            );
-            
+
+            let chunk_datafeed =
+                datafeed.clone_with_params(Some(chunk_start), Some(chunk_end), Some(step));
+
             // Each chunk's forecast length needs to be calculated based on remaining data
             let chunk_forecast_len = if i == divide - 1 {
                 forecast_len
             } else {
                 0 // Intermediate chunks don't need forecasting
             };
-            
+
             let chunk_ll0 = LL0::new(chunk_datafeed, chunk_forecast_len);
             chunks.push(chunk_ll0);
         }
-        
+
         // Create an empty LL0 as placeholder (for compatibility)
         let empty_datafeed = Datafeed::new(vec![0.0], 0, 1, 1);
         let ll0 = LL0::new(empty_datafeed, forecast_len);
-        
+
         Ok(Self {
             ll0,
             chunked: true,
@@ -478,13 +467,13 @@ impl LL {
         if !self.chunked {
             return self.ll0.state(i);
         }
-        
+
         // In chunked case, find corresponding chunk
         const SUBLEN: usize = 2000;
         let divide = (self.data_len / SUBLEN).max(1);
         let chunk_size = self.data_len / divide;
         let chunk_idx = (i / chunk_size).min(divide - 1);
-        
+
         if chunk_idx < self.chunks.len() {
             // Calculate index within chunk
             let local_idx = i % chunk_size;
@@ -503,13 +492,13 @@ impl LL {
         if !self.chunked {
             return self.ll0.var(i);
         }
-        
+
         // In chunked case, find corresponding chunk
         const SUBLEN: usize = 2000;
         let divide = (self.data_len / SUBLEN).max(1);
         let chunk_size = self.data_len / divide;
         let chunk_idx = (i / chunk_size).min(divide - 1);
-        
+
         if chunk_idx < self.chunks.len() {
             // Calculate index within chunk
             let local_idx = i % chunk_size;
@@ -523,17 +512,13 @@ impl LL {
             }
         }
     }
-    
+
     // Get fc array value (for LLP2 and other scenarios that need direct array access)
     pub fn get_fc(&self, i: usize) -> Option<f64> {
         if !self.chunked {
             if i < self.ll0.fc.len() {
                 let val = self.ll0.fc[i];
-                if val.is_nan() {
-                    None
-                } else {
-                    Some(val)
-                }
+                if val.is_nan() { None } else { Some(val) }
             } else {
                 None
             }
@@ -547,18 +532,14 @@ impl LL {
             }
         }
     }
-    
+
     // Get p array value (for LLP2 and other scenarios that need direct array access)
     // Note: This returns the p array value, excluding sigma (consistent with Python's self.model1.p[i])
     pub fn get_p(&self, i: usize) -> Option<f64> {
         if !self.chunked {
             if i < self.ll0.p.len() {
                 let val = self.ll0.p[i];
-                if val.is_nan() {
-                    None
-                } else {
-                    Some(val)
-                }
+                if val.is_nan() { None } else { Some(val) }
             } else {
                 None
             }
@@ -568,16 +549,12 @@ impl LL {
             let divide = (self.data_len / SUBLEN).max(1);
             let chunk_size = self.data_len / divide;
             let chunk_idx = (i / chunk_size).min(divide - 1);
-            
+
             if chunk_idx < self.chunks.len() {
                 let local_idx = i % chunk_size;
                 if local_idx < self.chunks[chunk_idx].p.len() {
                     let val = self.chunks[chunk_idx].p[local_idx];
-                    if val.is_nan() {
-                        None
-                    } else {
-                        Some(val)
-                    }
+                    if val.is_nan() { None } else { Some(val) }
                 } else {
                     None
                 }
@@ -607,13 +584,16 @@ pub struct LLT {
 
 impl LLT {
     /// Create a new Local Linear Trend (LLT) model
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the data has fewer than 2 data points.
     pub fn new(datafeed: Datafeed, forecast_len: usize) -> Result<Self, Error> {
         if datafeed.len() < 2 {
-            bail!("Insufficient data: LLT model requires at least 2 data points for trend estimation (required: 2, actual: {})", datafeed.len());
+            bail!(
+                "Insufficient data: LLT model requires at least 2 data points for trend estimation (required: 2, actual: {})",
+                datafeed.len()
+            );
         }
 
         let data_len = datafeed.len();
@@ -632,11 +612,11 @@ impl LLT {
         llt.compute_states();
         Ok(llt)
     }
-    
+
     /// Create a new LLT model (panics on error)
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// Panics if the data has fewer than 2 data points.
     pub fn new_or_panic(datafeed: Datafeed, forecast_len: usize) -> Self {
         Self::new(datafeed, forecast_len).expect("Failed to create LLT model: insufficient data")
@@ -652,7 +632,7 @@ impl LLT {
         let (_, _) = dfpmin(&mut func, &mut psi, DFP_TOLERANCE);
         self.zeta = psi[0].exp();
         self.update_all(self.zeta);
-        
+
         // Calculate predictions
         // Python code uses cur_state_end
         let fcend = self.cur_state_end;
@@ -682,10 +662,17 @@ impl LLT {
         }
     }
 
-    fn update_kalman(&self, y: f64, a: &mut [f64], p: &mut [f64], k: &mut [f64], zeta: f64) -> (f64, f64, f64) {
+    fn update_kalman(
+        &self,
+        y: f64,
+        a: &mut [f64],
+        p: &mut [f64],
+        k: &mut [f64],
+        zeta: f64,
+    ) -> (f64, f64, f64) {
         // Handle missing values
         if y.is_nan() {
-            a[0] = a[0] + a[1]; // a[1] remains the same
+            a[0] += a[1]; // a[1] remains the same
             p[0] += zeta;
             let f = p[0] + 1.0;
             return (0.0, f, f.ln());
@@ -696,8 +683,8 @@ impl LLT {
         k[0] = x1 / f;
         k[1] = p[2] / f;
         let v = y - a[0] - a[1];
-        a[0] = a[0] + a[1] + v * k[0];
-        a[1] = a[1] + v * k[1];
+        a[0] += a[1] + v * k[0];
+        a[1] += v * k[1];
         let l0 = 1.0 - k[0];
         // Save p2 and p3 values first, because updating p[2] requires the old p[2] value
         let p2 = p[2];
@@ -774,13 +761,13 @@ impl LLT {
         self.zeta = zeta * epsilon;
         self.trend = a[1];
         self.var = (p[0] + 1.0) * epsilon;
-        
+
         // In Python code, initial values are set at the end
         self.fc[fcstart] = pt1;
         self.p[pstart] = epsilon * (1.0 + zeta);
         self.fc[fcstart + self.state_step] = pt2;
         self.p[pstart + self.state_step] = epsilon * (5.0 + 2.0 * zeta);
-        
+
         // Then update subsequent values
         for j in (b..i).step_by(self.state_step) {
             if j < self.p.len() {
@@ -791,21 +778,13 @@ impl LLT {
     }
 
     pub fn state(&self, i: usize) -> f64 {
-        if i < self.fc.len() {
-            self.fc[i]
-        } else {
-            0.0
-        }
+        if i < self.fc.len() { self.fc[i] } else { 0.0 }
     }
 
     pub fn var(&self, i: usize) -> f64 {
         let n = self.datafeed.get_end();
         if i < n - 2 {
-            if i < self.p.len() {
-                self.p[i]
-            } else {
-                0.0
-            }
+            if i < self.p.len() { self.p[i] } else { 0.0 }
         } else {
             self.var + ((i as i32 - n as i32 + 3) as f64) * self.zeta
         }
@@ -884,9 +863,9 @@ impl StateSpaceModel for LLT {
 
 impl Univar {
     /// Create a new Univar model
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the algorithm is unsupported or data is invalid.
     pub fn new(
         algorithm: &str,
@@ -907,11 +886,11 @@ impl Univar {
             None,  // correlate
         )
     }
-    
+
     /// Create a new Univar model (panics on error)
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// Panics if the algorithm is unsupported or data is invalid.
     pub fn new_or_panic(
         algorithm: &str,
@@ -925,6 +904,7 @@ impl Univar {
             .expect("Failed to create Univar model")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_missing(
         algorithm: &str,
         data: Vec<Vec<f64>>,
@@ -937,28 +917,33 @@ impl Univar {
     ) -> Result<Self, Error> {
         let data_len = data_end - data_start;
         if period > MAX_LAG as i32 {
-            bail!("Invalid parameter 'period': {} - period cannot be greater than {}", period, MAX_LAG);
+            bail!(
+                "Invalid parameter 'period': {} - period cannot be greater than {}",
+                period,
+                MAX_LAG
+            );
         }
-        
+
         if !is_supported_algorithm(algorithm) {
-            let _supported_univariate = vec![
-                "LL".to_string(), "LLT".to_string(), 
-                "LLP".to_string(), "LLP1".to_string(), 
-                "LLP2".to_string(), "LLP5".to_string()
+            let _supported_univariate = [
+                "LL".to_string(),
+                "LLT".to_string(),
+                "LLP".to_string(),
+                "LLP1".to_string(),
+                "LLP2".to_string(),
+                "LLP5".to_string(),
             ];
-            bail!("Unsupported algorithm {}. For multivariate algorithms (LLB, LLBmv, BiLL, BiLLmv), use Multivar instead", algorithm);
+            bail!(
+                "Unsupported algorithm {}. For multivariate algorithms (LLB, LLBmv, BiLL, BiLLmv), use Multivar instead",
+                algorithm
+            );
         }
-        
+
         let mut algos: Vec<Box<dyn StateSpaceModel>> = vec![];
 
         if algorithm.starts_with("LLP") {
-            for i in 0..data.len() {
-                let mut datafeed = Datafeed::new(
-                    data[i].clone(),
-                    data_start,
-                    data_end,
-                    1,
-                );
+            for row in &data {
+                let mut datafeed = Datafeed::new(row.clone(), data_start, data_end, 1);
                 if missing_valued {
                     datafeed = datafeed.with_missing_values(true);
                 }
@@ -970,7 +955,10 @@ impl Univar {
                     _ => {
                         // Multivariate algorithms cannot be used through Univar
                         if is_multivariate_algorithm(algorithm) {
-                            bail!("Algorithm {} is a multivariate, but was used as a univariate", algorithm);
+                            bail!(
+                                "Algorithm {} is a multivariate, but was used as a univariate",
+                                algorithm
+                            );
                         }
                         bail!("Unknown LLP algorithm: {}", algorithm);
                     }
@@ -978,13 +966,8 @@ impl Univar {
                 algos.push(model);
             }
         } else {
-            for i in 0..data.len() {
-                let mut datafeed = Datafeed::new(
-                    data[i].clone(),
-                    data_start,
-                    data_end,
-                    1,
-                );
+            for row in &data {
+                let mut datafeed = Datafeed::new(row.clone(), data_start, data_end, 1);
                 if missing_valued {
                     datafeed = datafeed.with_missing_values(true);
                 }
@@ -994,7 +977,10 @@ impl Univar {
                     _ => {
                         // Multivariate algorithms cannot be used through Univar, as they require different parameters
                         if is_multivariate_algorithm(algorithm) {
-                            bail!("Algorithm {} is a multivariate, but was used as a univariate", algorithm);
+                            bail!(
+                                "Algorithm {} is a multivariate, but was used as a univariate",
+                                algorithm
+                            );
                         }
                         bail!("Unknown or unsupported algorithm: {}", algorithm);
                     }
@@ -1068,9 +1054,9 @@ pub struct LLP {
 
 impl LLP {
     /// Create a new Periodic Local Level (LLP) model
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if:
     /// - The detected period is less than 2
     /// - The data length is less than the period
@@ -1085,11 +1071,17 @@ impl LLP {
             }
             detected as usize
         };
-        
+
         if data_len < period {
-            bail!("Insufficient data: LLP model requires at least {} data points for period {} (required: {}, actual: {})", period, period, period, data_len);
+            bail!(
+                "Insufficient data: LLP model requires at least {} data points for period {} (required: {}, actual: {})",
+                period,
+                period,
+                period,
+                data_len
+            );
         }
-        
+
         let forecast_len = forecast_len.max(period);
         // Initialize fc and p arrays to NaN (representing None, consistent with Python)
         let mut llp = Self {
@@ -1100,21 +1092,21 @@ impl LLP {
             period,
             data_len,
         };
-        
+
         llp.set_models()?;
         Ok(llp)
     }
-    
+
     /// Create a new LLP model (panics on error)
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// Panics if the data is not periodic or has insufficient data.
     pub fn new_or_panic(datafeed: Datafeed, period: i32, forecast_len: usize) -> Self {
         Self::new(datafeed, period, forecast_len)
             .expect("Failed to create LLP model: data is not periodic or has insufficient data")
     }
-    
+
     fn set_models(&mut self) -> Result<(), Error> {
         // Fill missing values in first period
         for i in 0..self.period.min(self.data_len) {
@@ -1143,11 +1135,11 @@ impl LLP {
                 }
             }
         }
-        
+
         let start = self.datafeed.get_start();
         let end = self.datafeed.get_end();
         self.models = Vec::new();
-        
+
         for i in 0..self.period {
             let model_start = start + i;
             let mut model_end = end - ((end - i) % self.period);
@@ -1161,12 +1153,12 @@ impl LLP {
             );
             let diff = self.fc.len() - model_end;
             let model_forecast_len = diff / self.period;
-            let model_forecast_len = if diff % self.period != 0 {
+            let model_forecast_len = if !diff.is_multiple_of(self.period) {
                 model_forecast_len + 1
             } else {
                 model_forecast_len
             };
-            
+
             // Create LL model with shared fc and p arrays (consistent with Python implementation)
             // Note: fcend and pend should be self.fc.len() so that LL model can fill all prediction values
             let fcend = self.fc.len();
@@ -1186,14 +1178,14 @@ impl LLP {
             )?;
             self.models.push(model);
         }
-        
+
         Ok(())
     }
-    
+
     pub fn least_num_data(&self) -> usize {
         self.period * LL::least_num_data()
     }
-    
+
     pub fn first_forecast_index(&self) -> usize {
         self.models
             .iter()
@@ -1202,7 +1194,7 @@ impl LLP {
             .min()
             .unwrap_or(0)
     }
-    
+
     pub fn variance(&self, i: usize) -> f64 {
         // Call LL model's variance method (consistent with Python implementation)
         // Python: return self.models[i%self.period].variance(old_div(i,self.period))
@@ -1214,26 +1206,22 @@ impl LLP {
             f64::NAN
         }
     }
-    
+
     pub fn datalen(&self) -> usize {
         self.data_len
     }
-    
+
     pub fn state(&self, i: usize) -> f64 {
         // Get state from fc array (consistent with Python implementation)
         if i < self.fc.len() {
             let val = self.fc[i];
             // If value is NaN, return NaN (representing None)
-            if val.is_nan() {
-                f64::NAN
-            } else {
-                val
-            }
+            if val.is_nan() { f64::NAN } else { val }
         } else {
             f64::NAN
         }
     }
-    
+
     pub fn var(&self, i: usize) -> f64 {
         self.variance(i)
     }
@@ -1243,7 +1231,7 @@ impl StateSpaceModel for LLP {
     fn state(&self, i: usize) -> f64 {
         self.state(i)
     }
-    
+
     fn var(&self, i: usize) -> f64 {
         self.var(i)
     }
@@ -1251,15 +1239,15 @@ impl StateSpaceModel for LLP {
     fn p(&self, i: usize) -> f64 {
         get_p_value(&self.p, i)
     }
-    
+
     fn datalen(&self) -> usize {
         self.datalen()
     }
-    
+
     fn least_num_data(&self) -> usize {
         self.least_num_data()
     }
-    
+
     fn first_forecast_index(&self) -> usize {
         self.first_forecast_index()
     }
@@ -1269,7 +1257,7 @@ impl LL {
     pub fn least_num_data() -> usize {
         1
     }
-    
+
     pub fn first_forecast_index() -> usize {
         0
     }
@@ -1282,16 +1270,16 @@ pub struct LLP1 {
 
 impl LLP1 {
     /// Create a new LLP1 model (variant of LLP with maximum variance)
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the underlying LLP model creation fails.
     pub fn new(datafeed: Datafeed, period: i32, forecast_len: usize) -> Result<Self, Error> {
         let mut llp = LLP::new(datafeed, period, forecast_len)?;
         // LLP1's compute_states: set self.p[i] = max(self.p[i-1], self.p[i])
         for i in 1..llp.p.len() {
-            let prev = if !llp.p[i-1].is_nan() {
-                llp.p[i-1]
+            let prev = if !llp.p[i - 1].is_nan() {
+                llp.p[i - 1]
             } else {
                 f64::NEG_INFINITY
             };
@@ -1308,15 +1296,14 @@ impl LLP1 {
         }
         Ok(Self { llp })
     }
-    
+
     /// Create a new LLP1 model (panics on error)
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// Panics if the underlying LLP model creation fails.
     pub fn new_or_panic(datafeed: Datafeed, period: i32, forecast_len: usize) -> Self {
-        Self::new(datafeed, period, forecast_len)
-            .expect("Failed to create LLP1 model")
+        Self::new(datafeed, period, forecast_len).expect("Failed to create LLP1 model")
     }
 }
 
@@ -1333,7 +1320,7 @@ impl StateSpaceModel for LLP1 {
     fn state(&self, i: usize) -> f64 {
         self.llp.state(i)
     }
-    
+
     fn var(&self, i: usize) -> f64 {
         self.llp.var(i)
     }
@@ -1342,15 +1329,15 @@ impl StateSpaceModel for LLP1 {
         // Directly return p[i], consistent with Python's self.algos[ts_idx].p[i]
         self.llp.p(i)
     }
-    
+
     fn datalen(&self) -> usize {
         self.llp.datalen()
     }
-    
+
     fn least_num_data(&self) -> usize {
         self.llp.least_num_data()
     }
-    
+
     fn first_forecast_index(&self) -> usize {
         self.llp.first_forecast_index()
     }
@@ -1367,13 +1354,16 @@ pub struct LLP2 {
 
 impl LLP2 {
     /// Create a new LLP2 model (combines LL and LLP)
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the period is less than 2.
     pub fn new(datafeed: Datafeed, period: i32, forecast_len: usize) -> Result<Self, Error> {
         if period < 2 {
-            bail!("Invalid parameter 'period': {} - period must be >= 2 for LLP2 model", period);
+            bail!(
+                "Invalid parameter 'period': {} - period must be >= 2 for LLP2 model",
+                period
+            );
         }
         let period = period as usize;
         let data_len = datafeed.len();
@@ -1390,18 +1380,18 @@ impl LLP2 {
         llp2.compute_states();
         Ok(llp2)
     }
-    
+
     fn compute_states(&mut self) {
         for i in 0..self.fc.len() {
             self.combine(i);
         }
     }
-    
+
     fn combine(&mut self, i: usize) {
         // Get fc and p values from model1 (direct array access, consistent with Python)
         let fc1_val = self.model1.get_fc(i);
         let p1_val = self.model1.get_p(i);
-        
+
         // Get fc and p values from model2 (direct array access, consistent with Python)
         let fc2_val = if i < self.model2.fc.len() {
             let val = self.model2.fc[i];
@@ -1415,7 +1405,7 @@ impl LLP2 {
         } else {
             None
         };
-        
+
         // Consistent with Python implementation: check if None
         if fc1_val.is_none() || p1_val.is_none() {
             if let (Some(fc2), Some(p2)) = (fc2_val, p2_val) {
@@ -1435,11 +1425,16 @@ impl LLP2 {
                 self.fc[i] = f64::NAN;
             }
         } else {
-            let fc1 = fc1_val.unwrap();
-            let p1 = p1_val.unwrap();
-            let fc2 = fc2_val.unwrap();
-            let p2 = p2_val.unwrap();
-            
+            // Both pairs have Some values
+            let (fc1, p1, fc2, p2) = match (fc1_val, p1_val, fc2_val, p2_val) {
+                (Some(fc1), Some(p1), Some(fc2), Some(p2)) => (fc1, p1, fc2, p2),
+                _ => {
+                    self.p[i] = f64::NAN;
+                    self.fc[i] = f64::NAN;
+                    return;
+                }
+            };
+
             if p1 == 0.0 && p2 == 0.0 {
                 self.p[i] = 0.0;
                 self.fc[i] = (fc1 + fc2) / 2.0;
@@ -1450,31 +1445,25 @@ impl LLP2 {
             }
         }
     }
-    
+
     pub fn first_forecast_index(&self) -> usize {
-        self.model1.first_forecast_index().min(self.model2.first_forecast_index())
+        self.model1
+            .first_forecast_index()
+            .min(self.model2.first_forecast_index())
     }
-    
+
     pub fn variance(&self, i: usize) -> f64 {
-        if i < self.p.len() {
-            self.p[i]
-        } else {
-            0.0
-        }
+        if i < self.p.len() { self.p[i] } else { 0.0 }
     }
-    
+
     pub fn state(&self, i: usize) -> f64 {
-        if i < self.fc.len() {
-            self.fc[i]
-        } else {
-            0.0
-        }
+        if i < self.fc.len() { self.fc[i] } else { 0.0 }
     }
-    
+
     pub fn var(&self, i: usize) -> f64 {
         self.variance(i)
     }
-    
+
     pub fn datalen(&self) -> usize {
         self.data_len
     }
@@ -1484,7 +1473,7 @@ impl StateSpaceModel for LLP2 {
     fn state(&self, i: usize) -> f64 {
         self.state(i)
     }
-    
+
     fn var(&self, i: usize) -> f64 {
         self.var(i)
     }
@@ -1492,15 +1481,15 @@ impl StateSpaceModel for LLP2 {
     fn p(&self, i: usize) -> f64 {
         get_p_value(&self.p, i)
     }
-    
+
     fn datalen(&self) -> usize {
         self.datalen()
     }
-    
+
     fn least_num_data(&self) -> usize {
         self.model2.least_num_data()
     }
-    
+
     fn first_forecast_index(&self) -> usize {
         self.first_forecast_index()
     }
@@ -1517,9 +1506,9 @@ pub struct LLP5 {
 
 impl LLP5 {
     /// Create a new LLP5 model (combines LLT and LLP1)
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if model creation fails.
     pub fn new(datafeed: Datafeed, period: i32, forecast_len: usize) -> Result<Self, Error> {
         let data_len = datafeed.len();
@@ -1538,7 +1527,7 @@ impl LLP5 {
         } else {
             None
         };
-        
+
         let fc_len = data_len + forecast_len;
         let mut llp5 = Self {
             model1,
@@ -1550,14 +1539,14 @@ impl LLP5 {
         llp5.compute_states();
         Ok(llp5)
     }
-    
+
     fn compute_states(&mut self) {
         let first_idx = self.model1.first_forecast_index();
         for i in first_idx..self.fc.len() {
             self.combine(i);
         }
     }
-    
+
     fn combine(&mut self, i: usize) {
         // Get fc and p values from model1 (direct array access, consistent with Python)
         let fc1_val = if i < self.model1.fc.len() {
@@ -1572,7 +1561,7 @@ impl LLP5 {
         } else {
             None
         };
-        
+
         // Get fc and p values from model2 (direct array access, consistent with Python)
         if let Some(ref m2) = self.model2 {
             let p2_val = if i < m2.llp.p.len() {
@@ -1587,7 +1576,7 @@ impl LLP5 {
             } else {
                 None
             };
-            
+
             if p1_val.is_none() || fc1_val.is_none() {
                 if let (Some(fc2), Some(p2)) = (fc2_val, p2_val) {
                     self.p[i] = p2;
@@ -1605,11 +1594,16 @@ impl LLP5 {
                     self.fc[i] = f64::NAN;
                 }
             } else {
-                let fc1 = fc1_val.unwrap();
-                let p1 = p1_val.unwrap();
-                let fc2 = fc2_val.unwrap();
-                let p2 = p2_val.unwrap();
-                
+                // Both pairs have Some values
+                let (fc1, p1, fc2, p2) = match (fc1_val, p1_val, fc2_val, p2_val) {
+                    (Some(fc1), Some(p1), Some(fc2), Some(p2)) => (fc1, p1, fc2, p2),
+                    _ => {
+                        self.p[i] = f64::NAN;
+                        self.fc[i] = f64::NAN;
+                        return;
+                    }
+                };
+
                 if p1 == 0.0 && p2 == 0.0 {
                     self.p[i] = 0.0;
                     self.fc[i] = (fc1 + fc2) / 2.0;
@@ -1619,41 +1613,31 @@ impl LLP5 {
                     self.p[i] = (1.0 - k) * p1;
                 }
             }
+        } else if let (Some(fc1), Some(p1)) = (fc1_val, p1_val) {
+            self.p[i] = p1;
+            self.fc[i] = fc1;
         } else {
-            if let (Some(fc1), Some(p1)) = (fc1_val, p1_val) {
-                self.p[i] = p1;
-                self.fc[i] = fc1;
-            } else {
-                self.p[i] = f64::NAN;
-                self.fc[i] = f64::NAN;
-            }
+            self.p[i] = f64::NAN;
+            self.fc[i] = f64::NAN;
         }
     }
-    
+
     pub fn first_forecast_index(&self) -> usize {
         self.model1.first_forecast_index()
     }
-    
+
     pub fn variance(&self, i: usize) -> f64 {
-        if i < self.p.len() {
-            self.p[i]
-        } else {
-            0.0
-        }
+        if i < self.p.len() { self.p[i] } else { 0.0 }
     }
-    
+
     pub fn state(&self, i: usize) -> f64 {
-        if i < self.fc.len() {
-            self.fc[i]
-        } else {
-            0.0
-        }
+        if i < self.fc.len() { self.fc[i] } else { 0.0 }
     }
-    
+
     pub fn var(&self, i: usize) -> f64 {
         self.variance(i)
     }
-    
+
     pub fn datalen(&self) -> usize {
         self.data_len
     }
@@ -1663,7 +1647,7 @@ impl StateSpaceModel for LLP5 {
     fn state(&self, i: usize) -> f64 {
         self.state(i)
     }
-    
+
     fn var(&self, i: usize) -> f64 {
         self.var(i)
     }
@@ -1671,15 +1655,15 @@ impl StateSpaceModel for LLP5 {
     fn p(&self, i: usize) -> f64 {
         get_p_value(&self.p, i)
     }
-    
+
     fn datalen(&self) -> usize {
         self.datalen()
     }
-    
+
     fn least_num_data(&self) -> usize {
         self.model1.least_num_data()
     }
-    
+
     fn first_forecast_index(&self) -> usize {
         self.first_forecast_index()
     }
@@ -1708,7 +1692,7 @@ impl LLT2 {
         let data_start = datafeed.get_start();
         let step = datafeed.get_step();
         let i = data_start + step;
-        
+
         // If second data point is missing, fill it
         if i < datafeed.get_end() && datafeed.get_val(i).is_nan() {
             let mut j = i + step;
@@ -1722,7 +1706,7 @@ impl LLT2 {
             };
             datafeed.set_val(i, fillval);
         }
-        
+
         let data_len = datafeed.len();
         let mut llt2 = Self {
             datafeed,
@@ -1740,11 +1724,11 @@ impl LLT2 {
             fcstart: 0,
             pstart: 0,
         };
-        
+
         llt2.compute_states();
         llt2
     }
-    
+
     fn compute_states(&mut self) {
         self.fcstart = self.datafeed.get_start();
         self.pstart = self.fcstart;
@@ -1758,7 +1742,7 @@ impl LLT2 {
         self.zeta = psi[0].exp();
         self.eta = psi[1].exp();
         self.update_all(self.zeta, self.eta);
-        
+
         // Calculate predictions
         let fcend = self.cur_state_end;
         let pend = self.cur_state_end;
@@ -1774,26 +1758,36 @@ impl LLT2 {
             }
         }
     }
-    
-    fn update_kalman(&self, y: f64, a: &mut [f64], p: &mut [f64], p2: &mut [f64], k: &mut [f64], zeta: f64, eta: f64) -> (f64, f64, f64) {
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_kalman(
+        &self,
+        y: f64,
+        a: &mut [f64],
+        p: &mut [f64],
+        p2: &mut [f64],
+        k: &mut [f64],
+        zeta: f64,
+        eta: f64,
+    ) -> (f64, f64, f64) {
         if y.is_nan() {
             let f = p[0] + 1.0;
-            a[0] = a[0] + a[1];
+            a[0] += a[1];
             p2[0] = p[0] + zeta;
             p2[1] = p[1];
             p2[2] = p[2];
             p2[3] = p[3] + eta;
             return (0.0, f, f.ln());
         }
-        
+
         let x1 = p[0] + p[2];
         let x2 = p[1] + p[3];
         let f = p[0] + 1.0;
         k[0] = x1 / f;
         k[1] = p[2] / f;
         let v = y - a[0];
-        a[0] = a[0] + a[1] + v * k[0];
-        a[1] = a[1] + v * k[1];
+        a[0] += a[1] + v * k[0];
+        a[1] += v * k[1];
         let l0 = 1.0 - k[0];
         p2[0] = x1 * l0 + x2 + zeta;
         p2[1] = x2 - x1 * k[1];
@@ -1801,25 +1795,30 @@ impl LLT2 {
         p2[3] = p[3] - p[2] * k[1] + eta;
         (v, f, f.ln())
     }
-    
+
     fn steady_update(&self, y: f64, a: &mut [f64], k: &[f64]) -> f64 {
         if y.is_nan() {
-            a[0] = a[0] + a[1];
+            a[0] += a[1];
             return 0.0;
         }
         let v = y - a[0];
-        a[0] = a[0] + a[1] + v * k[0];
-        a[1] = a[1] + v * k[1];
+        a[0] += a[1] + v * k[0];
+        a[1] += v * k[1];
         v
     }
-    
+
     fn llh(&self, zeta: f64, eta: f64) -> f64 {
         let mut datafeed = self.datafeed.clone();
         datafeed.reset();
         let pt1 = datafeed.next().unwrap();
         let pt2 = datafeed.next().unwrap();
         let mut a = vec![2.0 * pt2 - pt1, pt2 - pt1];
-        let mut p = vec![5.0 + 2.0 * zeta + eta, 3.0 + zeta + eta, 3.0 + zeta + eta, 2.0 + zeta + 2.0 * eta];
+        let mut p = vec![
+            5.0 + 2.0 * zeta + eta,
+            3.0 + zeta + eta,
+            3.0 + zeta + eta,
+            2.0 + zeta + 2.0 * eta,
+        ];
         let mut p2 = vec![0.0; 4];
         let f = p[0] + 1.0;
         let lf = f.ln();
@@ -1827,10 +1826,11 @@ impl LLT2 {
         let mut t1 = 0.0;
         let mut t2 = 0.0;
         let mut steady = false;
-        
+
         for y in datafeed {
             if !steady {
-                let (v, f_val, lf_val) = self.update_kalman(y, &mut a, &mut p, &mut p2, &mut k, zeta, eta);
+                let (v, f_val, lf_val) =
+                    self.update_kalman(y, &mut a, &mut p, &mut p2, &mut k, zeta, eta);
                 let mut norm = 0.0;
                 for i in 0..4 {
                     norm += (p2[i] - p[i]).abs();
@@ -1838,9 +1838,7 @@ impl LLT2 {
                 if norm < 0.001 {
                     steady = true;
                 }
-                for i in 0..4 {
-                    p[i] = p2[i];
-                }
+                p[..4].copy_from_slice(&p2[..4]);
                 t1 += v * v / f_val;
                 t2 += lf_val;
             } else {
@@ -1849,21 +1847,26 @@ impl LLT2 {
                 t2 += lf;
             }
         }
-        
+
         if t1 == 0.0 {
             -t2
         } else {
             -(self.datafeed.len() as f64 - 2.0) * t1.ln() - t2
         }
     }
-    
+
     fn update_all(&mut self, zeta: f64, eta: f64) {
         let mut datafeed = self.datafeed.clone();
         datafeed.reset();
         let pt1 = datafeed.next().unwrap();
         let pt2 = datafeed.next().unwrap();
         let mut a = vec![2.0 * pt2 - pt1, pt2 - pt1];
-        let mut p = vec![5.0 + 2.0 * zeta + eta, 3.0 + zeta + eta, 3.0 + zeta + eta, 2.0 + zeta + 2.0 * eta];
+        let mut p = vec![
+            5.0 + 2.0 * zeta + eta,
+            3.0 + zeta + eta,
+            3.0 + zeta + eta,
+            2.0 + zeta + 2.0 * eta,
+        ];
         let mut p2 = vec![0.0; 4];
         let f = p[0] + 1.0;
         let mut k = vec![(p[0] + p[2]) / f, p[2] / f];
@@ -1871,17 +1874,18 @@ impl LLT2 {
         let mut steady = false;
         let mut i = self.fcstart + 2 * self.state_step;
         let b = i;
-        
+
         self.fc[self.fcstart] = pt1;
         self.trend[self.fcstart] = 0.0;
         self.p[self.pstart] = 1.0 + zeta;
         self.fc[self.fcstart + self.state_step] = pt2;
         self.trend[self.fcstart + self.state_step] = pt2 - pt1;
         self.p[self.pstart + self.state_step] = 5.0 + 2.0 * zeta;
-        
+
         for y in datafeed.skip(2) {
             if !steady {
-                let (v, f_val, _) = self.update_kalman(y, &mut a, &mut p, &mut p2, &mut k, zeta, eta);
+                let (v, f_val, _) =
+                    self.update_kalman(y, &mut a, &mut p, &mut p2, &mut k, zeta, eta);
                 let mut norm = 0.0;
                 for j in 0..4 {
                     norm += (p2[j] - p[j]).abs();
@@ -1889,9 +1893,7 @@ impl LLT2 {
                 if norm < 0.001 {
                     steady = true;
                 }
-                for j in 0..4 {
-                    p[j] = p2[j];
-                }
+                p[..4].copy_from_slice(&p2[..4]);
                 self.fc[i] = a[0];
                 self.trend[i] = a[1];
                 epsilon += v * v / f_val;
@@ -1905,7 +1907,7 @@ impl LLT2 {
             }
             i += self.state_step;
         }
-        
+
         self.epsilon = epsilon / ((i - b) / self.state_step).max(1) as f64;
         self.zeta = zeta * self.epsilon;
         self.eta = eta * self.epsilon;
@@ -1918,32 +1920,24 @@ impl LLT2 {
         }
         self.cur_state_end = i;
     }
-    
+
     pub fn variance(&self, i: usize) -> f64 {
         let n = self.datafeed.get_end();
         if i < n - 2 {
-            if i < self.p.len() {
-                self.p[i]
-            } else {
-                0.0
-            }
+            if i < self.p.len() { self.p[i] } else { 0.0 }
         } else {
             self.var + ((i as i32 - n as i32 + 3) as f64) * self.zeta
         }
     }
-    
+
     pub fn state(&self, i: usize) -> f64 {
-        if i < self.fc.len() {
-            self.fc[i]
-        } else {
-            0.0
-        }
+        if i < self.fc.len() { self.fc[i] } else { 0.0 }
     }
-    
+
     pub fn var(&self, i: usize) -> f64 {
         self.variance(i)
     }
-    
+
     pub fn datalen(&self) -> usize {
         self.datafeed.len()
     }
@@ -1953,7 +1947,7 @@ impl StateSpaceModel for LLT2 {
     fn state(&self, i: usize) -> f64 {
         self.state(i)
     }
-    
+
     fn var(&self, i: usize) -> f64 {
         self.var(i)
     }
@@ -1961,20 +1955,19 @@ impl StateSpaceModel for LLT2 {
     fn p(&self, i: usize) -> f64 {
         get_p_value(&self.p, i)
     }
-    
+
     fn datalen(&self) -> usize {
         self.datalen()
     }
-    
+
     fn least_num_data(&self) -> usize {
         2
     }
-    
+
     fn first_forecast_index(&self) -> usize {
         0
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1986,7 +1979,7 @@ mod tests {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let df = Datafeed::new(data, 0, 5, 1);
         let ll0 = LL0::new(df, 3);
-        
+
         // Test basic functionality
         assert!(ll0.state(0).is_finite());
         assert!(ll0.var(0) >= 0.0);
@@ -1998,7 +1991,7 @@ mod tests {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let df = Datafeed::new(data, 0, 5, 1);
         let ll = LL::new(df, 3).expect("Failed to create LL model");
-        
+
         assert!(ll.state(0).is_finite());
         assert!(ll.var(0) >= 0.0);
         assert_eq!(ll.datalen(), 5);
@@ -2010,7 +2003,7 @@ mod tests {
         let data: Vec<f64> = (0..2500).map(|i| i as f64).collect();
         let df = Datafeed::new(data, 0, 2500, 1);
         let ll = LL::new(df, 3).expect("Failed to create LL model");
-        
+
         assert!(ll.state(0).is_finite());
         assert!(ll.state(1000).is_finite());
         assert!(ll.state(2000).is_finite());
@@ -2022,7 +2015,7 @@ mod tests {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let df = Datafeed::new(data, 0, 6, 1);
         let llt = LLT::new(df, 3).expect("Failed to create LLT model");
-        
+
         assert!(llt.state(0).is_finite());
         assert!(llt.var(0) >= 0.0);
         assert_eq!(llt.datalen(), 6);
@@ -2042,7 +2035,7 @@ mod tests {
         let data = vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0];
         let df = Datafeed::new(data, 0, 8, 1);
         let llp = LLP::new(df, 3, 3).expect("Failed to create LLP model");
-        
+
         assert!(llp.state(0).is_finite());
         assert!(llp.var(0) >= 0.0);
         assert_eq!(llp.datalen(), 8);
@@ -2053,7 +2046,7 @@ mod tests {
         let data = vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0];
         let df = Datafeed::new(data, 0, 6, 1);
         let llp1 = LLP1::new(df, 3, 3).expect("Failed to create LLP1 model");
-        
+
         assert!(llp1.state(0).is_finite());
         assert_eq!(llp1.datalen(), 6);
     }
@@ -2063,7 +2056,7 @@ mod tests {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let df = Datafeed::new(data, 0, 6, 1);
         let llp2 = LLP2::new(df, 2, 3).expect("Failed to create LLP2 model");
-        
+
         assert!(llp2.state(0).is_finite());
         assert_eq!(llp2.datalen(), 6);
     }
@@ -2073,7 +2066,7 @@ mod tests {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let df = Datafeed::new(data, 0, 6, 1);
         let llp5 = LLP5::new(df, 2, 3).expect("Failed to create LLP5 model");
-        
+
         assert!(llp5.state(0).is_finite());
         assert_eq!(llp5.datalen(), 6);
     }
@@ -2083,7 +2076,7 @@ mod tests {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let df = Datafeed::new(data, 0, 6, 1);
         let llt2 = LLT2::new(df, 3);
-        
+
         assert!(llt2.state(0).is_finite());
         assert!(llt2.var(0) >= 0.0);
         assert!(llt2.var(0) >= 0.0);
@@ -2094,7 +2087,7 @@ mod tests {
     fn test_univar_ll() {
         let data = vec![vec![1.0, 2.0, 3.0, 4.0, 5.0]];
         let univar = Univar::new_or_panic("LL", data, 0, 5, -1, 3);
-        
+
         assert!(univar.state(0, 0).is_finite());
         assert!(univar.var(0, 0) >= 0.0);
         assert_eq!(univar.datalen(), 5);
@@ -2105,7 +2098,7 @@ mod tests {
     fn test_univar_llt() {
         let data = vec![vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]];
         let univar = Univar::new_or_panic("LLT", data, 0, 6, -1, 3);
-        
+
         assert!(univar.state(0, 0).is_finite());
         assert_eq!(univar.datalen(), 6);
     }
@@ -2114,7 +2107,7 @@ mod tests {
     fn test_univar_llp() {
         let data = vec![vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]];
         let univar = Univar::new_or_panic("LLP", data, 0, 6, 3, 3);
-        
+
         assert!(univar.state(0, 0).is_finite());
         assert_eq!(univar.period(), 3);
     }
@@ -2132,7 +2125,7 @@ mod tests {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let df = Datafeed::new(data, 0, 5, 1);
         let ll = LL::new(df, 3).expect("Failed to create LL model");
-        
+
         // Test trait methods
         assert_eq!(ll.least_num_data(), 1);
         assert_eq!(ll.first_forecast_index(), 0);
@@ -2143,7 +2136,7 @@ mod tests {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let df = Datafeed::new(data, 0, 6, 1);
         let llt = LLT::new(df, 3).expect("Failed to create LLT model");
-        
+
         assert_eq!(llt.least_num_data(), 2);
         assert_eq!(llt.first_forecast_index(), 0);
     }
@@ -2153,7 +2146,7 @@ mod tests {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let df = Datafeed::new(data.clone(), 0, 5, 1);
         let ll = LL::new(df, 3).expect("Failed to create LL model");
-        
+
         // State values should be in reasonable range
         for i in 0..5 {
             let state = ll.state(i);
@@ -2168,7 +2161,7 @@ mod tests {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let df = Datafeed::new(data, 0, 5, 1);
         let ll = LL::new(df, 3).expect("Failed to create LL model");
-        
+
         // Variance should be non-negative
         for i in 0..5 {
             let var = ll.var(i);

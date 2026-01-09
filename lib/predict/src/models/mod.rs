@@ -4,8 +4,8 @@
 
 use anyhow::Error;
 
-pub mod univariate;
 pub mod multivariate;
+pub mod univariate;
 
 /// Default forecast length
 pub const FORECAST: usize = 3;
@@ -49,17 +49,10 @@ pub fn is_supported_algorithm(algorithm: &str) -> bool {
 
 /// Check if algorithm is univariate
 pub fn is_univariate_algorithm(algorithm: &str) -> bool {
-    matches!(
-        algorithm,
-        "LL" | "LLT" | "LLP" | "LLP1" | "LLP2" | "LLP5"
-    )
+    matches!(algorithm, "LL" | "LLT" | "LLP" | "LLP1" | "LLP2" | "LLP5")
 }
 
 /// Check if algorithm is multivariate
 pub fn is_multivariate_algorithm(algorithm: &str) -> bool {
-    matches!(
-        algorithm,
-        "LLB" | "LLBmv" | "BiLL" | "BiLLmv"
-    )
+    matches!(algorithm, "LLB" | "LLBmv" | "BiLL" | "BiLLmv")
 }
-

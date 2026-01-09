@@ -13,12 +13,13 @@
 //!     - `multivariate`: Multivariate models
 
 pub mod dist;
+pub mod models;
 pub mod optimize;
 pub mod statespace;
 pub mod utils;
-pub mod models;
 
 // Re-export commonly used types and functions for external use
-pub use crate::statespace::{Datafeed, Univar, Multivar, is_univariate_algorithm, is_multivariate_algorithm};
+pub use crate::statespace::{
+    Datafeed, Multivar, Univar, is_multivariate_algorithm, is_univariate_algorithm,
+};
 pub use anyhow::Error;
-

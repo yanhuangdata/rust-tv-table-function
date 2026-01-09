@@ -2,21 +2,21 @@
 //!
 //! Implements DFP, BFGS and other optimization algorithms
 
-use std::f64;
-use std::ops::{Add, Sub, Mul, Div, Neg, Index, IndexMut};
 use anyhow::{Error, bail};
+use std::f64;
+use std::ops::{Add, Div, Index, IndexMut, Mul, Neg, Sub};
 
 const EPS: f64 = 1.0e-10;
 const TAB: usize = 10;
 
 /// Default tolerance for DFP optimization algorithm (consistent with Python implementation)
-/// 
+///
 /// Note: Ensure the same tolerance value (1e-3) is used as Python version's dfpmin
 /// If Python version uses different tolerance, this constant needs to be updated accordingly
 pub const DFP_TOLERANCE: f64 = 1e-3;
 
 /// Maximum number of iterations for DFP optimization algorithm (consistent with Python implementation)
-/// 
+///
 /// Note: Ensure the same maximum number of iterations (200) is used as Python version's dfpmin
 pub const DFP_MAX_ITER: usize = 200;
 
@@ -33,9 +33,9 @@ pub struct Mat {
 
 impl Mat {
     /// Create matrix from array
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if nrow or ncol is zero.
     pub fn new(mut a: Vec<f64>, nrow: usize, ncol: usize) -> Result<Self, Error> {
         if nrow == 0 || ncol == 0 {
@@ -54,20 +54,20 @@ impl Mat {
 
         Ok(Self { cols, nrow, ncol })
     }
-    
+
     /// Create matrix from array (panics on error)
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// Panics if nrow or ncol is zero.
     pub fn new_or_panic(a: Vec<f64>, nrow: usize, ncol: usize) -> Self {
         Self::new(a, nrow, ncol).expect("Failed to create matrix")
     }
 
     /// Create matrix from 2D array
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the array is empty or columns have different lengths.
     pub fn from_array(ar: Vec<Vec<f64>>) -> Result<Self, Error> {
         if ar.is_empty() || ar[0].is_empty() {
@@ -86,28 +86,28 @@ impl Mat {
             ncol,
         })
     }
-    
+
     /// Create matrix from 2D array (panics on error)
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// Panics if the array is empty or columns have different lengths.
     pub fn from_array_or_panic(ar: Vec<Vec<f64>>) -> Self {
         Self::from_array(ar).expect("Failed to create matrix from array")
     }
 
     /// Create identity matrix
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if n is zero.
     pub fn id(n: usize) -> Result<Self, Error> {
         if n == 0 {
             bail!("matrix dimension must be positive");
         }
         let mut cols = vec![vec![0.0; n]; n];
-        for i in 0..n {
-            cols[i][i] = 1.0;
+        for (i, col) in cols.iter_mut().enumerate().take(n) {
+            col[i] = 1.0;
         }
         Ok(Self {
             cols,
@@ -115,20 +115,20 @@ impl Mat {
             ncol: n,
         })
     }
-    
+
     /// Create identity matrix (panics on error)
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// Panics if n is zero.
     pub fn id_or_panic(n: usize) -> Self {
         Self::id(n).expect("Failed to create identity matrix")
     }
 
     /// Create zero matrix
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if nrow or ncol is zero.
     pub fn zero(nrow: usize, ncol: usize) -> Result<Self, Error> {
         if nrow == 0 || ncol == 0 {
@@ -140,20 +140,20 @@ impl Mat {
             ncol,
         })
     }
-    
+
     /// Create zero matrix (panics on error)
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// Panics if nrow or ncol is zero.
     pub fn zero_or_panic(nrow: usize, ncol: usize) -> Self {
         Self::zero(nrow, ncol).expect("Failed to create zero matrix")
     }
 
     /// Get row
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the row index is out of bounds.
     pub fn row(&self, i: usize) -> Result<Vec<f64>, Error> {
         if i >= self.nrow {
@@ -163,9 +163,9 @@ impl Mat {
     }
 
     /// Get column
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the column index is out of bounds.
     pub fn col(&self, i: usize) -> Result<&Vec<f64>, Error> {
         if i >= self.ncol {
@@ -177,9 +177,9 @@ impl Mat {
     /// Transpose
     pub fn t(&self) -> Self {
         let mut cols = vec![vec![0.0; self.ncol]; self.nrow];
-        for i in 0..self.nrow {
-            for j in 0..self.ncol {
-                cols[i][j] = self.cols[j][i];
+        for (i, col) in cols.iter_mut().enumerate().take(self.nrow) {
+            for (j, cell) in col.iter_mut().enumerate().take(self.ncol) {
+                *cell = self.cols[j][i];
             }
         }
         Self {
@@ -190,9 +190,9 @@ impl Mat {
     }
 
     /// Trace
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the matrix is not square.
     pub fn tr(&self) -> Result<f64, Error> {
         if self.nrow != self.ncol {
@@ -209,11 +209,7 @@ impl Mat {
             .flat_map(|col| col.iter())
             .map(|x| x.abs().powf(p))
             .sum();
-        if p > 1.0 {
-            s.powf(1.0 / p)
-        } else {
-            s
-        }
+        if p > 1.0 { s.powf(1.0 / p) } else { s }
     }
 
     /// Matrix size
@@ -261,9 +257,9 @@ impl Add for &Mat {
             panic!("Mat::add: dimensions must match");
         }
         let mut cols = vec![vec![0.0; self.nrow]; self.ncol];
-        for i in 0..self.ncol {
-            for j in 0..self.nrow {
-                cols[i][j] = self.cols[i][j] + other.cols[i][j];
+        for (i, col) in cols.iter_mut().enumerate().take(self.ncol) {
+            for (j, cell) in col.iter_mut().enumerate().take(self.nrow) {
+                *cell = self.cols[i][j] + other.cols[i][j];
             }
         }
         Mat {
@@ -306,9 +302,9 @@ impl Sub for &Mat {
             panic!("Mat::sub: dimensions must match");
         }
         let mut cols = vec![vec![0.0; self.nrow]; self.ncol];
-        for i in 0..self.ncol {
-            for j in 0..self.nrow {
-                cols[i][j] = self.cols[i][j] - other.cols[i][j];
+        for (i, col) in cols.iter_mut().enumerate().take(self.ncol) {
+            for (j, cell) in col.iter_mut().enumerate().take(self.nrow) {
+                *cell = self.cols[i][j] - other.cols[i][j];
             }
         }
         Mat {
@@ -508,7 +504,11 @@ where
     let p_clone = p.to_vec();
     let u_clone = u.to_vec();
     move |t: f64| {
-        let x: Vec<f64> = p_clone.iter().zip(u_clone.iter()).map(|(a, b)| a + t * b).collect();
+        let x: Vec<f64> = p_clone
+            .iter()
+            .zip(u_clone.iter())
+            .map(|(a, b)| a + t * b)
+            .collect();
         fn_clone(&x)
     }
 }
@@ -536,7 +536,7 @@ where
         let mut fac = CON2;
         for j in 1..=i {
             der_a[j][i] = (der_a[j - 1][i] * fac - der_a[j - 1][i - 1]) / (fac - 1.0);
-            fac = CON2 * fac;
+            fac *= CON2;
             let errt = (der_a[j][i] - der_a[j - 1][i])
                 .abs()
                 .max((der_a[j][i] - der_a[j - 1][i - 1]).abs());
@@ -622,15 +622,7 @@ fn ip(a1: f64, fa1: f64, da1: f64, a2: f64, fa2: f64, da2: f64) -> f64 {
 }
 
 /// Line search zoom function
-fn zoom<F>(
-    mut fn_: F,
-    f0: f64,
-    df0: f64,
-    mut a_lo: f64,
-    mut a_hi: f64,
-    c1: f64,
-    c2: f64,
-) -> f64
+fn zoom<F>(mut fn_: F, f0: f64, df0: f64, mut a_lo: f64, mut a_hi: f64, c1: f64, c2: f64) -> f64
 where
     F: FnMut(f64) -> f64,
 {
@@ -733,14 +725,14 @@ where
     let mut f2 = 0.0;
     let n = xold.len();
     let mut sum = 0.0;
-    for i in 0..n {
-        sum += p[i] * p[i];
+    for val in p.iter().take(n) {
+        sum += val * val;
     }
     sum = sum.sqrt();
 
     if sum > stpmax {
-        for i in 0..n {
-            p[i] *= stpmax / sum;
+        for val in p.iter_mut().take(n) {
+            *val *= stpmax / sum;
         }
     }
 
@@ -771,9 +763,7 @@ where
         let f = func(x);
 
         if alam < alamin {
-            for i in 0..n {
-                x[i] = xold[i];
-            }
+            x[..n].copy_from_slice(&xold[..n]);
             return f;
         } else if f <= fold + ALF * alam * slope {
             return f;
@@ -808,15 +798,15 @@ where
 }
 
 /// DFP optimization algorithm
-/// 
+///
 /// # Parameters
 /// - `func`: Function to minimize
 /// - `p`: Initial parameter vector (will be modified to optimal value)
 /// - `gtol`: Gradient tolerance (default uses DFP_TOLERANCE = 1e-3, consistent with Python implementation)
-/// 
+///
 /// # Returns
 /// - `(fval, iter)`: Function value and number of iterations
-/// 
+///
 /// # Notes
 /// - Maximum number of iterations is fixed at 200 (consistent with Python implementation)
 /// - If Python version uses different iteration limit, ITMAX constant needs to be updated accordingly
@@ -834,32 +824,32 @@ where
     let mut hdg = vec![0.0; n];
     let mut pnew = vec![0.0; n];
     let mut hessin = vec![vec![0.0; n]; n];
-    
+
     // Initialize identity matrix
-    for i in 0..n {
-        hessin[i][i] = 1.0;
+    for (i, row) in hessin.iter_mut().enumerate().take(n) {
+        row[i] = 1.0;
     }
 
-    let mut fp = func(&p);
-    df(&mut func, &p, fp, &mut g);
-    
+    let mut fp = func(p);
+    df(&mut func, p, fp, &mut g);
+
     if g.iter().map(|x| x * x).sum::<f64>().sqrt() == 0.0 {
         return (fp, 0);
     }
 
     let mut xi: OptVec = g.iter().map(|x| -x).collect();
     let mut sum = 0.0;
-    for i in 0..n {
-        sum += p[i] * p[i];
+    for val in p.iter().take(n) {
+        sum += val * val;
     }
     let stpmax = STPMX * sum.sqrt().max(n as f64);
 
     for its in 0..ITMAX {
         let iter = its;
-        let fret = lnsrch(&mut func, &p, fp, &g, &mut xi, &mut pnew, stpmax);
+        let fret = lnsrch(&mut func, p, fp, &g, &mut xi, &mut pnew, stpmax);
         fp = fret;
-        for i in 0..n {
-            xi[i] = pnew[i] - p[i];
+        for (i, xi_val) in xi.iter_mut().enumerate().take(n) {
+            *xi_val = pnew[i] - p[i];
             p[i] = pnew[i];
         }
 
@@ -875,12 +865,10 @@ where
             return (fret, iter);
         }
 
-        for i in 0..n {
-            dg[i] = g[i];
-        }
+        dg[..n].copy_from_slice(&g[..n]);
 
-        let fp_new = func(&p);
-        df(&mut func, &p, fp_new, &mut g);
+        let fp_new = func(p);
+        df(&mut func, p, fp_new, &mut g);
         let mut test = 0.0;
         let den = fret.max(1.0);
         for i in 0..n {
@@ -920,8 +908,8 @@ where
 
             for i in 0..n {
                 for j in i..n {
-                    hessin[i][j] += fac * xi[i] * xi[j] - fad * hdg[i] * hdg[j]
-                        + fae * dg_new[i] * dg_new[j];
+                    hessin[i][j] +=
+                        fac * xi[i] * xi[j] - fad * hdg[i] * hdg[j] + fae * dg_new[i] * dg_new[j];
                     hessin[j][i] = hessin[i][j];
                 }
             }
@@ -957,7 +945,11 @@ where
         let p_clone = p.clone();
         let fn_mut = &mut fn_;
         let mut line_search_fn = move |t: f64| {
-            let x_new: OptVec = x1_clone.iter().zip(p_clone.iter()).map(|(a, b)| a + t * b).collect();
+            let x_new: OptVec = x1_clone
+                .iter()
+                .zip(p_clone.iter())
+                .map(|(a, b)| a + t * b)
+                .collect();
             fn_mut(&x_new)
         };
         let alpha = line_search(&mut line_search_fn, er, 0.9, 1.1);
@@ -1072,7 +1064,8 @@ mod tests {
 
     #[test]
     fn test_tr() {
-        let m = Mat::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], 3, 3).expect("Failed to create matrix");
+        let m = Mat::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], 3, 3)
+            .expect("Failed to create matrix");
         let trace = tr(&m);
         assert!((trace - 15.0).abs() < 1e-10); // 1 + 5 + 9 = 15
     }
@@ -1120,4 +1113,3 @@ mod tests {
         assert!(result[1].abs() < 0.1);
     }
 }
-

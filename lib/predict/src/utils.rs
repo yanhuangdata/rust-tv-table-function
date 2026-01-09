@@ -2,8 +2,8 @@
 //!
 //! Provides utility functions for missing value handling, autocovariance, correlogram, period finding, etc.
 
-use std::f64;
 use anyhow::{Error, bail};
+use std::f64;
 
 /// Maximum lag
 pub const MAX_LAG: usize = 2000;
@@ -11,13 +11,12 @@ pub const MAX_LAG: usize = 2000;
 pub const MAX_POINTS: usize = 20 * MAX_LAG;
 
 /// Missing value handling helper functions
-/// 
+///
 /// Unify missing value representation, ensure consistency with Python implementation:
 /// - Python uses None to represent missing values
 /// - `Rust internally uses Option<f64>::None or f64::NAN to represent missing values`
-/// 
+///
 /// These functions are used for conversion at the interface layer to ensure algorithm logic consistency
-
 /// `Convert Option<f64> to f64, None to NAN (for internal calculations)`
 pub fn option_to_f64_or_nan(opt: Option<f64>) -> f64 {
     opt.unwrap_or(f64::NAN)
@@ -25,11 +24,7 @@ pub fn option_to_f64_or_nan(opt: Option<f64>) -> f64 {
 
 /// `Convert f64 to Option<f64>, NAN to None (for interface layer)`
 pub fn f64_to_option_or_none(val: f64) -> Option<f64> {
-    if val.is_nan() {
-        None
-    } else {
-        Some(val)
-    }
+    if val.is_nan() { None } else { Some(val) }
 }
 
 /// Check if value is missing (NAN or None)
@@ -97,15 +92,15 @@ fn autocovariance0(data: &[f64], start: usize, end: usize, mean: f64, k: usize) 
 }
 
 /// Calculate correlogram
-/// 
+///
 /// # Errors
-/// 
+///
 /// Returns an error if the variance is zero (all data points are the same).
 fn correlogram0(data: &[f64], start: usize, end: usize, n: usize) -> Result<Vec<f64>, Error> {
     let n_data = end - start;
     let mut mean = 0.0;
-    for i in start..end {
-        mean += data[i];
+    for val in data.iter().take(end).skip(start) {
+        mean += val;
     }
     mean /= n_data as f64;
 
@@ -179,12 +174,16 @@ pub fn find_period(data: &[f64], start: usize, end: usize) -> i32 {
 }
 
 /// Find longest continuous segment (handles missing values)
-pub fn find_longest_continuous_stretch(data: &[Option<f64>], start: usize, end: usize) -> (usize, usize) {
+pub fn find_longest_continuous_stretch(
+    data: &[Option<f64>],
+    start: usize,
+    end: usize,
+) -> (usize, usize) {
     let mut longest_start = start;
     let mut longest_end = start;
     let mut current_start = start;
     let mut current_end = start;
-    
+
     while current_end < end {
         if data[current_end].is_some() {
             current_end += 1;
@@ -200,24 +199,19 @@ pub fn find_longest_continuous_stretch(data: &[Option<f64>], start: usize, end: 
             current_start = current_end;
         }
     }
-    
-    if current_start < end {
-        if current_end - current_start > longest_end - longest_start {
-            longest_start = current_start;
-            longest_end = current_end;
-        }
+
+    if current_start < end && current_end - current_start > longest_end - longest_start {
+        longest_start = current_start;
+        longest_end = current_end;
     }
-    
+
     (longest_start, longest_end)
 }
 
 /// Find period (handles missing values)
 pub fn find_period2(data: &[Option<f64>], start: usize, end: usize) -> i32 {
     let (new_start, new_end) = find_longest_continuous_stretch(data, start, end);
-    let data_vec: Vec<f64> = data[new_start..new_end]
-        .iter()
-        .filter_map(|x| *x)
-        .collect();
+    let data_vec: Vec<f64> = data[new_start..new_end].iter().filter_map(|x| *x).collect();
     find_period0(&data_vec, 0, data_vec.len())
 }
 
@@ -228,7 +222,7 @@ pub fn fillin_mv(data: &mut [Option<f64>], start: usize, end: usize) {
     } else {
         end
     };
-    
+
     let mut i = start;
     while i < end {
         if data[i].is_none() {
@@ -236,7 +230,7 @@ pub fn fillin_mv(data: &mut [Option<f64>], start: usize, end: usize) {
             while j < end && data[j].is_none() {
                 j += 1;
             }
-            
+
             let denom = (j - i + 1) as f64;
             let left = if i > start {
                 data[i - 1].unwrap_or(0.0) / denom
@@ -248,11 +242,11 @@ pub fn fillin_mv(data: &mut [Option<f64>], start: usize, end: usize) {
             } else {
                 data[i - 1].unwrap_or(0.0) / denom
             };
-            
+
             let mut w1 = (denom - 1.0) * left;
             let mut w2 = right;
-            for k in i..j {
-                data[k] = Some(w1 + w2);
+            for val in data.iter_mut().take(j).skip(i) {
+                *val = Some(w1 + w2);
                 w1 -= left;
                 w2 += right;
             }
@@ -267,10 +261,7 @@ pub fn fillin_mv(data: &mut [Option<f64>], start: usize, end: usize) {
 pub fn find_period3(data: &[Option<f64>], start: usize, end: usize) -> i32 {
     let mut data_copy: Vec<Option<f64>> = data.to_vec();
     fillin_mv(&mut data_copy, start, end);
-    let data_vec: Vec<f64> = data_copy[start..end]
-        .iter()
-        .filter_map(|x| *x)
-        .collect();
+    let data_vec: Vec<f64> = data_copy[start..end].iter().filter_map(|x| *x).collect();
     find_period0(&data_vec, 0, data_vec.len())
 }
 
@@ -344,7 +335,12 @@ impl Datafeed {
         }
     }
 
-    pub fn clone_with_params(&self, start: Option<usize>, end: Option<usize>, step: Option<usize>) -> Self {
+    pub fn clone_with_params(
+        &self,
+        start: Option<usize>,
+        end: Option<usize>,
+        step: Option<usize>,
+    ) -> Self {
         Self {
             data: self.data.clone(),
             start: start.unwrap_or(self.start),
@@ -368,6 +364,10 @@ impl Datafeed {
     pub fn len(&self) -> usize {
         (self.end - self.start) / self.step
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl Iterator for Datafeed {
@@ -385,68 +385,78 @@ impl Iterator for Datafeed {
 }
 
 /// Calculate confidence interval for prediction values
-/// 
+///
 /// # Parameters
 /// - `prediction`: Prediction value (mean)
 /// - `variance`: Prediction variance
 /// - `confidence`: Confidence level, e.g., 0.95 for 95% confidence interval
-/// 
+///
 /// # Returns
 /// - `(lower, upper)`: Lower and upper bounds of confidence interval
-/// 
+///
 /// # Errors
-/// 
+///
 /// Returns an error if:
 /// - `variance` is negative
 /// - `confidence` is not in the range (0, 1)
-/// 
+///
 /// # Examples
 /// ```
 /// use predict::utils::prediction_interval;
-/// 
+///
 /// let prediction = 100.0;
 /// let variance = 4.0;
 /// let (lower, upper) = prediction_interval(prediction, variance, 0.95).unwrap();
 /// assert!(lower < prediction);
 /// assert!(upper > prediction);
 /// ```
-pub fn prediction_interval(prediction: f64, variance: f64, confidence: f64) -> Result<(f64, f64), Error> {
+pub fn prediction_interval(
+    prediction: f64,
+    variance: f64,
+    confidence: f64,
+) -> Result<(f64, f64), Error> {
     if variance < 0.0 {
-        bail!("invalid parameter 'variance': {} - variance must be non-negative", variance);
+        bail!(
+            "invalid parameter 'variance': {} - variance must be non-negative",
+            variance
+        );
     }
     if confidence <= 0.0 || confidence >= 1.0 {
-        bail!("invalid parameter 'confidence': {} - confidence must be in (0, 1)", confidence);
+        bail!(
+            "invalid parameter 'confidence': {} - confidence must be in (0, 1)",
+            confidence
+        );
     }
-    
+
     let std_dev = variance.sqrt();
     let std_norm = crate::dist::Normaldist::default();
     // For two-sided confidence interval, need (1 + confidence) / 2 quantile
     // For example, 95% confidence interval needs 97.5% quantile
     let z_score = std_norm.invcdf((1.0 + confidence) / 2.0)?;
-    
+
     let lower = prediction - z_score * std_dev;
     let upper = prediction + z_score * std_dev;
-    
+
     Ok((lower, upper))
 }
 
 /// Calculate 95% confidence interval for prediction values (convenience function)
-/// 
+///
 /// # Parameters
 /// - `prediction`: Prediction value (mean)
 /// - `variance`: Prediction variance
-/// 
+///
 /// # Returns
 /// - `(lower95, upper95)`: Lower and upper bounds of 95% confidence interval
-/// 
+///
 /// # Errors
-/// 
+///
 /// Returns an error if variance is negative.
-/// 
+///
 /// # Examples
 /// ```
 /// use predict::utils::prediction_interval_95;
-/// 
+///
 /// let prediction = 100.0;
 /// let variance = 4.0;
 /// let (lower95, upper95) = prediction_interval_95(prediction, variance).unwrap();
@@ -529,7 +539,14 @@ mod tests {
 
     #[test]
     fn test_find_period2() {
-        let data = vec![Some(1.0), Some(2.0), Some(3.0), Some(1.0), Some(2.0), Some(3.0)];
+        let data = vec![
+            Some(1.0),
+            Some(2.0),
+            Some(3.0),
+            Some(1.0),
+            Some(2.0),
+            Some(3.0),
+        ];
         let period = find_period2(&data, 0, data.len());
         assert!(period >= -1);
     }
@@ -688,25 +705,28 @@ mod tests {
     fn test_prediction_interval() {
         let prediction = 100.0;
         let variance = 4.0; // Standard deviation is 2.0
-        
+
         // Test 95% confidence interval
-        let (lower95, upper95) = prediction_interval_95(prediction, variance).expect("prediction_interval_95 failed");
+        let (lower95, upper95) =
+            prediction_interval_95(prediction, variance).expect("prediction_interval_95 failed");
         assert!(lower95 < prediction);
         assert!(upper95 > prediction);
         // 95% confidence interval should be approximately [96.08, 103.92] (100 ± 1.96 * 2)
         assert!((lower95 - 96.08).abs() < 0.1);
         assert!((upper95 - 103.92).abs() < 0.1);
-        
+
         // Test 90% confidence interval
-        let (lower90, upper90) = prediction_interval(prediction, variance, 0.90).expect("prediction_interval failed");
+        let (lower90, upper90) =
+            prediction_interval(prediction, variance, 0.90).expect("prediction_interval failed");
         assert!(lower90 < prediction);
         assert!(upper90 > prediction);
         // 90% confidence interval should be narrower than 95% confidence interval
         assert!(lower90 > lower95);
         assert!(upper90 < upper95);
-        
+
         // Test 99% confidence interval
-        let (lower99, upper99) = prediction_interval(prediction, variance, 0.99).expect("prediction_interval failed");
+        let (lower99, upper99) =
+            prediction_interval(prediction, variance, 0.99).expect("prediction_interval failed");
         assert!(lower99 < prediction);
         assert!(upper99 > prediction);
         // 99% confidence interval should be wider than 95% confidence interval
@@ -726,4 +746,3 @@ mod tests {
         prediction_interval(100.0, 4.0, 1.5).unwrap();
     }
 }
-
