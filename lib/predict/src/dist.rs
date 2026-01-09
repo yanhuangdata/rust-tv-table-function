@@ -262,15 +262,6 @@ impl Chisqdist {
         Ok(Self { nu: nnu, fac })
     }
 
-    /// Create a new Chi-square distribution (panics on error)
-    ///
-    /// # Panics
-    ///
-    /// Panics if degrees of freedom is not positive.
-    pub fn new_or_panic(nnu: f64) -> Self {
-        Self::new(nnu).expect("Failed to create Chi-square distribution")
-    }
-
     /// Probability density function
     ///
     /// # Errors
@@ -409,15 +400,6 @@ impl Fdist {
             - gammln(0.5 * nu1)?
             - gammln(0.5 * nu2)?;
         Ok(Self { nu1, nu2, fac })
-    }
-
-    /// Create a new F distribution (panics on error)
-    ///
-    /// # Panics
-    ///
-    /// Panics if either degrees of freedom is not positive.
-    pub fn new_or_panic(nnu1: f64, nnu2: f64) -> Self {
-        Self::new(nnu1, nnu2).expect("Failed to create F distribution")
     }
 
     /// Probability density function
@@ -806,15 +788,6 @@ impl Normaldist {
         })
     }
 
-    /// Create a new Normal distribution (panics on error)
-    ///
-    /// # Panics
-    ///
-    /// Panics if sigma is not positive.
-    pub fn new_or_panic(mmu: f64, ssig: f64) -> Self {
-        Self::new(mmu, ssig).expect("Failed to create Normal distribution")
-    }
-
     /// Probability density function
     pub fn pdf(&self, x: f64) -> f64 {
         let mu = self.mu;
@@ -850,7 +823,7 @@ impl Normaldist {
 
 impl Default for Normaldist {
     fn default() -> Self {
-        Self::new_or_panic(0.0, 1.0)
+        Self::new(0.0, 1.0).expect("Failed to create default Normal distribution")
     }
 }
 

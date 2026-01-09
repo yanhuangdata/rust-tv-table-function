@@ -10,74 +10,6 @@ pub const MAX_LAG: usize = 2000;
 /// Maximum number of points
 pub const MAX_POINTS: usize = 20 * MAX_LAG;
 
-/// Missing value handling helper functions
-///
-/// Unify missing value representation, ensure consistency with Python implementation:
-/// - Python uses None to represent missing values
-/// - `Rust internally uses Option<f64>::None or f64::NAN to represent missing values`
-///
-/// These functions are used for conversion at the interface layer to ensure algorithm logic consistency
-/// `Convert Option<f64> to f64, None to NAN (for internal calculations)`
-pub fn option_to_f64_or_nan(opt: Option<f64>) -> f64 {
-    opt.unwrap_or(f64::NAN)
-}
-
-/// `Convert f64 to Option<f64>, NAN to None (for interface layer)`
-pub fn f64_to_option_or_none(val: f64) -> Option<f64> {
-    if val.is_nan() { None } else { Some(val) }
-}
-
-/// Check if value is missing (NAN or None)
-pub fn is_missing(val: f64) -> bool {
-    val.is_nan()
-}
-
-/// Optional value type (for handling missing values)
-#[derive(Clone, Debug)]
-pub enum OptionF64 {
-    Some(f64),
-    None,
-}
-
-impl OptionF64 {
-    pub fn is_some(&self) -> bool {
-        matches!(self, OptionF64::Some(_))
-    }
-
-    pub fn is_none(&self) -> bool {
-        matches!(self, OptionF64::None)
-    }
-
-    pub fn unwrap(&self) -> f64 {
-        match self {
-            OptionF64::Some(x) => *x,
-            OptionF64::None => panic!("OptionF64::unwrap on None"),
-        }
-    }
-
-    pub fn unwrap_or(&self, default: f64) -> f64 {
-        match self {
-            OptionF64::Some(x) => *x,
-            OptionF64::None => default,
-        }
-    }
-}
-
-impl From<f64> for OptionF64 {
-    fn from(x: f64) -> Self {
-        OptionF64::Some(x)
-    }
-}
-
-impl From<Option<f64>> for OptionF64 {
-    fn from(x: Option<f64>) -> Self {
-        match x {
-            Some(v) => OptionF64::Some(v),
-            None => OptionF64::None,
-        }
-    }
-}
-
 /// Calculate autocovariance
 fn autocovariance0(data: &[f64], start: usize, end: usize, mean: f64, k: usize) -> f64 {
     let n = end - start;
@@ -156,21 +88,6 @@ pub fn find_period0(data: &[f64], start: usize, end: usize) -> i32 {
     } else {
         peak_idx as i32
     }
-}
-
-/// Autocovariance wrapper function
-pub fn autocovariance(data: &[f64], mean: f64, k: usize) -> f64 {
-    autocovariance0(data, 0, data.len(), mean, k)
-}
-
-/// Correlogram wrapper function
-pub fn correlogram(data: &[f64], n: usize) -> Vec<f64> {
-    correlogram0(data, 0, data.len(), n).unwrap_or_default()
-}
-
-/// Period finding wrapper function
-pub fn find_period(data: &[f64], start: usize, end: usize) -> i32 {
-    find_period0(data, start, end)
 }
 
 /// Find longest continuous segment (handles missing values)
@@ -455,54 +372,51 @@ pub fn prediction_interval(
 ///
 /// # Examples
 /// ```
-/// use predict::utils::prediction_interval_95;
+/// use predict::utils::prediction_interval;
 ///
 /// let prediction = 100.0;
 /// let variance = 4.0;
-/// let (lower95, upper95) = prediction_interval_95(prediction, variance).unwrap();
+/// let (lower95, upper95) = prediction_interval(prediction, variance, 0.95).unwrap();
 /// assert!(lower95 < prediction);
 /// assert!(upper95 > prediction);
 /// ```
-pub fn prediction_interval_95(prediction: f64, variance: f64) -> Result<(f64, f64), Error> {
-    prediction_interval(prediction, variance, 0.95)
-}
+///
+/// Calculate 95% confidence interval for prediction values (convenience function)
+///
+/// # Parameters
+/// - `prediction`: Prediction value (mean)
+/// - `variance`: Prediction variance
+///
+/// # Returns
+/// - `(lower95, upper95)`: Lower and upper bounds of 95% confidence interval
+///
+/// # Errors
+///
+/// Returns an error if variance is negative.
+///
+/// # Examples
+/// ```
+/// use predict::utils::prediction_interval;
+///
+/// let prediction = 100.0;
+/// let variance = 4.0;
+/// let (lower95, upper95) = prediction_interval(prediction, variance, 0.95).unwrap();
+/// assert!(lower95 < prediction);
+/// assert!(upper95 > prediction);
+/// ```
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_optionf64() {
-        let some_val = OptionF64::Some(3.14);
-        assert!(some_val.is_some());
-        assert!(!some_val.is_none());
-        assert!((some_val.unwrap() - 3.14).abs() < 1e-10);
-        assert!((some_val.unwrap_or(0.0) - 3.14).abs() < 1e-10);
-
-        let none_val = OptionF64::None;
-        assert!(!none_val.is_some());
-        assert!(none_val.is_none());
-        assert!((none_val.unwrap_or(5.0) - 5.0).abs() < 1e-10);
-
-        // Test From trait
-        let from_f64: OptionF64 = 2.5.into();
-        assert!(from_f64.is_some());
-        assert!((from_f64.unwrap() - 2.5).abs() < 1e-10);
-
-        let from_option: OptionF64 = Some(1.5).into();
-        assert!(from_option.is_some());
-        let from_none: OptionF64 = None.into();
-        assert!(from_none.is_none());
-    }
-
-    #[test]
     fn test_autocovariance() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let mean = 3.0;
-        let cov0 = autocovariance(&data, mean, 0);
+        let cov0 = autocovariance0(&data, 0, data.len(), mean, 0);
         assert!(cov0 >= 0.0); // Variance should be non-negative
 
-        let cov1 = autocovariance(&data, mean, 1);
+        let cov1 = autocovariance0(&data, 0, data.len(), mean, 1);
         // Autocovariance should be less than or equal to variance
         assert!(cov1.abs() <= cov0 + 1e-10);
     }
@@ -510,7 +424,7 @@ mod tests {
     #[test]
     fn test_correlogram() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let cor = correlogram(&data, 3);
+        let cor = correlogram0(&data, 0, data.len(), 3).unwrap_or_default();
         assert_eq!(cor.len(), 4); // 0, 1, 2, 3
         assert!((cor[0] - 1.0).abs() < 1e-10); // Autocorrelation is 1 at lag=0
     }
@@ -519,13 +433,13 @@ mod tests {
     fn test_find_period() {
         // Test periodic data
         let periodic_data = vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0];
-        let period = find_period(&periodic_data, 0, periodic_data.len());
+        let period = find_period0(&periodic_data, 0, periodic_data.len());
         // Should be able to find period 3
         assert!(period > 0 || period == -1); // May find period or not
 
         // Test non-periodic data
         let non_periodic = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let period2 = find_period(&non_periodic, 0, non_periodic.len());
+        let period2 = find_period0(&non_periodic, 0, non_periodic.len());
         assert!(period2 >= -1);
     }
 
@@ -616,34 +530,16 @@ mod tests {
     }
 
     #[test]
-    fn test_option_to_f64_or_nan() {
-        assert!(option_to_f64_or_nan(Some(3.14)).is_finite());
-        assert!(option_to_f64_or_nan(None).is_nan());
-    }
-
-    #[test]
-    fn test_f64_to_option_or_none() {
-        assert_eq!(f64_to_option_or_none(3.14), Some(3.14));
-        assert_eq!(f64_to_option_or_none(f64::NAN), None);
-    }
-
-    #[test]
-    fn test_is_missing() {
-        assert!(!is_missing(3.14));
-        assert!(is_missing(f64::NAN));
-    }
-
-    #[test]
     fn test_autocovariance_edge_cases() {
         // Test case where k >= n
         let data2 = vec![1.0, 2.0];
-        let cov2 = autocovariance(&data2, 1.5, 2);
+        let cov2 = autocovariance0(&data2, 0, data2.len(), 1.5, 2);
         assert_eq!(cov2, 0.0);
 
         // Test multi-point data
         let data3 = vec![1.0, 2.0, 3.0];
         let mean3 = 2.0;
-        let cov3 = autocovariance(&data3, mean3, 0);
+        let cov3 = autocovariance0(&data3, 0, data3.len(), mean3, 0);
         assert!(cov3 >= 0.0);
     }
 
@@ -651,13 +547,14 @@ mod tests {
     fn test_correlogram_edge_cases() {
         // Test multi-point data
         let data = vec![1.0, 2.0, 3.0];
-        let cor = correlogram(&data, 2);
+        let cor = correlogram0(&data, 0, data.len(), 2).unwrap_or_default();
         assert_eq!(cor.len(), 3);
         assert!((cor[0] - 1.0).abs() < 1e-10);
 
         // Test non-constant data
         let non_constant_data = vec![1.0, 2.0, 3.0, 4.0];
-        let cor2 = correlogram(&non_constant_data, 2);
+        let cor2 =
+            correlogram0(&non_constant_data, 0, non_constant_data.len(), 2).unwrap_or_default();
         assert_eq!(cor2.len(), 3);
     }
 
@@ -665,7 +562,7 @@ mod tests {
     fn test_find_period_clear_pattern() {
         // Test clear periodic pattern
         let data = vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0];
-        let period = find_period(&data, 0, data.len());
+        let period = find_period0(&data, 0, data.len());
         assert!(period > 0);
     }
 
@@ -708,7 +605,7 @@ mod tests {
 
         // Test 95% confidence interval
         let (lower95, upper95) =
-            prediction_interval_95(prediction, variance).expect("prediction_interval_95 failed");
+            prediction_interval(prediction, variance, 0.95).expect("prediction_interval_95 failed");
         assert!(lower95 < prediction);
         assert!(upper95 > prediction);
         // 95% confidence interval should be approximately [96.08, 103.92] (100 ± 1.96 * 2)

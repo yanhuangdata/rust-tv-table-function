@@ -5,7 +5,7 @@
 use crate::models::{StateSpaceModel, is_multivariate_algorithm, is_supported_algorithm};
 use crate::optimize::{DFP_TOLERANCE, dfpmin};
 use crate::utils::{Datafeed, MAX_LAG};
-use anyhow::{Error, bail};
+use anyhow::{Context, Error, bail};
 use std::f64;
 
 /// Helper function: Get value from p array (handles NaN and out-of-bounds cases)
@@ -36,7 +36,7 @@ pub struct LL0 {
 }
 
 impl LL0 {
-    pub fn new(datafeed: Datafeed, forecast_len: usize) -> Self {
+    pub fn new(datafeed: Datafeed, forecast_len: usize) -> anyhow::Result<Self> {
         Self::new_with_params(
             datafeed,
             None, // fc
@@ -50,7 +50,7 @@ impl LL0 {
             1,    // state_step
             forecast_len,
         )
-        .expect("Failed to create LL0 model")
+        .context("Failed to create LL0 model")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -411,7 +411,7 @@ impl LL {
 
         // If data length is less than or equal to SUBLEN, use LL0 directly
         if data_len <= SUBLEN {
-            let ll0 = LL0::new(datafeed, forecast_len);
+            let ll0 = LL0::new(datafeed, forecast_len)?;
             return Ok(Self {
                 ll0,
                 chunked: false,
@@ -447,13 +447,13 @@ impl LL {
                 0 // Intermediate chunks don't need forecasting
             };
 
-            let chunk_ll0 = LL0::new(chunk_datafeed, chunk_forecast_len);
+            let chunk_ll0 = LL0::new(chunk_datafeed, chunk_forecast_len)?;
             chunks.push(chunk_ll0);
         }
 
         // Create an empty LL0 as placeholder (for compatibility)
         let empty_datafeed = Datafeed::new(vec![0.0], 0, 1, 1);
-        let ll0 = LL0::new(empty_datafeed, forecast_len);
+        let ll0 = LL0::new(empty_datafeed, forecast_len)?;
 
         Ok(Self {
             ll0,
@@ -611,15 +611,6 @@ impl LLT {
 
         llt.compute_states();
         Ok(llt)
-    }
-
-    /// Create a new LLT model (panics on error)
-    ///
-    /// # Panics
-    ///
-    /// Panics if the data has fewer than 2 data points.
-    pub fn new_or_panic(datafeed: Datafeed, forecast_len: usize) -> Self {
-        Self::new(datafeed, forecast_len).expect("Failed to create LLT model: insufficient data")
     }
 
     fn compute_states(&mut self) {
@@ -887,23 +878,6 @@ impl Univar {
         )
     }
 
-    /// Create a new Univar model (panics on error)
-    ///
-    /// # Panics
-    ///
-    /// Panics if the algorithm is unsupported or data is invalid.
-    pub fn new_or_panic(
-        algorithm: &str,
-        data: Vec<Vec<f64>>,
-        data_start: usize,
-        data_end: usize,
-        period: i32,
-        forecast_len: usize,
-    ) -> Self {
-        Self::new(algorithm, data, data_start, data_end, period, forecast_len)
-            .expect("Failed to create Univar model")
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_missing(
         algorithm: &str,
@@ -1097,16 +1071,6 @@ impl LLP {
         Ok(llp)
     }
 
-    /// Create a new LLP model (panics on error)
-    ///
-    /// # Panics
-    ///
-    /// Panics if the data is not periodic or has insufficient data.
-    pub fn new_or_panic(datafeed: Datafeed, period: i32, forecast_len: usize) -> Self {
-        Self::new(datafeed, period, forecast_len)
-            .expect("Failed to create LLP model: data is not periodic or has insufficient data")
-    }
-
     fn set_models(&mut self) -> Result<(), Error> {
         // Fill missing values in first period
         for i in 0..self.period.min(self.data_len) {
@@ -1295,15 +1259,6 @@ impl LLP1 {
             }
         }
         Ok(Self { llp })
-    }
-
-    /// Create a new LLP1 model (panics on error)
-    ///
-    /// # Panics
-    ///
-    /// Panics if the underlying LLP model creation fails.
-    pub fn new_or_panic(datafeed: Datafeed, period: i32, forecast_len: usize) -> Self {
-        Self::new(datafeed, period, forecast_len).expect("Failed to create LLP1 model")
     }
 }
 
@@ -1978,7 +1933,7 @@ mod tests {
     fn test_ll0_basic() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let df = Datafeed::new(data, 0, 5, 1);
-        let ll0 = LL0::new(df, 3);
+        let ll0 = LL0::new(df, 3).unwrap();
 
         // Test basic functionality
         assert!(ll0.state(0).is_finite());
@@ -2022,12 +1977,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_llt_insufficient_data() {
         let data = vec![1.0];
         let df = Datafeed::new(data, 0, 1, 1);
-        // Using new_or_panic which should panic
-        let _ = LLT::new_or_panic(df, 3);
+        // Using new which should return error
+        assert!(LLT::new(df, 3).is_err());
     }
 
     #[test]
@@ -2086,7 +2040,7 @@ mod tests {
     #[test]
     fn test_univar_ll() {
         let data = vec![vec![1.0, 2.0, 3.0, 4.0, 5.0]];
-        let univar = Univar::new_or_panic("LL", data, 0, 5, -1, 3);
+        let univar = Univar::new("LL", data, 0, 5, -1, 3).unwrap();
 
         assert!(univar.state(0, 0).is_finite());
         assert!(univar.var(0, 0) >= 0.0);
@@ -2097,7 +2051,7 @@ mod tests {
     #[test]
     fn test_univar_llt() {
         let data = vec![vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]];
-        let univar = Univar::new_or_panic("LLT", data, 0, 6, -1, 3);
+        let univar = Univar::new("LLT", data, 0, 6, -1, 3).unwrap();
 
         assert!(univar.state(0, 0).is_finite());
         assert_eq!(univar.datalen(), 6);
@@ -2106,18 +2060,17 @@ mod tests {
     #[test]
     fn test_univar_llp() {
         let data = vec![vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]];
-        let univar = Univar::new_or_panic("LLP", data, 0, 6, 3, 3);
+        let univar = Univar::new("LLP", data, 0, 6, 3, 3).unwrap();
 
         assert!(univar.state(0, 0).is_finite());
         assert_eq!(univar.period(), 3);
     }
 
     #[test]
-    #[should_panic]
     fn test_univar_rejects_multivariate() {
         let data = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
-        // Using new_or_panic which should panic for multivariate algorithm
-        let _ = Univar::new_or_panic("BiLL", data, 0, 3, -1, 3);
+        // Using new which should return error for multivariate algorithm
+        assert!(Univar::new("BiLL", data, 0, 3, -1, 3).is_err());
     }
 
     #[test]

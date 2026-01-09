@@ -278,7 +278,11 @@ impl Predict {
         values
     }
 
-    fn predict_field(&self, values: &[Option<f64>], config: &FieldConfig) -> Vec<(f64, f64, f64)> {
+    fn predict_field(
+        &self,
+        values: &[Option<f64>],
+        config: &FieldConfig,
+    ) -> anyhow::Result<Vec<(f64, f64, f64)>> {
         // Apply holdback
         let training_data = if self.holdback > 0 && values.len() > self.holdback {
             &values[..values.len() - self.holdback]
@@ -338,13 +342,13 @@ impl Predict {
                 period,
                 self.future_timespan,
             )
-            .expect("Failed to create Univar model");
+            .context("Failed to create Univar model")?;
 
             for i in 0..training_data.len() + self.future_timespan {
                 let state = model.state(0, i);
                 let variance = model.var(0, i);
                 let (lower, upper) = prediction_interval(state, variance, confidence)
-                    .expect("prediction_interval failed");
+                    .context("Failed to compute prediction interval")?;
                 predictions.push((state, lower, upper));
             }
         } else if is_multivariate_algorithm(algorithm_name) {
@@ -377,13 +381,13 @@ impl Predict {
                     period,
                     self.future_timespan,
                 )
-                .expect("Failed to create Univar model");
+                .context("Failed to create Univar model")?;
 
                 for i in 0..training_data.len() + self.future_timespan {
                     let state = model.state(0, i);
                     let variance = model.var(0, i);
                     let (lower, upper) = prediction_interval(state, variance, confidence)
-                        .expect("prediction_interval failed");
+                        .context("Failed to compute prediction interval")?;
                     predictions.push((state, lower, upper));
                 }
 
@@ -395,7 +399,7 @@ impl Predict {
                     }
                 }
 
-                return predictions;
+                return Ok(predictions);
             };
 
             // Get correlate as slice reference for Multivar::new
@@ -410,13 +414,13 @@ impl Predict {
                 correlate_ref,
                 use_mv,
             )
-            .expect("Failed to create Multivar model");
+            .context("Failed to create Multivar model")?;
 
             for i in 0..training_data.len() + self.future_timespan {
                 let state = model.state(0, i);
                 let variance = model.var(0, i);
                 let (lower, upper) = prediction_interval(state, variance, confidence)
-                    .expect("prediction_interval failed");
+                    .context("Failed to compute prediction interval")?;
                 predictions.push((state, lower, upper));
             }
         } else {
@@ -430,13 +434,13 @@ impl Predict {
                 period,
                 self.future_timespan,
             )
-            .expect("Failed to create Univar model");
+            .context("Failed to create Univar model")?;
 
             for i in 0..training_data.len() + self.future_timespan {
                 let state = model.state(0, i);
                 let variance = model.var(0, i);
                 let (lower, upper) = prediction_interval(state, variance, confidence)
-                    .expect("prediction_interval failed");
+                    .context("Failed to compute prediction interval")?;
                 predictions.push((state, lower, upper));
             }
         }
@@ -449,7 +453,7 @@ impl Predict {
             }
         }
 
-        predictions
+        Ok(predictions)
     }
 }
 
@@ -559,7 +563,7 @@ impl TableFunction for Predict {
                 .get(&config.field_name)
                 .ok_or_else(|| anyhow!("No data for field: {}", config.field_name))?;
 
-            let predictions = self.predict_field(values, config);
+            let predictions = self.predict_field(values, config)?;
 
             let output_field_name = config.alias.as_ref().unwrap_or(&config.field_name);
 

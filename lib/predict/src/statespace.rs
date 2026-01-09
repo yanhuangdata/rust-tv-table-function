@@ -11,9 +11,8 @@
 
 // Re-export commonly used types and functions
 pub use crate::utils::{
-    Datafeed, MAX_LAG, MAX_POINTS, OptionF64, autocovariance, correlogram, f64_to_option_or_none,
-    fillin_mv, find_longest_continuous_stretch, find_period, find_period2, find_period3,
-    is_missing, option_to_f64_or_nan, prediction_interval, prediction_interval_95,
+    Datafeed, MAX_LAG, MAX_POINTS, fillin_mv, find_longest_continuous_stretch, find_period2,
+    find_period3, prediction_interval,
 };
 
 pub use crate::models::{

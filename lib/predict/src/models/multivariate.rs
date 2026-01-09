@@ -5,7 +5,7 @@
 use crate::models::MultivarModel;
 use crate::optimize::{DFP_TOLERANCE, dfpmin};
 use crate::utils::MAX_LAG;
-use anyhow::{Error, bail};
+use anyhow::{Context, Error, bail};
 use std::f64;
 
 /// Bivariate Local Level model (BiLL)
@@ -66,19 +66,10 @@ impl BiLL {
         Ok(bill)
     }
 
-    /// Create a new BiLL model (panics on error)
-    ///
-    /// # Panics
-    ///
-    /// Panics if the data is empty.
-    pub fn new_or_panic(data: Vec<Vec<f64>>, data_len: usize, forecast_len: usize) -> Self {
-        Self::new(data, data_len, forecast_len).expect("Failed to create BiLL model: data is empty")
-    }
-
-    pub fn instance(var1: &[f64], var2: &[f64], forecast_len: usize) -> Self {
+    pub fn instance(var1: &[f64], var2: &[f64], forecast_len: usize) -> anyhow::Result<Self> {
         let data = vec![var1.to_vec(), var2.to_vec()];
         let data_len = var1.len().min(var2.len());
-        Self::new(data, data_len, forecast_len).expect("Failed to create BiLL model")
+        Self::new(data, data_len, forecast_len).context("Failed to create BiLL model")
     }
 
     pub fn least_num_data() -> usize {
@@ -365,16 +356,14 @@ impl BiLLmv {
     ///
     /// # Panics
     ///
-    /// Panics if the data is empty.
-    pub fn new_or_panic(data: Vec<Vec<Option<f64>>>, data_len: usize, forecast_len: usize) -> Self {
-        Self::new(data, data_len, forecast_len)
-            .expect("Failed to create BiLLmv model: data is empty")
-    }
-
-    pub fn instance(var1: &[Option<f64>], var2: &[Option<f64>], forecast_len: usize) -> Self {
+    pub fn instance(
+        var1: &[Option<f64>],
+        var2: &[Option<f64>],
+        forecast_len: usize,
+    ) -> anyhow::Result<Self> {
         let data = vec![var1.to_vec(), var2.to_vec()];
         let data_len = var1.len().min(var2.len());
-        Self::new(data, data_len, forecast_len).expect("Failed to create BiLLmv model")
+        Self::new(data, data_len, forecast_len).context("Failed to create BiLLmv model")
     }
 
     pub fn least_num_data() -> usize {
@@ -680,20 +669,14 @@ impl BiLLmv2 {
         Ok(billmv2)
     }
 
-    /// Create a new BiLLmv2 model (panics on error)
-    ///
-    /// # Panics
-    ///
-    /// Panics if the data is empty.
-    pub fn new_or_panic(data: Vec<Vec<Option<f64>>>, data_len: usize, forecast_len: usize) -> Self {
-        Self::new(data, data_len, forecast_len)
-            .expect("Failed to create BiLLmv2 model: data is empty")
-    }
-
-    pub fn instance(var1: &[Option<f64>], var2: &[Option<f64>], forecast_len: usize) -> Self {
+    pub fn instance(
+        var1: &[Option<f64>],
+        var2: &[Option<f64>],
+        forecast_len: usize,
+    ) -> anyhow::Result<Self> {
         let data = vec![var1.to_vec(), var2.to_vec()];
         let data_len = var1.len().min(var2.len());
-        Self::new(data, data_len, forecast_len).expect("Failed to create BiLLmv2 model")
+        Self::new(data, data_len, forecast_len).context("Failed to create BiLLmv2 model")
     }
 
     pub fn least_num_data() -> usize {
@@ -967,13 +950,14 @@ impl LLB {
     /// # Panics
     ///
     /// Panics if the data is empty or data_len is 0.
-    pub fn new_or_panic(data: Vec<Vec<f64>>, data_len: usize, forecast_len: usize) -> Self {
-        Self::new(data, data_len, forecast_len).expect("Failed to create LLB model: invalid data")
-    }
-
-    pub fn instance(var1: &[f64], var2: &[f64], data_len: usize, forecast_len: usize) -> Self {
+    pub fn instance(
+        var1: &[f64],
+        var2: &[f64],
+        data_len: usize,
+        forecast_len: usize,
+    ) -> anyhow::Result<Self> {
         let data = vec![var1.to_vec(), var2.to_vec()];
-        Self::new(data, data_len, forecast_len).expect("Failed to create LLB model")
+        Self::new(data, data_len, forecast_len).context("Failed to create LLB model")
     }
 
     pub fn instance_with_opt(
@@ -981,14 +965,14 @@ impl LLB {
         var2: &[Option<f64>],
         data_len: usize,
         forecast_len: usize,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let data_opt = [var1.to_vec(), var2.to_vec()];
         // Convert to Vec<Vec<f64>>, fill missing values with 0
         let data: Vec<Vec<f64>> = data_opt
             .iter()
             .map(|row| row.iter().map(|x| x.unwrap_or(0.0)).collect())
             .collect();
-        Self::new(data, data_len, forecast_len).expect("Failed to create LLB model")
+        Self::new(data, data_len, forecast_len).context("Failed to create LLB model")
     }
 
     pub fn least_num_data() -> usize {
@@ -1237,18 +1221,14 @@ impl LLBmv {
     /// # Panics
     ///
     /// Panics if the underlying LLB model creation fails.
-    pub fn new_or_panic(data: Vec<Vec<Option<f64>>>, data_len: usize, forecast_len: usize) -> Self {
-        Self::new(data, data_len, forecast_len).expect("Failed to create LLBmv model")
-    }
-
     pub fn instance(
         var1: &[Option<f64>],
         var2: &[Option<f64>],
         data_len: usize,
         forecast_len: usize,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let data = vec![var1.to_vec(), var2.to_vec()];
-        Self::new(data, data_len, forecast_len).expect("Failed to create LLBmv model")
+        Self::new(data, data_len, forecast_len).context("Failed to create LLBmv model")
     }
 
     pub fn state(&self, ts_idx: usize, i: usize) -> f64 {
@@ -1394,7 +1374,7 @@ impl Multivar {
                         &corr_opt,
                         data_end,
                         forecast_len,
-                    ))
+                    )?)
                 } else {
                     // If no correlate, use first two columns of data
                     if data.len() < 2 {
@@ -1418,7 +1398,7 @@ impl Multivar {
                     } else {
                         bail!("Invalid data: LLB model requires non-empty data")
                     };
-                    Box::new(LLB::instance(var1, corr, data_end, forecast_len))
+                    Box::new(LLB::instance(var1, corr, data_end, forecast_len)?)
                 } else {
                     // If no correlate, use first two columns of data
                     if data.len() < 2 {
@@ -1458,29 +1438,6 @@ impl Multivar {
     /// Create a new Multivar model (panics on error)
     ///
     /// # Panics
-    ///
-    /// Panics if the algorithm is unsupported or data is invalid.
-    pub fn new_or_panic(
-        algorithm: &str,
-        data: Vec<Vec<f64>>,
-        data_end: usize,
-        period: Option<i32>,
-        forecast_len: usize,
-        correlate: Option<&[f64]>,
-        missing_valued: bool,
-    ) -> Self {
-        Self::new(
-            algorithm,
-            data,
-            data_end,
-            period,
-            forecast_len,
-            correlate,
-            missing_valued,
-        )
-        .expect("Failed to create Multivar model")
-    }
-
     /// Make predictions using the Multivar model
     ///
     /// # Errors

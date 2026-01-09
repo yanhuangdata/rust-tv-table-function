@@ -55,15 +55,6 @@ impl Mat {
         Ok(Self { cols, nrow, ncol })
     }
 
-    /// Create matrix from array (panics on error)
-    ///
-    /// # Panics
-    ///
-    /// Panics if nrow or ncol is zero.
-    pub fn new_or_panic(a: Vec<f64>, nrow: usize, ncol: usize) -> Self {
-        Self::new(a, nrow, ncol).expect("Failed to create matrix")
-    }
-
     /// Create matrix from 2D array
     ///
     /// # Errors
