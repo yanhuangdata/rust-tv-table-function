@@ -14,6 +14,11 @@ on:
       - main
   pull_request:
   workflow_dispatch:
+    inputs:
+      build_release:
+        description: Build and upload release Rust artifact
+        type: boolean
+        default: false
 
 jobs:
   lint:
@@ -69,13 +74,19 @@ jobs:
       - uses: extractions/setup-just@v3
 
       - name: Build
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.build_release == true) }}
         run: just build
 
+      - name: Build release artifact
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_release == true }}
+        run: just build release
+
       - name: nextest
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.build_release == true) }}
         run: cargo nextest run --profile ci
 
       - name: Upload JUnit report
-        if: '!cancelled()'
+        if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.build_release == true) }}
         uses: actions/upload-artifact@v4.6.2
         with:
           retention-days: 7
@@ -85,17 +96,21 @@ jobs:
           if-no-files-found: error
 
       - uses: lukka/get-cmake@latest
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.build_release == true) }}
         with:
           cmakeVersion: '3.31'
       - name: setup ccache
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.build_release == true) }}
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           create-symlink: true
 
       - name: Setup vcpkg
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.build_release == true) }}
         uses: lukka/run-vcpkg@v11
 
       - name: Setup C++ environment
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.build_release == true) }}
         run: |
           echo "VCPKG_TARGET_TRIPLET=${{ matrix.vcpkg_triplet }}" >> $GITHUB_ENV
           echo "VCPKG_TOOLCHAIN_PATH=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" >> $GITHUB_ENV
@@ -123,15 +138,19 @@ jobs:
           exit 0
 
       - name: Setup Cmake
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.build_release == true) }}
         run: just cmake
         working-directory: cpp
       - name: Build C++
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.build_release == true) }}
         run: just build
         working-directory: cpp
       - name: Run C++ tests
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.build_release == true) }}
         run: just test
         working-directory: cpp
       - name: Upload binary
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.build_release == true) }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           retention-days: 7
@@ -141,6 +160,28 @@ jobs:
             target/debug/librust_tvtf.dylib
             target/debug/librust_tvtf.so
             target/debug/librust_tvtf.d
+            cpp/zngur_tvtf/generated.h
+            cpp/zngur_tvtf/extra_generated.h
+          if-no-files-found: error
+
+      - name: Prepare release headers
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_release == true }}
+        run: |
+          if [ -d cpp/src/zngur_tvtf ] && [ ! -d cpp/zngur_tvtf ]; then
+            mkdir -p cpp/zngur_tvtf
+            cp cpp/src/zngur_tvtf/*.h cpp/zngur_tvtf/
+          fi
+
+      - name: Upload release artifact
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_release == true }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          retention-days: 7
+          compression-level: 9
+          name: rust-tvtf-release-${{ matrix.os }}
+          path: |
+            target/release/librust_tvtf.dylib
+            target/release/librust_tvtf.so
             cpp/zngur_tvtf/generated.h
             cpp/zngur_tvtf/extra_generated.h
           if-no-files-found: error
