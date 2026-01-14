@@ -154,6 +154,10 @@ impl Predict {
             }
         }
 
+        if field_names.is_empty() {
+            return Err(anyhow!("At least one field name is required"));
+        }
+
         // Build field configurations
         let mut field_configs = Vec::new();
         for field_name in field_names {
@@ -491,8 +495,8 @@ mod tests {
     fn test_predict_basic() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let mut predict = Predict::new(Some(params), vec![]).expect("Failed to create Predict");
+        let named_args = vec![("fields".to_string(), Arg::String("value".to_string()))];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         // Process batch
         let result = predict.process(batch).expect("Processing failed");
@@ -519,9 +523,11 @@ mod tests {
     fn test_predict_with_algorithm() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![("algorithm".to_string(), Arg::String("LL".to_string()))];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("algorithm".to_string(), Arg::String("LL".to_string())),
+        ];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -536,9 +542,11 @@ mod tests {
     fn test_predict_with_future_timespan() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![("future_timespan".to_string(), Arg::Int(5))];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("future_timespan".to_string(), Arg::Int(5)),
+        ];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -554,12 +562,12 @@ mod tests {
     fn test_predict_with_holdback() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
             ("holdback".to_string(), Arg::Int(2)),
-            ("future_timespan".to_string(), Arg::Int(1)), // Must be positive
+            ("future_timespan".to_string(), Arg::Int(1)),
         ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -590,8 +598,8 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
             .expect("Failed to create test RecordBatch");
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let mut predict = Predict::new(Some(params), vec![]).expect("Failed to create Predict");
+        let named_args = vec![("fields".to_string(), Arg::String("value".to_string()))];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -620,11 +628,11 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![time_array, value1_array, value2_array])
             .expect("Failed to create test RecordBatch");
 
-        let params = Args::from(vec![
-            Arg::String("value1".to_string()),
-            Arg::String("value2".to_string()),
-        ]);
-        let mut predict = Predict::new(Some(params), vec![]).expect("Failed to create Predict");
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value1".to_string())),
+            ("fields".to_string(), Arg::String("value2".to_string())),
+        ];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -647,12 +655,12 @@ mod tests {
         let values = vec![10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0];
         let batch = create_test_batch(values);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
             ("algorithm".to_string(), Arg::String("LLP".to_string())),
             ("period".to_string(), Arg::Int(3)),
         ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -667,9 +675,11 @@ mod tests {
     fn test_predict_algorithm_llt() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![("algorithm".to_string(), Arg::String("LLT".to_string()))];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("algorithm".to_string(), Arg::String("LLT".to_string())),
+        ];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -684,9 +694,11 @@ mod tests {
     fn test_predict_algorithm_llp5() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![("algorithm".to_string(), Arg::String("LLP5".to_string()))];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("algorithm".to_string(), Arg::String("LLP5".to_string())),
+        ];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -710,8 +722,8 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
             .expect("Failed to create test RecordBatch");
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let mut predict = Predict::new(Some(params), vec![]).expect("Failed to create Predict");
+        let named_args = vec![("fields".to_string(), Arg::String("value".to_string()))];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict.finalize().expect("Finalize failed");
@@ -724,8 +736,8 @@ mod tests {
     fn test_predict_invalid_field() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0]);
 
-        let params = Args::from(vec![Arg::String("nonexistent".to_string())]);
-        let mut predict = Predict::new(Some(params), vec![]).expect("Failed to create Predict");
+        let named_args = vec![("fields".to_string(), Arg::String("nonexistent".to_string()))];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let result = predict.finalize();
@@ -743,9 +755,11 @@ mod tests {
 
     #[test]
     fn test_predict_invalid_algorithm() {
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![("algorithm".to_string(), Arg::String("INVALID".to_string()))];
-        let result = Predict::new(Some(params), named_args);
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("algorithm".to_string(), Arg::String("INVALID".to_string())),
+        ];
+        let result = Predict::new(None, named_args);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("algorithm"));
     }
@@ -754,12 +768,12 @@ mod tests {
     fn test_predict_confidence_intervals() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
             ("upper".to_string(), Arg::Float(0.99)),
             ("lower".to_string(), Arg::Float(0.95)),
         ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -795,8 +809,8 @@ mod tests {
         let batch1 = create_test_batch(vec![10.0, 12.0, 14.0]);
         let batch2 = create_test_batch(vec![16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let mut predict = Predict::new(Some(params), vec![]).expect("Failed to create Predict");
+        let named_args = vec![("fields".to_string(), Arg::String("value".to_string()))];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         // Process multiple batches
         predict.process(batch1).expect("Processing failed");
@@ -825,8 +839,8 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
             .expect("Failed to create test RecordBatch");
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let mut predict = Predict::new(Some(params), vec![]).expect("Failed to create Predict");
+        let named_args = vec![("fields".to_string(), Arg::String("value".to_string()))];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -870,12 +884,12 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![time_array, count_array])
             .expect("Failed to create test RecordBatch");
 
-        let params = Args::from(vec![Arg::String("count".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("count".to_string())),
             ("algorithm".to_string(), Arg::String("LLT".to_string())),
             ("future_timespan".to_string(), Arg::Int(7)),
         ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -1044,12 +1058,12 @@ mod tests {
         // Test LLP1 algorithm (LLP with variance taking maximum)
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
             ("algorithm".to_string(), Arg::String("LLP1".to_string())),
             ("period".to_string(), Arg::Int(3)),
         ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -1073,12 +1087,12 @@ mod tests {
         // Test LLP2 algorithm (combines LL and LLP)
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
             ("algorithm".to_string(), Arg::String("LLP2".to_string())),
             ("period".to_string(), Arg::Int(3)),
         ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -1098,15 +1112,15 @@ mod tests {
     fn test_predict_algorithm_llp2_with_insufficient_period() {
         // LLP2 with period < 2 may either fail or use default behavior
         // The library may handle this gracefully by using the default period
-        let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
             ("algorithm".to_string(), Arg::String("LLP2".to_string())),
             ("period".to_string(), Arg::Int(1)),
         ];
 
         // Try to create the predictor - if it succeeds, it means the library
         // handles this case gracefully
-        let result = Predict::new(Some(params), named_args);
+        let result = Predict::new(None, named_args);
         // Either success or a specific error about period is acceptable
         if result.is_err() {
             let err_msg = result.unwrap_err().to_string();
@@ -1126,12 +1140,12 @@ mod tests {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0]);
 
         // Test lowercase algorithm name with proper period
-        let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
             ("algorithm".to_string(), Arg::String("llp1".to_string())),
             ("period".to_string(), Arg::Int(3)), // Need period for LLP1
         ];
-        let mut predict = Predict::new(Some(params), named_args)
+        let mut predict = Predict::new(None, named_args)
             .expect("Failed to create Predict with lowercase algorithm");
 
         predict.process(batch).expect("Processing failed");
@@ -1160,24 +1174,26 @@ mod tests {
         let periodic_batch = create_test_batch(vec![10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0]);
 
         for algo in algorithms {
-            let (params, named_args, batch): (Args, Vec<(String, Arg)>, RecordBatch) = match algo {
+            let (named_args, batch): (Vec<(String, Arg)>, RecordBatch) = match algo {
                 "LL" | "LLT" | "LLP5" => {
-                    let params = Args::from(vec![Arg::String("value".to_string())]);
-                    let named_args = vec![("algorithm".to_string(), Arg::String(algo.to_string()))];
-                    (params, named_args, simple_batch.clone())
+                    let named_args = vec![
+                        ("fields".to_string(), Arg::String("value".to_string())),
+                        ("algorithm".to_string(), Arg::String(algo.to_string())),
+                    ];
+                    (named_args, simple_batch.clone())
                 }
                 "LLP" | "LLP1" | "LLP2" => {
-                    let params = Args::from(vec![Arg::String("value".to_string())]);
                     let named_args = vec![
+                        ("fields".to_string(), Arg::String("value".to_string())),
                         ("algorithm".to_string(), Arg::String(algo.to_string())),
                         ("period".to_string(), Arg::Int(3)),
                     ];
-                    (params, named_args, periodic_batch.clone())
+                    (named_args, periodic_batch.clone())
                 }
                 _ => unreachable!(),
             };
 
-            let mut predict = Predict::new(Some(params), named_args.clone()).expect(&format!(
+            let mut predict = Predict::new(None, named_args.clone()).expect(&format!(
                 "Failed to create Predict with algorithm: {}",
                 algo
             ));
@@ -1202,13 +1218,15 @@ mod tests {
     #[test]
     fn test_predict_invalid_algorithm_name() {
         // Test that invalid algorithm names are rejected
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![(
-            "algorithm".to_string(),
-            Arg::String("INVALID_ALGORITHM".to_string()),
-        )];
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            (
+                "algorithm".to_string(),
+                Arg::String("INVALID_ALGORITHM".to_string()),
+            ),
+        ];
 
-        let result = Predict::new(Some(params), named_args);
+        let result = Predict::new(None, named_args);
         assert!(result.is_err());
         assert!(
             result
