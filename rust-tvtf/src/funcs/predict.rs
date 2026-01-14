@@ -10,10 +10,7 @@ use std::sync::Arc;
 use crate::TableFunction;
 use rust_tvtf_api::arg::{Arg, Args};
 
-use predict::{
-    Univar,
-    statespace::prediction_interval,
-};
+use predict::{Univar, statespace::prediction_interval};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Algorithm {
@@ -138,7 +135,9 @@ impl Predict {
                         Arg::Float(f) if f > 0.0 && f <= 1.0 => f,
                         Arg::Int(i) if i > 0 && i <= 100 => i as f64 / 100.0,
                         Arg::String(s) => {
-                            let f: f64 = s.parse().context("upper must be a number between 0 and 1 or 1 and 100")?;
+                            let f: f64 = s
+                                .parse()
+                                .context("upper must be a number between 0 and 1 or 1 and 100")?;
                             if f > 0.0 && f <= 1.0 {
                                 f
                             } else if f > 1.0 && f <= 100.0 {
@@ -155,7 +154,9 @@ impl Predict {
                         Arg::Float(f) if f > 0.0 && f <= 1.0 => f,
                         Arg::Int(i) if i > 0 && i <= 100 => i as f64 / 100.0,
                         Arg::String(s) => {
-                            let f: f64 = s.parse().context("lower must be a number between 0 and 1 or 1 and 100")?;
+                            let f: f64 = s
+                                .parse()
+                                .context("lower must be a number between 0 and 1 or 1 and 100")?;
                             if f > 0.0 && f <= 1.0 {
                                 f
                             } else if f > 1.0 && f <= 100.0 {
@@ -365,18 +366,14 @@ impl TableFunction for Predict {
                 } else {
                     // For non-nullable fields, create an array with default values
                     match field.data_type() {
-                        DataType::Int32 => {
-                            Arc::new(arrow::array::Int32Array::from(vec![
+                        DataType::Int32 => Arc::new(arrow::array::Int32Array::from(vec![
                                 0;
                                 self.future_timespan
-                            ])) as ArrayRef
-                        }
-                        DataType::Int64 => {
-                            Arc::new(arrow::array::Int64Array::from(vec![
+                            ])) as ArrayRef,
+                        DataType::Int64 => Arc::new(arrow::array::Int64Array::from(vec![
                                 0i64;
                                 self.future_timespan
-                            ])) as ArrayRef
-                        }
+                            ])) as ArrayRef,
                         DataType::Float64 => Arc::new(arrow::array::Float64Array::from(vec![
                                 0.0;
                                 self.future_timespan
@@ -1169,7 +1166,7 @@ mod tests {
     fn test_predict_all_algorithms() {
         // Test that all algorithms can be created successfully
         // Note: LLP, LLP1, LLP2 require periodic data to work properly
-                let algorithms = vec![
+        let algorithms = vec![
             "LL", "LLT", "LLP5", // These don't require period
             "LLP", "LLP1", "LLP2", // These require period
         ];
