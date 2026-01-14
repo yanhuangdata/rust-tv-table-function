@@ -64,32 +64,7 @@ pub struct Predict {
 }
 
 impl Predict {
-    pub fn new(params: Option<Args>, named_arguments: Vec<(String, Arg)>) -> Result<Self> {
-        // Parse field names from positional arguments
-        let field_names = if let Some(params) = params {
-            let scalars = params
-                .into_iter()
-                .filter(|p| p.is_scalar())
-                .collect::<Vec<_>>();
-
-            scalars
-                .into_iter()
-                .map(|arg| {
-                    if let Arg::String(s) = arg {
-                        Ok(s)
-                    } else {
-                        Err(anyhow!("Field names must be strings"))
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            return Err(anyhow!("At least one field name is required"));
-        };
-
-        if field_names.is_empty() {
-            return Err(anyhow!("At least one field name is required"));
-        }
-
+    pub fn new(_: Option<Args>, named_arguments: Vec<(String, Arg)>) -> Result<Self> {
         // Parse named arguments
         let mut algorithm = Algorithm::default();
         let mut period = None;
@@ -97,9 +72,16 @@ impl Predict {
         let mut holdback = 0;
         let mut upper_confidence = 0.99;
         let mut lower_confidence = 0.99;
+        let mut field_names: Vec<String> = Vec::new();
 
         for (name, arg) in named_arguments {
             match name.as_str() {
+                "fields" => {
+                    let Arg::String(s) = arg else {
+                        return Err(anyhow!("fields must be a string"));
+                    };
+                    field_names.push(s);
+                }
                 "algorithm" => {
                     let Arg::String(s) = arg else {
                         return Err(anyhow!("algorithm must be a string"));
