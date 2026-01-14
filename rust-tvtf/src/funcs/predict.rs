@@ -11,7 +11,7 @@ use crate::TableFunction;
 use rust_tvtf_api::arg::{Arg, Args};
 
 use predict::{
-    Multivar, Univar, is_multivariate_algorithm, is_univariate_algorithm,
+    Univar,
     statespace::prediction_interval,
 };
 
@@ -51,10 +51,8 @@ impl Algorithm {
 #[derive(Debug, Clone)]
 pub struct FieldConfig {
     pub field_name: String,
-    pub alias: Option<String>,
     pub algorithm: Algorithm,
     pub period: Option<usize>,
-    pub correlate: Option<String>,
 }
 
 #[derive(Debug)]
@@ -62,8 +60,8 @@ pub struct Predict {
     field_configs: Vec<FieldConfig>,
     future_timespan: usize,
     holdback: usize,
-    upper_confidence: Option<f64>, // e.g., 90 for 90%
-    lower_confidence: Option<f64>, // e.g., 97 for 97%
+    upper_confidence: f64,
+    lower_confidence: f64,
     data_buffer: Vec<RecordBatch>,
     time_series_data: HashMap<String, Vec<Option<f64>>>,
 }
@@ -100,12 +98,8 @@ impl Predict {
         let mut period = None;
         let mut future_timespan = 10;
         let mut holdback = 0;
-        let mut upper_confidence = None;
-        let mut lower_confidence = None;
-        let mut field_aliases: HashMap<String, String> = HashMap::new();
-        let mut field_algorithms: HashMap<String, Algorithm> = HashMap::new();
-        let mut field_periods: HashMap<String, Option<usize>> = HashMap::new();
-        let mut field_correlates: HashMap<String, String> = HashMap::new();
+        let mut upper_confidence = 0.99;
+        let mut lower_confidence = 0.99;
 
         for (name, arg) in named_arguments {
             match name.as_str() {
@@ -139,103 +133,51 @@ impl Predict {
                         _ => return Err(anyhow!("holdback must be a non-negative integer")),
                     };
                 }
-                "upper90" | "upper95" | "upper97" | "upper99" => {
-                    let conf = match name.as_str() {
-                        "upper90" => 90.0,
-                        "upper95" => 95.0,
-                        "upper97" => 97.0,
-                        "upper99" => 99.0,
-                        _ => unreachable!(),
-                    };
-                    upper_confidence = Some(conf);
-                }
-                "lower90" | "lower95" | "lower97" | "lower99" => {
-                    let conf = match name.as_str() {
-                        "lower90" => 90.0,
-                        "lower95" => 95.0,
-                        "lower97" => 97.0,
-                        "lower99" => 99.0,
-                        _ => unreachable!(),
-                    };
-                    lower_confidence = Some(conf);
-                }
-                "correlate" => {
-                    let Arg::String(_s) = arg else {
-                        return Err(anyhow!("correlate must be a string"));
-                    };
-                    // For now, apply to all fields. In a full implementation,
-                    // this would be field-specific
-                }
-                _ => {
-                    // Check if it's a field-specific parameter (e.g., "foo_algorithm", "foo_period")
-                    if let Some(field_name) = field_names.iter().find(|&f| name.starts_with(f)) {
-                        let suffix = name.strip_prefix(field_name).unwrap_or("");
-                        if suffix == "_algorithm" || suffix == " algorithm" {
-                            let Arg::String(s) = arg else {
-                                return Err(anyhow!("{} must be a string", name));
-                            };
-                            field_algorithms.insert(field_name.clone(), Algorithm::from_str(&s)?);
-                        } else if suffix == "_period" || suffix == " period" {
-                            let period_val: i64 = match arg {
-                                Arg::Int(i) => i,
-                                Arg::String(s) => s.parse().context("period must be a number")?,
-                                _ => return Err(anyhow!("period must be an integer")),
-                            };
-                            if period_val > 0 {
-                                field_periods.insert(field_name.clone(), Some(period_val as usize));
-                            }
-                        } else if suffix == "_correlate" || suffix == " correlate" {
-                            let Arg::String(s) = arg else {
-                                return Err(anyhow!("correlate must be a string"));
-                            };
-                            field_correlates.insert(field_name.clone(), s);
-                        } else if suffix == "_alias" || suffix == " alias" {
-                            let Arg::String(s) = arg else {
-                                return Err(anyhow!("{} must be a string", name));
-                            };
-                            if !s.is_empty() {
-                                field_aliases.insert(field_name.clone(), s);
+                "upper" => {
+                    upper_confidence = match arg {
+                        Arg::Float(f) if f > 0.0 && f <= 1.0 => f,
+                        Arg::Int(i) if i > 0 && i <= 100 => i as f64 / 100.0,
+                        Arg::String(s) => {
+                            let f: f64 = s.parse().context("upper must be a number between 0 and 1 or 1 and 100")?;
+                            if f > 0.0 && f <= 1.0 {
+                                f
+                            } else if f > 1.0 && f <= 100.0 {
+                                f / 100.0
+                            } else {
+                                return Err(anyhow!("upper must be between 0 and 1 or 1 and 100"));
                             }
                         }
-                    } else if name == "AS" || name == "as" {
-                        // Handle AS keyword for aliases
-                        // Format: "field_name AS alias_name"
-                        let Arg::String(s) = arg else {
-                            return Err(anyhow!("AS value must be a string"));
-                        };
-                        // Parse "field AS alias" format
-                        if let Some((field, alias)) = s.split_once(" AS ") {
-                            let field = field.trim();
-                            let alias = alias.trim();
-                            if !field.is_empty() && !alias.is_empty() {
-                                field_aliases.insert(field.to_string(), alias.to_string());
-                            }
-                        } else if let Some((field, alias)) = s.split_once(" as ") {
-                            let field = field.trim();
-                            let alias = alias.trim();
-                            if !field.is_empty() && !alias.is_empty() {
-                                field_aliases.insert(field.to_string(), alias.to_string());
+                        _ => return Err(anyhow!("upper must be a number")),
+                    };
+                }
+                "lower" => {
+                    lower_confidence = match arg {
+                        Arg::Float(f) if f > 0.0 && f <= 1.0 => f,
+                        Arg::Int(i) if i > 0 && i <= 100 => i as f64 / 100.0,
+                        Arg::String(s) => {
+                            let f: f64 = s.parse().context("lower must be a number between 0 and 1 or 1 and 100")?;
+                            if f > 0.0 && f <= 1.0 {
+                                f
+                            } else if f > 1.0 && f <= 100.0 {
+                                f / 100.0
+                            } else {
+                                return Err(anyhow!("lower must be between 0 and 1 or 1 and 100"));
                             }
                         }
-                    }
+                        _ => return Err(anyhow!("lower must be a number")),
+                    };
                 }
+                _ => return Err(anyhow!("Unknown parameter: {}", name)),
             }
         }
 
         // Build field configurations
         let mut field_configs = Vec::new();
         for field_name in field_names {
-            let alias = field_aliases.remove(&field_name);
-            let field_algorithm = field_algorithms.remove(&field_name).unwrap_or(algorithm);
-            let field_period = field_periods.remove(&field_name).flatten().or(period);
-            let correlate = field_correlates.remove(&field_name);
-
             field_configs.push(FieldConfig {
                 field_name: field_name.clone(),
-                alias,
-                algorithm: field_algorithm,
-                period: field_period,
-                correlate,
+                algorithm,
+                period,
             });
         }
 
@@ -318,131 +260,27 @@ impl Predict {
         let period = config.period.map(|p| p as i32).unwrap_or(0);
 
         // Calculate confidence level for prediction interval
-        // Use average of upper and lower confidence levels, or default to 95%
-        let confidence =
-            if let (Some(upper), Some(lower)) = (self.upper_confidence, self.lower_confidence) {
-                (upper + lower) / 2.0 / 100.0
-            } else if let Some(upper) = self.upper_confidence {
-                upper / 100.0
-            } else if let Some(lower) = self.lower_confidence {
-                lower / 100.0
-            } else {
-                0.95 // Default to 95%
-            };
+        // Use average of upper and lower confidence levels
+        let confidence = (self.upper_confidence + self.lower_confidence) / 2.0;
 
-        // Determine if it's univariate or multivariate algorithm
-        if is_univariate_algorithm(algorithm_name) {
-            // Use Univar
-            let data = vec![data_f64];
-            let model = Univar::new(
-                algorithm_name,
-                data,
-                data_start,
-                data_end,
-                period,
-                self.future_timespan,
-            )
-            .context("Failed to create Univar model")?;
+        // Use univariate algorithm
+        let data = vec![data_f64];
+        let model = Univar::new(
+            algorithm_name,
+            data,
+            data_start,
+            data_end,
+            period,
+            self.future_timespan,
+        )
+        .context("Failed to create Univar model")?;
 
-            for i in 0..training_data.len() + self.future_timespan {
-                let state = model.state(0, i);
-                let variance = model.var(0, i);
-                let (lower, upper) = prediction_interval(state, variance, confidence)
-                    .context("Failed to compute prediction interval")?;
-                predictions.push((state, lower, upper));
-            }
-        } else if is_multivariate_algorithm(algorithm_name) {
-            // Use Multivar
-            // For multivariate algorithm, need correlated field data
-            let correlate_data: Option<Vec<f64>> = if let Some(ref corr_field) = config.correlate {
-                // Get correlated field data from time_series_data
-                self.time_series_data
-                    .get(corr_field)
-                    .map(|v| v.iter().map(|x| x.unwrap_or(f64::NAN)).collect())
-            } else {
-                None
-            };
-
-            // Determine if we should use missing values version
-            let use_mv = algorithm_name.ends_with("mv");
-
-            // Build data for multivariate model
-            let data: Vec<Vec<f64>> = if let Some(ref corr) = correlate_data {
-                vec![data_f64.clone(), corr.clone()]
-            } else {
-                // If no correlated field, use univariate algorithm as fallback
-                let data = vec![data_f64.clone()];
-                let fallback_algo = "LLT";
-                let model = Univar::new(
-                    fallback_algo,
-                    data,
-                    data_start,
-                    data_end,
-                    period,
-                    self.future_timespan,
-                )
-                .context("Failed to create Univar model")?;
-
-                for i in 0..training_data.len() + self.future_timespan {
-                    let state = model.state(0, i);
-                    let variance = model.var(0, i);
-                    let (lower, upper) = prediction_interval(state, variance, confidence)
-                        .context("Failed to compute prediction interval")?;
-                    predictions.push((state, lower, upper));
-                }
-
-                // If holdback was used, pad with predictions to match original length
-                if self.holdback > 0 && predictions.len() < values.len() {
-                    let last_pred = predictions.last().copied().unwrap_or((0.0, 0.0, 0.0));
-                    while predictions.len() < values.len() {
-                        predictions.push(last_pred);
-                    }
-                }
-
-                return Ok(predictions);
-            };
-
-            // Get correlate as slice reference for Multivar::new
-            let correlate_ref: Option<&[f64]> = correlate_data.as_deref();
-
-            let model = Multivar::new(
-                algorithm_name,
-                data,
-                data_end,
-                if period > 0 { Some(period) } else { None },
-                self.future_timespan,
-                correlate_ref,
-                use_mv,
-            )
-            .context("Failed to create Multivar model")?;
-
-            for i in 0..training_data.len() + self.future_timespan {
-                let state = model.state(0, i);
-                let variance = model.var(0, i);
-                let (lower, upper) = prediction_interval(state, variance, confidence)
-                    .context("Failed to compute prediction interval")?;
-                predictions.push((state, lower, upper));
-            }
-        } else {
-            // Unknown algorithm, use default LLT
-            let data = vec![data_f64];
-            let model = Univar::new(
-                "LLT",
-                data,
-                data_start,
-                data_end,
-                period,
-                self.future_timespan,
-            )
-            .context("Failed to create Univar model")?;
-
-            for i in 0..training_data.len() + self.future_timespan {
-                let state = model.state(0, i);
-                let variance = model.var(0, i);
-                let (lower, upper) = prediction_interval(state, variance, confidence)
-                    .context("Failed to compute prediction interval")?;
-                predictions.push((state, lower, upper));
-            }
+        for i in 0..training_data.len() + self.future_timespan {
+            let state = model.state(0, i);
+            let variance = model.var(0, i);
+            let (lower, upper) = prediction_interval(state, variance, confidence)
+                .context("Failed to compute prediction interval")?;
+            predictions.push((state, lower, upper));
         }
 
         // If holdback was used, pad with predictions to match original length
@@ -527,9 +365,15 @@ impl TableFunction for Predict {
                 } else {
                     // For non-nullable fields, create an array with default values
                     match field.data_type() {
-                        DataType::Int32 | DataType::Int64 => {
+                        DataType::Int32 => {
                             Arc::new(arrow::array::Int32Array::from(vec![
                                 0;
+                                self.future_timespan
+                            ])) as ArrayRef
+                        }
+                        DataType::Int64 => {
+                            Arc::new(arrow::array::Int64Array::from(vec![
+                                0i64;
                                 self.future_timespan
                             ])) as ArrayRef
                         }
@@ -565,8 +409,6 @@ impl TableFunction for Predict {
 
             let predictions = self.predict_field(values, config)?;
 
-            let output_field_name = config.alias.as_ref().unwrap_or(&config.field_name);
-
             // Ensure predictions match the length of input data
             let total_rows = all_rows + self.future_timespan;
             let mut predicted_values: Vec<f64> = predictions.iter().map(|p| p.0).collect();
@@ -598,17 +440,17 @@ impl TableFunction for Predict {
             output_columns.push(upper_array);
 
             output_fields.push(Field::new(
-                format!("{}_predicted", output_field_name),
+                format!("{}_predicted", config.field_name),
                 DataType::Float64,
                 true,
             ));
             output_fields.push(Field::new(
-                format!("{}_lower", output_field_name),
+                format!("{}_lower", config.field_name),
                 DataType::Float64,
                 true,
             ));
             output_fields.push(Field::new(
-                format!("{}_upper", output_field_name),
+                format!("{}_upper", config.field_name),
                 DataType::Float64,
                 true,
             ));
@@ -935,8 +777,8 @@ mod tests {
 
         let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
-            ("upper90".to_string(), Arg::Float(90.0)),
-            ("lower95".to_string(), Arg::Float(95.0)),
+            ("upper".to_string(), Arg::Float(0.99)),
+            ("lower".to_string(), Arg::Float(0.95)),
         ];
         let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
 
@@ -1219,174 +1061,6 @@ mod tests {
     }
 
     #[test]
-    fn test_predict_with_field_alias() {
-        let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
-
-        // Test with field-specific alias using suffix pattern
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![(
-            "value_alias".to_string(),
-            Arg::String("predicted_value".to_string()),
-        )];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
-
-        predict.process(batch).expect("Processing failed");
-        let output = predict
-            .finalize()
-            .expect("Finalize failed")
-            .expect("No output");
-
-        // Check that alias is used in output column names
-        let schema = output.schema();
-        assert!(schema.field_with_name("predicted_value_predicted").is_ok());
-        assert!(schema.field_with_name("predicted_value_lower").is_ok());
-        assert!(schema.field_with_name("predicted_value_upper").is_ok());
-    }
-
-    #[test]
-    fn test_predict_with_alias_keyword() {
-        let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
-
-        // Test with AS keyword
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![(
-            "AS".to_string(),
-            Arg::String("value AS forecast".to_string()),
-        )];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
-
-        predict.process(batch).expect("Processing failed");
-        let output = predict
-            .finalize()
-            .expect("Finalize failed")
-            .expect("No output");
-
-        // Check that alias is used in output column names
-        let schema = output.schema();
-        assert!(schema.field_with_name("forecast_predicted").is_ok());
-        assert!(schema.field_with_name("forecast_lower").is_ok());
-        assert!(schema.field_with_name("forecast_upper").is_ok());
-    }
-
-    #[test]
-    fn test_predict_with_alias_lowercase_as() {
-        let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
-
-        // Test with lowercase "as" keyword
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![(
-            "as".to_string(),
-            Arg::String("value as my_prediction".to_string()),
-        )];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
-
-        predict.process(batch).expect("Processing failed");
-        let output = predict
-            .finalize()
-            .expect("Finalize failed")
-            .expect("No output");
-
-        // Check that alias is used in output column names
-        let schema = output.schema();
-        assert!(schema.field_with_name("my_prediction_predicted").is_ok());
-    }
-
-    #[test]
-    fn test_predict_multiple_fields_with_aliases() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("time", DataType::Int32, false),
-            Field::new("value1", DataType::Float64, true),
-            Field::new("value2", DataType::Float64, true),
-        ]));
-
-        let time_array = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])) as ArrayRef;
-        let value1_array =
-            Arc::new(Float64Array::from(vec![10.0, 12.0, 14.0, 16.0, 18.0])) as ArrayRef;
-        let value2_array =
-            Arc::new(Float64Array::from(vec![20.0, 22.0, 24.0, 26.0, 28.0])) as ArrayRef;
-
-        let batch = RecordBatch::try_new(schema, vec![time_array, value1_array, value2_array])
-            .expect("Failed to create test RecordBatch");
-
-        // Test with multiple aliases
-        let params = Args::from(vec![
-            Arg::String("value1".to_string()),
-            Arg::String("value2".to_string()),
-        ]);
-        let named_args = vec![
-            (
-                "value1_alias".to_string(),
-                Arg::String("forecast1".to_string()),
-            ),
-            (
-                "value2_alias".to_string(),
-                Arg::String("forecast2".to_string()),
-            ),
-        ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
-
-        predict.process(batch).expect("Processing failed");
-        let output = predict
-            .finalize()
-            .expect("Finalize failed")
-            .expect("No output");
-
-        // Check that both aliases are used in output column names
-        let schema = output.schema();
-        assert!(schema.field_with_name("forecast1_predicted").is_ok());
-        assert!(schema.field_with_name("forecast2_predicted").is_ok());
-    }
-
-    #[test]
-    fn test_predict_empty_alias() {
-        let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
-
-        // Test with empty alias (should use original field name)
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![("value_alias".to_string(), Arg::String("".to_string()))];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
-
-        predict.process(batch).expect("Processing failed");
-        let output = predict
-            .finalize()
-            .expect("Finalize failed")
-            .expect("No output");
-
-        // Empty alias should fall back to original field name
-        let schema = output.schema();
-        assert!(schema.field_with_name("value_predicted").is_ok());
-    }
-
-    #[test]
-    fn test_predict_alias_with_algorithm_and_period() {
-        let batch = create_test_batch(vec![10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0]);
-
-        // Test alias combined with other parameters
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![
-            (
-                "value_alias".to_string(),
-                Arg::String("sales_forecast".to_string()),
-            ),
-            ("algorithm".to_string(), Arg::String("LLP".to_string())),
-            ("period".to_string(), Arg::Int(3)),
-        ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
-
-        predict.process(batch).expect("Processing failed");
-        let output = predict
-            .finalize()
-            .expect("Finalize failed")
-            .expect("No output");
-
-        // Check that alias is used
-        let schema = output.schema();
-        assert!(schema.field_with_name("sales_forecast_predicted").is_ok());
-        assert!(schema.field_with_name("sales_forecast_lower").is_ok());
-        assert!(schema.field_with_name("sales_forecast_upper").is_ok());
-    }
-
-    #[test]
     fn test_predict_algorithm_llp1() {
         // Test LLP1 algorithm (LLP with variance taking maximum)
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0]);
@@ -1467,137 +1141,6 @@ mod tests {
     }
 
     #[test]
-    fn test_predict_algorithm_billmv() {
-        // Test BiLLmv algorithm (BiLL with missing values support)
-        // Create a batch with two numeric columns for bivariate analysis
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("time", DataType::Int32, false),
-            Field::new("value1", DataType::Float64, true),
-            Field::new("value2", DataType::Float64, true),
-        ]));
-
-        let time_array = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6])) as ArrayRef;
-        let value1_array = Arc::new(Float64Array::from(vec![
-            10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0,
-        ])) as ArrayRef;
-        let value2_array = Arc::new(Float64Array::from(vec![
-            20.0, 22.0, 24.0, 26.0, 28.0, 30.0, 32.0,
-        ])) as ArrayRef;
-
-        let batch = RecordBatch::try_new(schema, vec![time_array, value1_array, value2_array])
-            .expect("Failed to create test RecordBatch");
-
-        let params = Args::from(vec![Arg::String("value1".to_string())]);
-        let named_args = vec![
-            ("algorithm".to_string(), Arg::String("BiLLmv".to_string())),
-            ("correlate".to_string(), Arg::String("value2".to_string())),
-        ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
-
-        predict.process(batch).expect("Processing failed");
-        let output = predict
-            .finalize()
-            .expect("Finalize failed")
-            .expect("No output");
-
-        // Check basic output structure
-        assert_eq!(output.num_columns(), 6); // 3 original + 3 prediction columns
-
-        // Check prediction columns exist
-        let schema = output.schema();
-        assert!(schema.field_with_name("value1_predicted").is_ok());
-        assert!(schema.field_with_name("value1_lower").is_ok());
-        assert!(schema.field_with_name("value1_upper").is_ok());
-    }
-
-    #[test]
-    fn test_predict_algorithm_llbmv() {
-        // Test LLBmv algorithm (LLB with missing values support)
-        // Create a batch with two numeric columns for bivariate analysis
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("time", DataType::Int32, false),
-            Field::new("value1", DataType::Float64, true),
-            Field::new("value2", DataType::Float64, true),
-        ]));
-
-        let time_array = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6])) as ArrayRef;
-        let value1_array = Arc::new(Float64Array::from(vec![
-            10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0,
-        ])) as ArrayRef;
-        let value2_array = Arc::new(Float64Array::from(vec![
-            20.0, 22.0, 24.0, 26.0, 28.0, 30.0, 32.0,
-        ])) as ArrayRef;
-
-        let batch = RecordBatch::try_new(schema, vec![time_array, value1_array, value2_array])
-            .expect("Failed to create test RecordBatch");
-
-        let params = Args::from(vec![Arg::String("value1".to_string())]);
-        let named_args = vec![
-            ("algorithm".to_string(), Arg::String("LLBmv".to_string())),
-            ("correlate".to_string(), Arg::String("value2".to_string())),
-        ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
-
-        predict.process(batch).expect("Processing failed");
-        let output = predict
-            .finalize()
-            .expect("Finalize failed")
-            .expect("No output");
-
-        // Check basic output structure
-        assert_eq!(output.num_columns(), 6); // 3 original + 3 prediction columns
-
-        // Check prediction columns exist
-        let schema = output.schema();
-        assert!(schema.field_with_name("value1_predicted").is_ok());
-    }
-
-    #[test]
-    fn test_predict_algorithm_billmv_with_missing_values() {
-        // Test BiLLmv with actual missing values in data
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("time", DataType::Int32, false),
-            Field::new("value1", DataType::Float64, true),
-            Field::new("value2", DataType::Float64, true),
-        ]));
-
-        let time_array = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])) as ArrayRef;
-        let value1_array = Arc::new(Float64Array::from(vec![
-            Some(10.0),
-            Some(12.0),
-            None,
-            Some(14.0),
-            Some(16.0),
-        ])) as ArrayRef;
-        let value2_array = Arc::new(Float64Array::from(vec![
-            Some(20.0),
-            Some(22.0),
-            Some(24.0),
-            Some(26.0),
-            Some(28.0),
-        ])) as ArrayRef;
-
-        let batch = RecordBatch::try_new(schema, vec![time_array, value1_array, value2_array])
-            .expect("Failed to create test RecordBatch");
-
-        let params = Args::from(vec![Arg::String("value1".to_string())]);
-        let named_args = vec![
-            ("algorithm".to_string(), Arg::String("BiLLmv".to_string())),
-            ("correlate".to_string(), Arg::String("value2".to_string())),
-        ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
-
-        predict.process(batch).expect("Processing failed");
-        let output = predict
-            .finalize()
-            .expect("Finalize failed")
-            .expect("No output");
-
-        // Should handle missing values gracefully
-        assert!(output.num_columns() >= 5);
-    }
-
-    #[test]
     fn test_predict_algorithm_lowercase() {
         // Test that algorithms work with lowercase names
         // Use periodic data for LLP1 to work properly
@@ -1626,10 +1169,9 @@ mod tests {
     fn test_predict_all_algorithms() {
         // Test that all algorithms can be created successfully
         // Note: LLP, LLP1, LLP2 require periodic data to work properly
-        let algorithms = vec![
+                let algorithms = vec![
             "LL", "LLT", "LLP5", // These don't require period
             "LLP", "LLP1", "LLP2", // These require period
-            "LLB", "BiLL", // These require correlate field
         ];
 
         // Non-periodic data for simple algorithms
@@ -1637,23 +1179,6 @@ mod tests {
 
         // Periodic data for LLP/LLP1/LLP2
         let periodic_batch = create_test_batch(vec![10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0]);
-
-        // Bivariate data for LLB/BiLL
-        let bivariate_schema = Arc::new(Schema::new(vec![
-            Field::new("time", DataType::Int32, false),
-            Field::new("value1", DataType::Float64, true),
-            Field::new("value2", DataType::Float64, true),
-        ]));
-        let time_array = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])) as ArrayRef;
-        let value1_array =
-            Arc::new(Float64Array::from(vec![10.0, 12.0, 14.0, 16.0, 18.0])) as ArrayRef;
-        let value2_array =
-            Arc::new(Float64Array::from(vec![20.0, 22.0, 24.0, 26.0, 28.0])) as ArrayRef;
-        let bivariate_batch = RecordBatch::try_new(
-            bivariate_schema,
-            vec![time_array, value1_array, value2_array],
-        )
-        .expect("Failed to create bivariate batch");
 
         for algo in algorithms {
             let (params, named_args, batch): (Args, Vec<(String, Arg)>, RecordBatch) = match algo {
@@ -1669,14 +1194,6 @@ mod tests {
                         ("period".to_string(), Arg::Int(3)),
                     ];
                     (params, named_args, periodic_batch.clone())
-                }
-                "LLB" | "BiLL" => {
-                    let params = Args::from(vec![Arg::String("value1".to_string())]);
-                    let named_args = vec![
-                        ("algorithm".to_string(), Arg::String(algo.to_string())),
-                        ("correlate".to_string(), Arg::String("value2".to_string())),
-                    ];
-                    (params, named_args, bivariate_batch.clone())
                 }
                 _ => unreachable!(),
             };
