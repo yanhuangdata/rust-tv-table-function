@@ -71,8 +71,8 @@ pub struct Predict {
     // Time preprocessing state
     beginning: usize,     // Number of leading null/invalid values
     missing_valued: bool, // Whether there were any missing values in the data
-    _databegun: bool,      // Whether any valid data has been encountered (reserved for future use)
-    _numvals: usize,       // Number of values (reserved for future use)
+    _databegun: bool,     // Whether any valid data has been encountered (reserved for future use)
+    _numvals: usize,      // Number of values (reserved for future use)
     // Internal tracking for output (reserved for future use)
     _upper_names: HashMap<String, String>,
     _lower_names: HashMap<String, String>,
@@ -369,7 +369,10 @@ impl Predict {
         } else {
             numvals
         };
-        let _period = self._period.or(config.period.map(|p| p as i32)).unwrap_or(0);
+        let _period = self
+            ._period
+            .or(config.period.map(|p| p as i32))
+            .unwrap_or(0);
 
         // Determine algorithm type for model selection
         let algorithm_prefix = match config.algorithm {
@@ -394,9 +397,7 @@ impl Predict {
             // Univariate models
             Algorithm::LL => 1,
             Algorithm::LLT | Algorithm::LLP5 => 2,
-            Algorithm::LLP | Algorithm::LLP1 | Algorithm::LLP2 => {
-                config.period.unwrap_or(2)
-            }
+            Algorithm::LLP | Algorithm::LLP1 | Algorithm::LLP2 => config.period.unwrap_or(2),
             // Multivariate models
             Algorithm::LLB | Algorithm::LLBmv => 2,
             Algorithm::BiLL | Algorithm::BiLLmv => 1,
@@ -431,9 +432,7 @@ impl Predict {
             match config.algorithm {
                 Algorithm::LL => 0,
                 Algorithm::LLT => 2,
-                Algorithm::LLP | Algorithm::LLP1 | Algorithm::LLP2 => {
-                    config.period.unwrap_or(2)
-                }
+                Algorithm::LLP | Algorithm::LLP1 | Algorithm::LLP2 => config.period.unwrap_or(2),
                 Algorithm::LLP5 => 2,
                 _ => 1,
             }
@@ -1016,7 +1015,9 @@ impl TableFunction for Predict {
                     || field.name() == "_span"
                     || field.name() == "_spandays";
 
-                let extension_array = if is_time_column && let Some((time_span, time_idx)) = time_span_info.as_ref() {
+                let extension_array = if is_time_column
+                    && let Some((time_span, time_idx)) = time_span_info.as_ref()
+                {
                     // Extend time column with computed future timestamps
                     let last_valid_idx = all_rows.saturating_sub(1);
                     self.extend_time_column(
@@ -1064,7 +1065,6 @@ impl TableFunction for Predict {
 
         // Add prediction columns for each configured field
         for config in &self.field_configs {
-
             let values = self
                 .time_series_data
                 .get(&config.field_name)
