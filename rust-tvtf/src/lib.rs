@@ -101,10 +101,10 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
                     .parameter(ArgType::String) // field name(s)
                     .parameter((Some("algorithm"), ArgType::String, Some("LLP5")))
                     .parameter((Some("period"), ArgType::Int, Some(0)))
-                    .parameter((Some("future_timespan"), ArgType::Int, Some(10)))
+                    .parameter((Some("future_timespan"), ArgType::Int, Some(5)))
                     .parameter((Some("holdback"), ArgType::Int, Some(0)))
-                    .parameter((Some("upper"), ArgType::Float, Some(0.99)))
-                    .parameter((Some("lower"), ArgType::Float, Some(0.99)))
+                    .parameter((Some("nonnegative"), ArgType::Bool, Some(false)))
+                    .parameter((Some("start"), ArgType::Int, Some(0)))
                     .build()
                     .context("Failed to build signature parameters")?,
             )
