@@ -390,7 +390,6 @@ impl AnomalyDetector {
     }
 
     /// Calculate threshold using histogram method (Splunk default)
-    /// 完全匹配 Python 实现
     fn calculate_histogram_threshold(&mut self, sorted_probs: &[f64], fields: &[String]) -> f64 {
         let q1 = percentile(sorted_probs, 25.0);
         let q3 = percentile(sorted_probs, 75.0);
@@ -497,7 +496,6 @@ impl AnomalyDetector {
     }
 
     /// Calculate threshold using z-score method
-    /// 完全匹配 Python 实现
     fn calculate_zscore_threshold(&self, log_probs: &[f64]) -> f64 {
         let mean: f64 = log_probs.iter().sum::<f64>() / log_probs.len() as f64;
         let variance: f64 =
@@ -524,7 +522,6 @@ impl AnomalyDetector {
     }
 
     /// Apply sensitivity adjustment to threshold
-    /// 完全匹配 Python 实现
     fn apply_sensitivity_adjustment(&self, threshold: f64, log_probs: &[f64]) -> f64 {
         match self.sensitivity.as_str() {
             "strict" => {
@@ -732,11 +729,6 @@ fn median(sorted: &[f64]) -> f64 {
 
 impl TableFunction for AnomalyDetector {
     fn process(&mut self, input: RecordBatch) -> anyhow::Result<Option<RecordBatch>> {
-        eprintln!(
-            "DEBUG process: input.num_rows()={}, input.num_columns()={}",
-            input.num_rows(),
-            input.num_columns()
-        );
 
         if input.num_rows() == 0 {
             return Ok(Some(input));
@@ -789,12 +781,6 @@ impl TableFunction for AnomalyDetector {
         let anomalies: Vec<&AnomalyRecord> =
             anomaly_records.iter().filter(|r| r.is_anomaly).collect();
 
-        eprintln!(
-            "DEBUG: anomaly_records.len()={}, anomalies.len()={}",
-            anomaly_records.len(),
-            anomalies.len()
-        );
-
         // Build output schema with additional columns (even if no anomalies detected)
         let mut output_fields = schema.fields().to_vec();
         output_fields.push(Arc::new(Field::new(
@@ -816,11 +802,6 @@ impl TableFunction for AnomalyDetector {
         let output_schema = Arc::new(Schema::new(output_fields));
 
         if anomalies.is_empty() {
-            // Return empty batch with output schema
-            eprintln!(
-                "DEBUG: No anomalies detected, returning empty batch with {} columns",
-                output_schema.fields().len()
-            );
             return Ok(Some(RecordBatch::new_empty(output_schema)));
         }
 
