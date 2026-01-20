@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::TableFunction;
 use anyhow::Context;
 use arrow::{
     array::{Array, ArrayRef, AsArray, Float64Array, StringArray},
@@ -9,7 +10,6 @@ use arrow::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use rust_tvtf_api::arg::{Arg, Args};
-use crate::TableFunction;
 
 /// Field type analysis result
 #[derive(Debug, Clone, PartialEq)]
@@ -22,7 +22,6 @@ enum FieldType {
 /// Anomaly detection result for a single record
 #[derive(Debug, Clone)]
 struct AnomalyRecord {
-    row_data: Vec<(String, String)>,
     log_prob: f64,
     probable_cause: String,
     probable_cause_freq: f64,
@@ -69,7 +68,10 @@ impl Default for AnomalyDetector {
 }
 
 impl AnomalyDetector {
-    pub fn new(_params: Option<Args>, named_params: Vec<(String, Arg)>) -> anyhow::Result<AnomalyDetector> {
+    pub fn new(
+        _params: Option<Args>,
+        named_params: Vec<(String, Arg)>,
+    ) -> anyhow::Result<AnomalyDetector> {
         let mut detector = Self::default();
 
         // Parse named parameters
@@ -135,13 +137,21 @@ impl AnomalyDetector {
 
     /// Check if a string value can be converted to a number
     fn is_numeric(value: &str) -> bool {
-        let clean_value = value.trim().trim_matches('"').trim_matches('\'').to_lowercase();
+        let clean_value = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_lowercase();
         clean_value.parse::<f64>().is_ok()
     }
 
     /// Clean and convert string to numeric value
     fn clean_numeric_value(value: &str) -> f64 {
-        let clean_value = value.trim().trim_matches('"').trim_matches('\'').to_lowercase();
+        let clean_value = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_lowercase();
         clean_value.parse::<f64>().unwrap_or(0.0)
     }
 
@@ -195,9 +205,7 @@ impl AnomalyDetector {
 
         // If all values are the same, put everything in bin 0
         if bin_edges.len() <= 1 {
-            return values.iter()
-                .map(|v| (v.to_string(), 0))
-                .collect();
+            return values.iter().map(|v| (v.to_string(), 0)).collect();
         }
 
         // Use digitize-like logic: find the right bin for each value
@@ -237,7 +245,10 @@ impl AnomalyDetector {
 
         // Build frequency distributions
         for field in fields {
-            let field_type = self.field_types.get(field).unwrap_or(&FieldType::Categorical);
+            let field_type = self
+                .field_types
+                .get(field)
+                .unwrap_or(&FieldType::Categorical);
 
             match field_type {
                 FieldType::Numerical => {
@@ -299,7 +310,8 @@ impl AnomalyDetector {
                 }
             }
 
-            self.field_frequencies.insert(field.to_string(), value_frequencies);
+            self.field_frequencies
+                .insert(field.to_string(), value_frequencies);
         } else {
             // Use direct frequency counting - matching Python
             let mut counter: HashMap<String, usize> = HashMap::new();
@@ -315,7 +327,8 @@ impl AnomalyDetector {
                 .map(|(value, count)| (value, count as f64 / total))
                 .collect();
 
-            self.field_frequencies.insert(field.to_string(), value_frequencies);
+            self.field_frequencies
+                .insert(field.to_string(), value_frequencies);
         }
     }
 
@@ -336,7 +349,8 @@ impl AnomalyDetector {
             .map(|(value, count)| (value, count as f64 / total))
             .collect();
 
-        self.field_frequencies.insert(field.to_string(), value_frequencies);
+        self.field_frequencies
+            .insert(field.to_string(), value_frequencies);
     }
 
     /// Calculate event probability as product of field value frequencies
@@ -344,11 +358,11 @@ impl AnomalyDetector {
         let mut probability = 1.0f64;
 
         for field in fields {
-            if let Some((_, value)) = row.iter().find(|(f, _)| f == field) {
-                if let Some(field_freqs) = self.field_frequencies.get(field) {
-                    let freq = field_freqs.get(value).copied().unwrap_or(1e-10);
-                    probability *= freq;
-                }
+            if let Some((_, value)) = row.iter().find(|(f, _)| f == field)
+                && let Some(field_freqs) = self.field_frequencies.get(field)
+            {
+                let freq = field_freqs.get(value).copied().unwrap_or(1e-10);
+                probability *= freq;
             }
         }
 
@@ -356,11 +370,7 @@ impl AnomalyDetector {
     }
 
     /// Calculate threshold based on the selected method
-    fn calculate_threshold(
-        &mut self,
-        log_probabilities: &[f64],
-        fields: &[String],
-    ) -> f64 {
+    fn calculate_threshold(&mut self, log_probabilities: &[f64], fields: &[String]) -> f64 {
         if log_probabilities.is_empty() {
             return -10.0;
         }
@@ -381,11 +391,7 @@ impl AnomalyDetector {
 
     /// Calculate threshold using histogram method (Splunk default)
     /// 完全匹配 Python 实现
-    fn calculate_histogram_threshold(
-        &mut self,
-        sorted_probs: &[f64],
-        fields: &[String],
-    ) -> f64 {
+    fn calculate_histogram_threshold(&mut self, sorted_probs: &[f64], fields: &[String]) -> f64 {
         let q1 = percentile(sorted_probs, 25.0);
         let q3 = percentile(sorted_probs, 75.0);
         let iqr = q3 - q1;
@@ -431,31 +437,26 @@ impl AnomalyDetector {
                 } else {
                     sorted_probs[0] + 0.001
                 }
+            } else {
+                // Mixed or numerical: Use modified approach for better sensitivity
+                let base_threshold = q1 - 1.5 * iqr;
+
+                // MAD: Python uses median of absolute deviations from median
+                // np.median(np.abs(log_probs - np.median(log_probs)))
+                let median = median(sorted_probs);
+                let abs_deviations: Vec<f64> =
+                    sorted_probs.iter().map(|p| (p - median).abs()).collect();
+                let mad = percentile(&abs_deviations, 50.0); // 使用中位数
+
+                let mad_threshold = if mad > 0.0 {
+                    median - 3.0 * mad
                 } else {
-                    // Mixed or numerical: Use modified approach for better sensitivity
-                    let base_threshold = q1 - 1.5 * iqr;
-
-                    // MAD: Python uses median of absolute deviations from median
-                    // np.median(np.abs(log_probs - np.median(log_probs)))
-                    let median = median(sorted_probs);
-                    let abs_deviations: Vec<f64> = sorted_probs
-                        .iter()
-                        .map(|p| (p - median).abs())
-                        .collect();
-                    let mad = percentile(&abs_deviations, 50.0);  // 使用中位数
-
-                    let mad_threshold = if mad > 0.0 {
-                        median - 3.0 * mad
-                    } else {
-                        base_threshold
-                    };
+                    base_threshold
+                };
 
                 // Z-score constraint
                 let mean: f64 = sorted_probs.iter().sum::<f64>() / sorted_probs.len() as f64;
-                let variance: f64 = sorted_probs
-                    .iter()
-                    .map(|p| (p - mean).powi(2))
-                    .sum::<f64>()
+                let variance: f64 = sorted_probs.iter().map(|p| (p - mean).powi(2)).sum::<f64>()
                     / sorted_probs.len() as f64;
                 let std = variance.sqrt();
 
@@ -472,7 +473,8 @@ impl AnomalyDetector {
 
                     // Rank-based threshold for ~1% anomalies (Python default)
                     let target_anomaly_rate = 0.01;
-                    let target_count = (sorted_probs.len() as f64 * target_anomaly_rate).max(3.0) as usize;
+                    let target_count =
+                        (sorted_probs.len() as f64 * target_anomaly_rate).max(3.0) as usize;
 
                     let rank_based_threshold = if target_count < sorted_probs.len() {
                         sorted_probs[target_count - 1] + 0.001
@@ -498,11 +500,8 @@ impl AnomalyDetector {
     /// 完全匹配 Python 实现
     fn calculate_zscore_threshold(&self, log_probs: &[f64]) -> f64 {
         let mean: f64 = log_probs.iter().sum::<f64>() / log_probs.len() as f64;
-        let variance: f64 = log_probs
-            .iter()
-            .map(|p| (p - mean).powi(2))
-            .sum::<f64>()
-            / log_probs.len() as f64;
+        let variance: f64 =
+            log_probs.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / log_probs.len() as f64;
         let std = variance.sqrt();
 
         let pthresh = self.pthresh.unwrap_or(0.01);
@@ -566,7 +565,11 @@ impl AnomalyDetector {
     }
 
     /// Detect anomalies in the data
-    fn detect_anomalies(&mut self, data: &[Vec<(String, String)>], fields: &[String]) -> Vec<AnomalyRecord> {
+    fn detect_anomalies(
+        &mut self,
+        data: &[Vec<(String, String)>],
+        fields: &[String],
+    ) -> Vec<AnomalyRecord> {
         // Build field frequencies
         self.build_field_frequencies(data, fields);
 
@@ -609,16 +612,14 @@ impl AnomalyDetector {
                 };
 
                 for &field in &check_fields {
-                    if let Some((_, value)) = row.iter().find(|(f, _)| f == field) {
-                        if let Some(field_freqs) = self.field_frequencies.get(field) {
-                            if let Some(&freq) = field_freqs.get(value) {
-                                if freq < min_freq {
-                                    min_freq = freq;
-                                    probable_cause = field.clone();
-                                    probable_cause_freq = freq;
-                                }
-                            }
-                        }
+                    if let Some((_, value)) = row.iter().find(|(f, _)| f == field)
+                        && let Some(field_freqs) = self.field_frequencies.get(field)
+                        && let Some(&freq) = field_freqs.get(value)
+                        && freq < min_freq
+                    {
+                        min_freq = freq;
+                        probable_cause = field.clone();
+                        probable_cause_freq = freq;
                     }
                 }
 
@@ -665,7 +666,6 @@ impl AnomalyDetector {
                 };
 
                 AnomalyRecord {
-                    row_data: row.clone(),
                     log_prob,
                     probable_cause,
                     probable_cause_freq,
@@ -732,18 +732,18 @@ fn median(sorted: &[f64]) -> f64 {
 
 impl TableFunction for AnomalyDetector {
     fn process(&mut self, input: RecordBatch) -> anyhow::Result<Option<RecordBatch>> {
-        eprintln!("DEBUG process: input.num_rows()={}, input.num_columns()={}", input.num_rows(), input.num_columns());
+        eprintln!(
+            "DEBUG process: input.num_rows()={}, input.num_columns()={}",
+            input.num_rows(),
+            input.num_columns()
+        );
 
         if input.num_rows() == 0 {
             return Ok(Some(input));
         }
 
         let schema = input.schema();
-        let fields: Vec<String> = schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
+        let fields: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
 
         // Convert RecordBatch to Vec<Vec<(String, String)>>
         let data: Vec<Vec<(String, String)>> = (0..input.num_rows())
@@ -757,16 +757,15 @@ impl TableFunction for AnomalyDetector {
                         "null".to_string()
                     } else {
                         match col.data_type() {
-                            DataType::Utf8 => {
-                                col.as_string::<i32>()
-                                    .value(row_idx)
-                                    .to_string()
-                            }
+                            DataType::Utf8 => col.as_string::<i32>().value(row_idx).to_string(),
                             DataType::Int8
                             | DataType::Int16
                             | DataType::Int32
                             | DataType::Int64 => {
-                                let arr = col.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+                                let arr = col
+                                    .as_any()
+                                    .downcast_ref::<arrow::array::Int64Array>()
+                                    .unwrap();
                                 arr.value(row_idx).to_string()
                             }
                             DataType::Float32 | DataType::Float64 => {
@@ -787,15 +786,28 @@ impl TableFunction for AnomalyDetector {
         let anomaly_records = self.detect_anomalies(&data, &fields);
 
         // Filter anomalies and create output
-        let anomalies: Vec<&AnomalyRecord> = anomaly_records.iter().filter(|r| r.is_anomaly).collect();
+        let anomalies: Vec<&AnomalyRecord> =
+            anomaly_records.iter().filter(|r| r.is_anomaly).collect();
 
-        eprintln!("DEBUG: anomaly_records.len()={}, anomalies.len()={}", anomaly_records.len(), anomalies.len());
+        eprintln!(
+            "DEBUG: anomaly_records.len()={}, anomalies.len()={}",
+            anomaly_records.len(),
+            anomalies.len()
+        );
 
         // Build output schema with additional columns (even if no anomalies detected)
         let mut output_fields = schema.fields().to_vec();
-        output_fields.push(Arc::new(Field::new("log_event_prob", DataType::Float64, false)));
+        output_fields.push(Arc::new(Field::new(
+            "log_event_prob",
+            DataType::Float64,
+            false,
+        )));
         output_fields.push(Arc::new(Field::new("max_freq", DataType::Float64, false)));
-        output_fields.push(Arc::new(Field::new("probable_cause", DataType::Utf8, false)));
+        output_fields.push(Arc::new(Field::new(
+            "probable_cause",
+            DataType::Utf8,
+            false,
+        )));
         output_fields.push(Arc::new(Field::new(
             "probable_cause_freq",
             DataType::Float64,
@@ -805,7 +817,10 @@ impl TableFunction for AnomalyDetector {
 
         if anomalies.is_empty() {
             // Return empty batch with output schema
-            eprintln!("DEBUG: No anomalies detected, returning empty batch with {} columns", output_schema.fields().len());
+            eprintln!(
+                "DEBUG: No anomalies detected, returning empty batch with {} columns",
+                output_schema.fields().len()
+            );
             return Ok(Some(RecordBatch::new_empty(output_schema)));
         }
 
@@ -834,8 +849,12 @@ impl TableFunction for AnomalyDetector {
                 // Empty column
                 let empty_array = match col.data_type() {
                     DataType::Utf8 => Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
-                    DataType::Int64 => Arc::new(arrow::array::Int64Array::from(Vec::<i64>::new())) as ArrayRef,
-                    DataType::Float64 => Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
+                    DataType::Int64 => {
+                        Arc::new(arrow::array::Int64Array::from(Vec::<i64>::new())) as ArrayRef
+                    }
+                    DataType::Float64 => {
+                        Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef
+                    }
                     _ => Arc::new(arrow::array::NullArray::new(0)) as ArrayRef,
                 };
                 output_columns.push(empty_array);
@@ -843,16 +862,10 @@ impl TableFunction for AnomalyDetector {
         }
 
         // Add anomaly information columns
-        let log_probs: Vec<f64> = anomalies
-            .iter()
-            .map(|r| r.log_prob)
-            .collect();
+        let log_probs: Vec<f64> = anomalies.iter().map(|r| r.log_prob).collect();
         output_columns.push(Arc::new(Float64Array::from(log_probs)));
 
-        let max_freqs: Vec<f64> = anomalies
-            .iter()
-            .map(|r| r.max_freq)
-            .collect();
+        let max_freqs: Vec<f64> = anomalies.iter().map(|r| r.max_freq).collect();
         output_columns.push(Arc::new(Float64Array::from(max_freqs)));
 
         let probable_causes: Vec<&str> = anomalies
@@ -861,10 +874,8 @@ impl TableFunction for AnomalyDetector {
             .collect();
         output_columns.push(Arc::new(StringArray::from(probable_causes)));
 
-        let probable_cause_freqs: Vec<f64> = anomalies
-            .iter()
-            .map(|r| r.probable_cause_freq)
-            .collect();
+        let probable_cause_freqs: Vec<f64> =
+            anomalies.iter().map(|r| r.probable_cause_freq).collect();
         output_columns.push(Arc::new(Float64Array::from(probable_cause_freqs)));
 
         let output_batch = RecordBatch::try_new(output_schema, output_columns)
@@ -891,22 +902,22 @@ mod tests {
         // Anomalies: "error" with 500 (3 times), "unknown" with 999 (1 time)
         // This larger dataset ensures the threshold is sensitive enough
         let status_col = Arc::new(StringArray::from(
-            std::iter::repeat("success").take(100)
+            std::iter::repeat("success")
+                .take(100)
                 .chain(std::iter::repeat("error").take(3))
                 .chain(std::iter::once("unknown"))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
         )) as ArrayRef;
         let code_col = Arc::new(Int64Array::from(
-            std::iter::repeat(200i64).take(100)
+            std::iter::repeat(200i64)
+                .take(100)
                 .chain(std::iter::repeat(500i64).take(3))
                 .chain(std::iter::once(999i64))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
         )) as ArrayRef;
 
-        let input_batch = RecordBatch::try_new(
-            schema,
-            vec![status_col, code_col],
-        ).expect("Failed to create record batch");
+        let input_batch = RecordBatch::try_new(schema, vec![status_col, code_col])
+            .expect("Failed to create record batch");
 
         let params = vec![];
         let named_params = vec![];
@@ -928,9 +939,7 @@ mod tests {
     #[test]
     fn test_anomaly_detector_method_parameter() {
         let params = vec![];
-        let named_params = vec![
-            ("method".to_string(), Arg::String("iqr".to_string())),
-        ];
+        let named_params = vec![("method".to_string(), Arg::String("iqr".to_string()))];
 
         let result = AnomalyDetector::new(Some(params), named_params);
         assert!(result.is_ok());
@@ -942,9 +951,7 @@ mod tests {
     #[test]
     fn test_anomaly_detector_invalid_method() {
         let params = vec![];
-        let named_params = vec![
-            ("method".to_string(), Arg::String("invalid".to_string())),
-        ];
+        let named_params = vec![("method".to_string(), Arg::String("invalid".to_string()))];
 
         let result = AnomalyDetector::new(Some(params), named_params);
         assert!(result.is_err());
@@ -953,9 +960,7 @@ mod tests {
     #[test]
     fn test_anomaly_detector_bins_parameter() {
         let params = vec![];
-        let named_params = vec![
-            ("bins".to_string(), Arg::Int(20)),
-        ];
+        let named_params = vec![("bins".to_string(), Arg::Int(20))];
 
         let result = AnomalyDetector::new(Some(params), named_params);
         assert!(result.is_ok());
@@ -967,9 +972,7 @@ mod tests {
     #[test]
     fn test_anomaly_detector_cutoff_parameter() {
         let params = vec![];
-        let named_params = vec![
-            ("cutoff".to_string(), Arg::Bool(false)),
-        ];
+        let named_params = vec![("cutoff".to_string(), Arg::Bool(false))];
 
         let result = AnomalyDetector::new(Some(params), named_params);
         assert!(result.is_ok());
@@ -981,9 +984,7 @@ mod tests {
     #[test]
     fn test_anomaly_detector_sensitivity_parameter() {
         let params = vec![];
-        let named_params = vec![
-            ("sensitivity".to_string(), Arg::String("strict".to_string())),
-        ];
+        let named_params = vec![("sensitivity".to_string(), Arg::String("strict".to_string()))];
 
         let result = AnomalyDetector::new(Some(params), named_params);
         assert!(result.is_ok());
@@ -1009,12 +1010,10 @@ mod tests {
 
     #[test]
     fn test_anomaly_detector_empty_input() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("col1", DataType::Utf8, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("col1", DataType::Utf8, false)]));
         let col = Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
-        let input_batch = RecordBatch::try_new(schema, vec![col])
-            .expect("Failed to create record batch");
+        let input_batch =
+            RecordBatch::try_new(schema, vec![col]).expect("Failed to create record batch");
 
         let params = vec![];
         let named_params = vec![];
