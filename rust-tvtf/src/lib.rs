@@ -110,6 +110,24 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
             )
             .build()
             .context("create `predict` registry failed")?,
+        FunctionRegistry::builder()
+            .name("anomalydetection")
+            .init(Arc::new(|ctx| {
+                AnomalyDetector::new(ctx.arguments, ctx.named_arguments)
+                    .map(|f| Box::new(f) as Box<dyn TableFunction>)
+            }))
+            .signature(
+                Signature::builder()
+                    .parameter((Some("method"), ArgType::String, Some("histogram")))
+                    .parameter((Some("bins"), ArgType::Int, Some(10)))
+                    .parameter((Some("cutoff"), ArgType::Bool, Some(true)))
+                    .parameter((Some("pthresh"), ArgType::Float, Some(0.01)))
+                    .parameter((Some("sensitivity"), ArgType::String, Some("default")))
+                    .build()
+                    .context("Failed to build signature parameters")?,
+            )
+            .build()
+            .context("create `anomalydetection` registry failed")?,
     ])
 }
 
