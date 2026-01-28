@@ -729,7 +729,6 @@ fn median(sorted: &[f64]) -> f64 {
 
 impl TableFunction for AnomalyDetector {
     fn process(&mut self, input: RecordBatch) -> anyhow::Result<Option<RecordBatch>> {
-
         if input.num_rows() == 0 {
             return Ok(Some(input));
         }
