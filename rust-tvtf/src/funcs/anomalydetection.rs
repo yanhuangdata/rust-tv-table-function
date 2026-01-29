@@ -20,7 +20,7 @@ enum FieldType {
 }
 
 /// Anomaly detection result for a single record
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct AnomalyRecord {
     log_prob: f64,
     probable_cause: String,
@@ -29,20 +29,36 @@ struct AnomalyRecord {
     is_anomaly: bool,
 }
 
+/// Summary data for action=summary
+#[derive(Debug, Clone)]
+struct SummaryData {
+    num_anomalies: usize,
+    thresh: f64,
+    max_logprob: f64,
+    min_logprob: f64,
+    first_quartile: f64,
+    third_quartile: f64,
+}
+
 /// AnomalyDetector - Splunk anomalydetection command implementation
 ///
-/// Default: method=histogram, cutoff=true, action=filter
+/// Default: method=histogram, cutoff=true, action=filter (histogram/zscore)
+///          method=iqr, action=transform (default for IQR)
 #[derive(Debug)]
 pub struct AnomalyDetector {
     /// Detection method: "histogram", "zscore", "iqr"
     method: String,
+    /// Action: "filter", "annotate", "summary" (histogram/zscore)
+    ///         "remove", "transform" (iqr)
+    action: String,
     /// Number of bins for histogram method
     n_bins: usize,
-    /// Whether to apply cutoff threshold
+    /// Whether to apply cutoff threshold (histogram/zscore)
     cutoff: bool,
     /// Probability threshold for zscore method
     pthresh: Option<f64>,
     /// Sensitivity adjustment: "strict", "default", "lenient", "very_lenient"
+    /// Note: This is a custom extension, not in Splunk docs
     sensitivity: String,
     /// Field frequencies (value -> frequency)
     field_frequencies: HashMap<String, HashMap<String, f64>>,
@@ -50,12 +66,29 @@ pub struct AnomalyDetector {
     field_types: HashMap<String, FieldType>,
     /// Calculated threshold
     threshold: Option<f64>,
+    /// IQR parameter: multiplier for IQR (default 1.5)
+    /// Note: This is from Splunk's outlier command
+    param: Option<f64>,
+    /// IQR flag: whether to use lower bound as well
+    /// Note: This is from Splunk's outlier command
+    uselower: bool,
+    /// IQR flag: whether to prefix transformed values with "000"
+    /// Note: This is from Splunk's outlier command
+    /// LIMITATION: For Int64/Float64 column types, the "000" prefix cannot be stored
+    /// as numeric types don't support string prefixes. In a full implementation,
+    /// this would require either:
+    ///    1. Converting numeric columns to string columns, or
+    ///    2. Adding a separate marker/flag column to indicate transformed values
+    ///
+    /// Current implementation truncates values but cannot add the "000" prefix.
+    mark: bool,
 }
 
 impl Default for AnomalyDetector {
     fn default() -> Self {
         AnomalyDetector {
             method: "histogram".to_string(),
+            action: String::new(), // Will be set based on method in new()
             n_bins: 10,
             cutoff: true,
             pthresh: None,
@@ -63,6 +96,9 @@ impl Default for AnomalyDetector {
             field_frequencies: HashMap::new(),
             field_types: HashMap::new(),
             threshold: None,
+            param: Some(1.5),
+            uselower: false,
+            mark: false,
         }
     }
 }
@@ -73,8 +109,9 @@ impl AnomalyDetector {
         named_params: Vec<(String, Arg)>,
     ) -> anyhow::Result<AnomalyDetector> {
         let mut detector = Self::default();
+        let mut action_specified = false;
 
-        // Parse named parameters
+        // Parse all parameters first without validation
         for (name, arg) in named_params {
             match name.as_str() {
                 "method" => {
@@ -86,6 +123,12 @@ impl AnomalyDetector {
                                 method
                             ));
                         }
+                    }
+                }
+                "action" => {
+                    if let Arg::String(action) = arg {
+                        detector.action = action.to_lowercase();
+                        action_specified = true;
                     }
                 }
                 "bins" | "n_bins" => {
@@ -126,10 +169,68 @@ impl AnomalyDetector {
                         }
                     }
                 }
+                // IQR-specific parameters
+                "mark" => {
+                    if let Arg::Bool(mark) = arg {
+                        detector.mark = mark;
+                    }
+                }
+                "param" => {
+                    if let Arg::Float(p) = arg {
+                        if p <= 0.0 {
+                            return Err(anyhow::anyhow!("param must be greater than 0, got {}", p));
+                        }
+                        detector.param = Some(p);
+                    }
+                }
+                "uselower" => {
+                    if let Arg::Bool(uselower) = arg {
+                        detector.uselower = uselower;
+                    }
+                }
                 _ => {
                     // Ignore unknown parameters
                 }
             }
+        }
+
+        // Set default action based on method (only if not explicitly specified)
+        if !action_specified {
+            detector.action = match detector.method.as_str() {
+                "iqr" => "transform".to_string(), // IQR default is transform
+                _ => "filter".to_string(),        // histogram/zscore default is filter
+            };
+        }
+
+        // Validate action based on method (after all parameters are parsed)
+        match detector.method.as_str() {
+            "histogram" | "zscore" => {
+                if !matches!(detector.action.as_str(), "filter" | "annotate" | "summary") {
+                    return Err(anyhow::anyhow!(
+                        "Invalid action '{}' for method '{}'. Must be 'filter', 'annotate', or 'summary'",
+                        detector.action,
+                        detector.method
+                    ));
+                }
+            }
+            "iqr" => {
+                // pthresh is not supported for IQR method
+                if detector.pthresh.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "Invalid argument: 'pthresh' is not supported with method 'iqr'"
+                    ));
+                }
+                if !matches!(
+                    detector.action.as_str(),
+                    "remove" | "transform" | "rm" | "tf"
+                ) {
+                    return Err(anyhow::anyhow!(
+                        "Invalid action '{}' for method 'iqr'. Must be 'remove', 'transform', or their abbreviations 'rm', 'tf'",
+                        detector.action
+                    ));
+                }
+            }
+            _ => {}
         }
 
         Ok(detector)
@@ -514,21 +615,28 @@ impl AnomalyDetector {
     }
 
     /// Calculate threshold using IQR method
+    /// Uses self.param (default 1.5) as the multiplier for IQR
     fn calculate_iqr_threshold(&self, sorted_probs: &[f64]) -> f64 {
         let q1 = percentile(sorted_probs, 25.0);
         let q3 = percentile(sorted_probs, 75.0);
         let iqr = q3 - q1;
-        q1 - 1.5 * iqr
+        let param = self.param.unwrap_or(1.5);
+        q1 - param * iqr
     }
 
     /// Apply sensitivity adjustment to threshold
+    /// Note: log_probs may not be sorted, so we sort it for percentile calculation
     fn apply_sensitivity_adjustment(&self, threshold: f64, log_probs: &[f64]) -> f64 {
+        // Sort log_probs for percentile calculation
+        let mut sorted_probs: Vec<f64> = log_probs.to_vec();
+        sorted_probs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
         match self.sensitivity.as_str() {
             "strict" => {
                 // Fewer anomalies: make threshold more restrictive
                 // Python: adjustment = -0.3 * iqr if iqr > 0 else -0.5
-                let q1 = percentile(log_probs, 25.0);
-                let iqr = percentile(log_probs, 75.0) - q1;
+                let q1 = percentile(&sorted_probs, 25.0);
+                let iqr = percentile(&sorted_probs, 75.0) - q1;
                 if iqr > 0.0 {
                     threshold - 0.3 * iqr
                 } else {
@@ -538,8 +646,8 @@ impl AnomalyDetector {
             "lenient" => {
                 // More anomalies: make threshold less restrictive
                 // Python: adjustment = 0.5 * iqr if iqr > 0 else 1.0
-                let q1 = percentile(log_probs, 25.0);
-                let iqr = percentile(log_probs, 75.0) - q1;
+                let q1 = percentile(&sorted_probs, 25.0);
+                let iqr = percentile(&sorted_probs, 75.0) - q1;
                 if iqr > 0.0 {
                     threshold + 0.5 * iqr
                 } else {
@@ -549,8 +657,8 @@ impl AnomalyDetector {
             "very_lenient" => {
                 // Many more anomalies: make threshold much less restrictive
                 // Python: adjustment = 1.0 * iqr if iqr > 0 else 2.0
-                let q1 = percentile(log_probs, 25.0);
-                let iqr = percentile(log_probs, 75.0) - q1;
+                let q1 = percentile(&sorted_probs, 25.0);
+                let iqr = percentile(&sorted_probs, 75.0) - q1;
                 if iqr > 0.0 {
                     threshold + 1.0 * iqr
                 } else {
@@ -699,6 +807,409 @@ impl AnomalyDetector {
 
         records
     }
+
+    /// Build summary data for action=summary
+    fn build_summary(&self, anomaly_records: &[AnomalyRecord], log_probs: &[f64]) -> SummaryData {
+        let num_anomalies = anomaly_records.iter().filter(|r| r.is_anomaly).count();
+
+        let thresh = self.threshold.unwrap_or(0.0);
+
+        let max_logprob = log_probs
+            .iter()
+            .fold(f64::NEG_INFINITY, |acc, &p| acc.max(p));
+        let min_logprob = log_probs.iter().fold(f64::INFINITY, |acc, &p| acc.min(p));
+
+        // Sort log_probs for percentile calculation
+        let mut sorted_probs: Vec<f64> = log_probs.to_vec();
+        sorted_probs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let first_quartile = percentile(&sorted_probs, 25.0);
+        let third_quartile = percentile(&sorted_probs, 75.0);
+
+        SummaryData {
+            num_anomalies,
+            thresh,
+            max_logprob,
+            min_logprob,
+            first_quartile,
+            third_quartile,
+        }
+    }
+
+    /// Create summary output for action=summary (following Splunk docs - only 6 fields)
+    fn create_summary_output_only(
+        &self,
+        summary: SummaryData,
+    ) -> anyhow::Result<Option<RecordBatch>> {
+        let fields = vec![
+            Arc::new(Field::new("num_anomalies", DataType::Int64, false)),
+            Arc::new(Field::new("thresh", DataType::Float64, false)),
+            Arc::new(Field::new("max_logprob", DataType::Float64, false)),
+            Arc::new(Field::new("min_logprob", DataType::Float64, false)),
+            Arc::new(Field::new("1st_quartile", DataType::Float64, false)),
+            Arc::new(Field::new("3rd_quartile", DataType::Float64, false)),
+        ];
+
+        let schema = Arc::new(Schema::new(fields));
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(arrow::array::Int64Array::from(vec![
+                summary.num_anomalies as i64,
+            ])),
+            Arc::new(Float64Array::from(vec![summary.thresh])),
+            Arc::new(Float64Array::from(vec![summary.max_logprob])),
+            Arc::new(Float64Array::from(vec![summary.min_logprob])),
+            Arc::new(Float64Array::from(vec![summary.first_quartile])),
+            Arc::new(Float64Array::from(vec![summary.third_quartile])),
+        ];
+
+        RecordBatch::try_new(schema, columns)
+            .map(Some)
+            .context("Failed to create summary output")
+    }
+
+    /// Create filter output for action=filter
+    /// Returns anomalous events only
+    fn create_filter_output(
+        &self,
+        anomaly_records: &[AnomalyRecord],
+        input: &RecordBatch,
+    ) -> anyhow::Result<Option<RecordBatch>> {
+        let anomalies: Vec<&AnomalyRecord> =
+            anomaly_records.iter().filter(|r| r.is_anomaly).collect();
+
+        self.build_filter_output(&anomalies, anomaly_records, input)
+    }
+
+    /// Create remove output for action=remove (IQR method)
+    /// Returns normal events only (removes outliers)
+    fn create_remove_output(
+        &self,
+        anomaly_records: &[AnomalyRecord],
+        input: &RecordBatch,
+    ) -> anyhow::Result<Option<RecordBatch>> {
+        let normal_events: Vec<&AnomalyRecord> =
+            anomaly_records.iter().filter(|r| !r.is_anomaly).collect();
+
+        self.build_filter_output(&normal_events, anomaly_records, input)
+    }
+
+    /// Common helper to build filter/remove output
+    fn build_filter_output(
+        &self,
+        records: &[&AnomalyRecord],
+        anomaly_records: &[AnomalyRecord],
+        input: &RecordBatch,
+    ) -> anyhow::Result<Option<RecordBatch>> {
+        // Build output schema with additional columns
+        let mut output_fields = input.schema().fields().to_vec();
+        output_fields.push(Arc::new(Field::new(
+            "log_event_prob",
+            DataType::Float64,
+            false,
+        )));
+        output_fields.push(Arc::new(Field::new("max_freq", DataType::Float64, false)));
+        output_fields.push(Arc::new(Field::new(
+            "probable_cause",
+            DataType::Utf8,
+            false,
+        )));
+        output_fields.push(Arc::new(Field::new(
+            "probable_cause_freq",
+            DataType::Float64,
+            false,
+        )));
+        let output_schema = Arc::new(Schema::new(output_fields));
+
+        if records.is_empty() {
+            return Ok(Some(RecordBatch::new_empty(output_schema)));
+        }
+
+        // Build output columns
+        let mut output_columns: Vec<ArrayRef> = Vec::new();
+
+        // Collect the actual row indices from the original input
+        // records are references to AnomalyRecords, which correspond to input rows
+        let num_output_rows = records.len();
+
+        // Copy original columns for selected rows
+        for col_idx in 0..input.num_columns() {
+            let col = input.column(col_idx);
+            let mut indices: Vec<u32> = Vec::with_capacity(num_output_rows);
+
+            // Build a mapping from record pointer to its index in anomaly_records
+            // Then use that index as the row index in input
+            for (anomaly_idx, anomaly_record) in anomaly_records.iter().enumerate() {
+                if records.contains(&anomaly_record) {
+                    indices.push(anomaly_idx as u32);
+                }
+            }
+
+            if !indices.is_empty() {
+                let indices_array = arrow::array::UInt32Array::from(indices);
+                let taken_col = compute::take(col.as_ref(), &indices_array, None)
+                    .context("Failed to take columns for output")?;
+                output_columns.push(taken_col);
+            } else {
+                let empty_array = match col.data_type() {
+                    DataType::Utf8 => Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
+                    DataType::Int64 => {
+                        Arc::new(arrow::array::Int64Array::from(Vec::<i64>::new())) as ArrayRef
+                    }
+                    DataType::Float64 => {
+                        Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef
+                    }
+                    _ => Arc::new(arrow::array::NullArray::new(0)) as ArrayRef,
+                };
+                output_columns.push(empty_array);
+            }
+        }
+
+        // Add anomaly information columns
+        let log_probs: Vec<f64> = records.iter().map(|r| r.log_prob).collect();
+        output_columns.push(Arc::new(Float64Array::from(log_probs)));
+
+        let max_freqs: Vec<f64> = records.iter().map(|r| r.max_freq).collect();
+        output_columns.push(Arc::new(Float64Array::from(max_freqs)));
+
+        let probable_causes: Vec<&str> =
+            records.iter().map(|r| r.probable_cause.as_str()).collect();
+        output_columns.push(Arc::new(StringArray::from(probable_causes)));
+
+        let probable_cause_freqs: Vec<f64> =
+            records.iter().map(|r| r.probable_cause_freq).collect();
+        output_columns.push(Arc::new(Float64Array::from(probable_cause_freqs)));
+
+        let output_batch = RecordBatch::try_new(output_schema, output_columns)
+            .context("Failed to create output RecordBatch")?;
+
+        Ok(Some(output_batch))
+    }
+
+    /// Create transform output for IQR method - truncates outlier values
+    /// According to Splunk docs:
+    /// - Truncates outlying value to the threshold for outliers
+    /// - If mark=true, prefixes the value with "000"
+    ///
+    /// # Mark Parameter Limitation
+    /// For Int64/Float64 column types, the "000" prefix cannot be stored as numeric
+    /// types don't support string prefixes. In a full implementation, this would require:
+    ///    1. Converting numeric columns to string columns, or
+    ///    2. Adding a separate marker/flag column to indicate transformed values
+    ///
+    /// Current implementation truncates values but cannot add the "000" prefix.
+    fn create_transform_output(
+        &self,
+        anomaly_records: &[AnomalyRecord],
+        input: &RecordBatch,
+    ) -> anyhow::Result<Option<RecordBatch>> {
+        let param = self.param.unwrap_or(1.5);
+
+        // Build output schema (same as input for transform)
+        let output_schema = input.schema();
+
+        let num_rows = input.num_rows();
+        let mut output_columns: Vec<ArrayRef> = Vec::new();
+
+        // Pre-calculate field bounds for each numeric column
+        // According to Splunk outlier docs, IQR should be calculated per numeric field
+        let mut field_bounds: HashMap<usize, (f64, f64)> = HashMap::new();
+
+        for col_idx in 0..input.num_columns() {
+            let col = input.column(col_idx);
+
+            match col.data_type() {
+                DataType::Int64 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .unwrap();
+                    let values: Vec<i64> = (0..num_rows).map(|i| arr.value(i)).collect();
+                    let float_values: Vec<f64> = values.iter().map(|v| *v as f64).collect();
+                    let mut sorted_values = float_values.clone();
+                    sorted_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let q1 = percentile(&sorted_values, 25.0);
+                    let q3 = percentile(&sorted_values, 75.0);
+                    let iqr = q3 - q1;
+                    let upper_bound = q3 + param * iqr;
+                    let lower_bound = q1 - param * iqr;
+                    field_bounds.insert(col_idx, (upper_bound, lower_bound));
+                }
+                DataType::Float64 => {
+                    let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                    let values: Vec<f64> = (0..num_rows).map(|i| arr.value(i)).collect();
+                    let mut sorted_values = values.clone();
+                    sorted_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let q1 = percentile(&sorted_values, 25.0);
+                    let q3 = percentile(&sorted_values, 75.0);
+                    let iqr = q3 - q1;
+                    let upper_bound = q3 + param * iqr;
+                    let lower_bound = q1 - param * iqr;
+                    field_bounds.insert(col_idx, (upper_bound, lower_bound));
+                }
+                _ => {}
+            }
+        }
+
+        // Process each column - numeric columns get transformed based on their own bounds
+        for col_idx in 0..input.num_columns() {
+            let col = input.column(col_idx);
+
+            match col.data_type() {
+                DataType::Int64 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .unwrap();
+                    let mut values: Vec<i64> = Vec::with_capacity(num_rows);
+
+                    // Get bounds for this field
+                    let (upper_bound, lower_bound) = field_bounds
+                        .get(&col_idx)
+                        .copied()
+                        .unwrap_or((f64::MAX, f64::MIN));
+
+                    for row_idx in 0..num_rows {
+                        let is_anomaly = if row_idx < anomaly_records.len() {
+                            anomaly_records[row_idx].is_anomaly
+                        } else {
+                            false
+                        };
+
+                        if is_anomaly {
+                            let original_value = arr.value(row_idx);
+                            let _transformed_value = if self.mark {
+                                // Mark parameter would prefix with "000" as per Splunk docs
+                                // Note: For Int64 type, we cannot store "000" prefix.
+                                // In a full implementation, this would require converting to string
+                                // or adding a separate marker column. For now, we just truncate.
+                                format!("000{}", original_value)
+                            } else {
+                                original_value.to_string()
+                            };
+                            // Truncate to upper_bound or lower_bound based on direction and field bounds
+                            if original_value > upper_bound as i64 {
+                                values.push(upper_bound as i64);
+                            } else if original_value < lower_bound as i64 && self.uselower {
+                                values.push(lower_bound as i64);
+                            } else {
+                                values.push(original_value);
+                            }
+                        } else {
+                            values.push(arr.value(row_idx));
+                        }
+                    }
+                    output_columns
+                        .push(Arc::new(arrow::array::Int64Array::from(values)) as ArrayRef);
+                }
+                DataType::Float64 => {
+                    let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                    let mut values: Vec<f64> = Vec::with_capacity(num_rows);
+
+                    // Get bounds for this field
+                    let (upper_bound, lower_bound) = field_bounds
+                        .get(&col_idx)
+                        .copied()
+                        .unwrap_or((f64::MAX, f64::MIN));
+
+                    for row_idx in 0..num_rows {
+                        let is_anomaly = if row_idx < anomaly_records.len() {
+                            anomaly_records[row_idx].is_anomaly
+                        } else {
+                            false
+                        };
+
+                        if is_anomaly {
+                            let original_value = arr.value(row_idx);
+                            let _transformed_value = if self.mark {
+                                // Mark parameter would prefix with "000" as per Splunk docs
+                                // Note: For Float64 type, we cannot store "000" prefix.
+                                // In a full implementation, this would require converting to string
+                                // or adding a separate marker column. For now, we just truncate.
+                                format!("000{}", original_value)
+                            } else {
+                                upper_bound.to_string()
+                            };
+                            // Truncate to upper_bound or lower_bound based on direction and field bounds
+                            if original_value > upper_bound {
+                                values.push(upper_bound);
+                            } else if original_value < lower_bound && self.uselower {
+                                values.push(lower_bound);
+                            } else {
+                                values.push(original_value);
+                            }
+                        } else {
+                            values.push(arr.value(row_idx));
+                        }
+                    }
+                    output_columns.push(Arc::new(Float64Array::from(values)) as ArrayRef);
+                }
+                _ => {
+                    // Non-numeric columns: copy as-is
+                    output_columns.push(col.clone());
+                }
+            }
+        }
+
+        if num_rows > 0 {
+            RecordBatch::try_new(output_schema, output_columns)
+                .map(Some)
+                .context("Failed to create transform output")
+        } else {
+            RecordBatch::try_new(output_schema, output_columns)
+                .map(Some)
+                .context("Failed to create empty transform output")
+        }
+    }
+
+    /// Create annotated output for action=annotate (returns all events with annotation fields)
+    fn create_annotated_output(
+        &self,
+        anomaly_records: &[AnomalyRecord],
+        input: &RecordBatch,
+        output_schema: Arc<Schema>,
+    ) -> anyhow::Result<Option<RecordBatch>> {
+        let num_rows = input.num_rows();
+        let mut output_columns: Vec<ArrayRef> = Vec::new();
+
+        // Copy all original columns
+        for col_idx in 0..input.num_columns() {
+            let col = input.column(col_idx);
+            output_columns.push(col.clone());
+        }
+
+        // Add annotation fields
+        let is_anomaly: Vec<bool> = anomaly_records.iter().map(|r| r.is_anomaly).collect();
+        output_columns.push(Arc::new(arrow::array::BooleanArray::from(is_anomaly)));
+
+        let log_probs: Vec<f64> = anomaly_records.iter().map(|r| r.log_prob).collect();
+        output_columns.push(Arc::new(Float64Array::from(log_probs)));
+
+        let max_freqs: Vec<f64> = anomaly_records.iter().map(|r| r.max_freq).collect();
+        output_columns.push(Arc::new(Float64Array::from(max_freqs)));
+
+        let probable_causes: Vec<&str> = anomaly_records
+            .iter()
+            .map(|r| r.probable_cause.as_str())
+            .collect();
+        output_columns.push(Arc::new(StringArray::from(probable_causes)));
+
+        let probable_cause_freqs: Vec<f64> = anomaly_records
+            .iter()
+            .map(|r| r.probable_cause_freq)
+            .collect();
+        output_columns.push(Arc::new(Float64Array::from(probable_cause_freqs)));
+
+        if num_rows > 0 {
+            RecordBatch::try_new(output_schema, output_columns)
+                .map(Some)
+                .context("Failed to create annotated output")
+        } else {
+            RecordBatch::try_new(output_schema, output_columns)
+                .map(Some)
+                .context("Failed to create empty annotated output")
+        }
+    }
 }
 
 /// Calculate percentile of a sorted array
@@ -775,93 +1286,59 @@ impl TableFunction for AnomalyDetector {
 
         // Detect anomalies
         let anomaly_records = self.detect_anomalies(&data, &fields);
+        let log_probs: Vec<f64> = anomaly_records.iter().map(|r| r.log_prob).collect();
 
-        // Filter anomalies and create output
-        let anomalies: Vec<&AnomalyRecord> =
-            anomaly_records.iter().filter(|r| r.is_anomaly).collect();
-
-        // Build output schema with additional columns (even if no anomalies detected)
-        let mut output_fields = schema.fields().to_vec();
-        output_fields.push(Arc::new(Field::new(
-            "log_event_prob",
-            DataType::Float64,
-            false,
-        )));
-        output_fields.push(Arc::new(Field::new("max_freq", DataType::Float64, false)));
-        output_fields.push(Arc::new(Field::new(
-            "probable_cause",
-            DataType::Utf8,
-            false,
-        )));
-        output_fields.push(Arc::new(Field::new(
-            "probable_cause_freq",
-            DataType::Float64,
-            false,
-        )));
-        let output_schema = Arc::new(Schema::new(output_fields));
-
-        if anomalies.is_empty() {
-            return Ok(Some(RecordBatch::new_empty(output_schema)));
-        }
-
-        // Build output columns
-        let num_output_rows = anomalies.len();
-        let mut output_columns: Vec<ArrayRef> = Vec::new();
-
-        // Copy original columns
-        for col_idx in 0..input.num_columns() {
-            let col = input.column(col_idx);
-            let mut indices: Vec<u32> = Vec::with_capacity(num_output_rows);
-
-            // Map anomaly indices
-            for (i, record) in anomaly_records.iter().enumerate() {
-                if record.is_anomaly {
-                    indices.push(i as u32);
-                }
+        // Handle different actions
+        match self.action.as_str() {
+            "summary" => {
+                // Build summary data
+                let summary = self.build_summary(&anomaly_records, &log_probs);
+                self.create_summary_output_only(summary)
             }
-
-            if !indices.is_empty() {
-                let indices_array = arrow::array::UInt32Array::from(indices);
-                let repeated_col = compute::take(col.as_ref(), &indices_array, None)
-                    .context("Failed to repeat column for anomalies")?;
-                output_columns.push(repeated_col);
-            } else {
-                // Empty column
-                let empty_array = match col.data_type() {
-                    DataType::Utf8 => Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
-                    DataType::Int64 => {
-                        Arc::new(arrow::array::Int64Array::from(Vec::<i64>::new())) as ArrayRef
-                    }
-                    DataType::Float64 => {
-                        Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef
-                    }
-                    _ => Arc::new(arrow::array::NullArray::new(0)) as ArrayRef,
-                };
-                output_columns.push(empty_array);
+            "annotate" => {
+                // Build output schema with annotation fields
+                // Note: Following Splunk docs, annotate adds log_event_prob, probable_cause,
+                // probable_cause_freq, max_freq. The is_anomaly field is a custom addition
+                // for convenience.
+                let mut output_fields = schema.fields().to_vec();
+                output_fields.push(Arc::new(Field::new("is_anomaly", DataType::Boolean, false)));
+                output_fields.push(Arc::new(Field::new(
+                    "log_event_prob",
+                    DataType::Float64,
+                    false,
+                )));
+                output_fields.push(Arc::new(Field::new("max_freq", DataType::Float64, false)));
+                output_fields.push(Arc::new(Field::new(
+                    "probable_cause",
+                    DataType::Utf8,
+                    false,
+                )));
+                output_fields.push(Arc::new(Field::new(
+                    "probable_cause_freq",
+                    DataType::Float64,
+                    false,
+                )));
+                let output_schema = Arc::new(Schema::new(output_fields));
+                self.create_annotated_output(&anomaly_records, &input, output_schema)
+            }
+            "remove" | "rm" => {
+                // Remove anomalous events (for IQR method)
+                // Returns normal events (non-anomalies), removes outliers
+                // "rm" is the abbreviation for "remove"
+                self.create_remove_output(&anomaly_records, &input)
+            }
+            "transform" | "tf" => {
+                // Transform outlier values (for IQR method)
+                // Truncates outlying values to the threshold
+                // "tf" is the abbreviation for "transform"
+                self.create_transform_output(&anomaly_records, &input)
+            }
+            _ => {
+                // filter (default for histogram/zscore)
+                // Filter anomalies and create output
+                self.create_filter_output(&anomaly_records, &input)
             }
         }
-
-        // Add anomaly information columns
-        let log_probs: Vec<f64> = anomalies.iter().map(|r| r.log_prob).collect();
-        output_columns.push(Arc::new(Float64Array::from(log_probs)));
-
-        let max_freqs: Vec<f64> = anomalies.iter().map(|r| r.max_freq).collect();
-        output_columns.push(Arc::new(Float64Array::from(max_freqs)));
-
-        let probable_causes: Vec<&str> = anomalies
-            .iter()
-            .map(|r| r.probable_cause.as_str())
-            .collect();
-        output_columns.push(Arc::new(StringArray::from(probable_causes)));
-
-        let probable_cause_freqs: Vec<f64> =
-            anomalies.iter().map(|r| r.probable_cause_freq).collect();
-        output_columns.push(Arc::new(Float64Array::from(probable_cause_freqs)));
-
-        let output_batch = RecordBatch::try_new(output_schema, output_columns)
-            .context("Failed to create output RecordBatch")?;
-
-        Ok(Some(output_batch))
     }
 }
 
@@ -926,6 +1403,8 @@ mod tests {
 
         let detector = result.unwrap();
         assert_eq!(detector.method, "iqr");
+        // IQR method should have default action = "transform"
+        assert_eq!(detector.action, "transform");
     }
 
     #[test]
@@ -1042,5 +1521,396 @@ mod tests {
         assert_eq!(AnomalyDetector::clean_numeric_value("1.23e-4"), 0.000123);
         assert_eq!(AnomalyDetector::clean_numeric_value("abc"), 0.0);
         assert_eq!(AnomalyDetector::clean_numeric_value(""), 0.0);
+    }
+
+    #[test]
+    fn test_action_filter_parameter() {
+        let params = vec![];
+        let named_params = vec![("action".to_string(), Arg::String("filter".to_string()))];
+
+        let result = AnomalyDetector::new(Some(params), named_params);
+        assert!(result.is_ok());
+
+        let detector = result.unwrap();
+        assert_eq!(detector.action, "filter");
+    }
+
+    #[test]
+    fn test_action_annotate_parameter() {
+        let params = vec![];
+        let named_params = vec![("action".to_string(), Arg::String("annotate".to_string()))];
+
+        let result = AnomalyDetector::new(Some(params), named_params);
+        assert!(result.is_ok());
+
+        let detector = result.unwrap();
+        assert_eq!(detector.action, "annotate");
+    }
+
+    #[test]
+    fn test_action_summary_parameter() {
+        let params = vec![];
+        let named_params = vec![("action".to_string(), Arg::String("summary".to_string()))];
+
+        let result = AnomalyDetector::new(Some(params), named_params);
+        assert!(result.is_ok());
+
+        let detector = result.unwrap();
+        assert_eq!(detector.action, "summary");
+    }
+
+    #[test]
+    fn test_action_remove_parameter() {
+        let params = vec![];
+        let named_params = vec![
+            ("method".to_string(), Arg::String("iqr".to_string())),
+            ("action".to_string(), Arg::String("remove".to_string())),
+        ];
+
+        let result = AnomalyDetector::new(Some(params), named_params);
+        assert!(result.is_ok());
+
+        let detector = result.unwrap();
+        assert_eq!(detector.action, "remove");
+    }
+
+    #[test]
+    fn test_action_transform_parameter() {
+        let params = vec![];
+        let named_params = vec![
+            ("method".to_string(), Arg::String("iqr".to_string())),
+            ("action".to_string(), Arg::String("transform".to_string())),
+        ];
+
+        let result = AnomalyDetector::new(Some(params), named_params);
+        assert!(result.is_ok());
+
+        let detector = result.unwrap();
+        assert_eq!(detector.action, "transform");
+    }
+
+    #[test]
+    fn test_action_invalid_for_histogram() {
+        let params = vec![];
+        let named_params = vec![
+            ("method".to_string(), Arg::String("histogram".to_string())),
+            ("action".to_string(), Arg::String("remove".to_string())),
+        ];
+
+        let result = AnomalyDetector::new(Some(params), named_params);
+        assert!(result.is_err());
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid action 'remove' for method 'histogram'"));
+    }
+
+    #[test]
+    fn test_action_invalid_for_zscore() {
+        let params = vec![];
+        let named_params = vec![
+            ("method".to_string(), Arg::String("zscore".to_string())),
+            ("action".to_string(), Arg::String("transform".to_string())),
+        ];
+
+        let result = AnomalyDetector::new(Some(params), named_params);
+        assert!(result.is_err());
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid action 'transform' for method 'zscore'"));
+    }
+
+    #[test]
+    fn test_action_invalid_for_iqr() {
+        let params = vec![];
+        let named_params = vec![
+            ("method".to_string(), Arg::String("iqr".to_string())),
+            ("action".to_string(), Arg::String("annotate".to_string())),
+        ];
+
+        let result = AnomalyDetector::new(Some(params), named_params);
+        assert!(result.is_err());
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid action 'annotate' for method 'iqr'"));
+    }
+
+    #[test]
+    fn test_pthresh_invalid_for_iqr() {
+        // pthresh should return an error when used with IQR method
+        let params = vec![];
+        let named_params = vec![
+            ("method".to_string(), Arg::String("iqr".to_string())),
+            ("pthresh".to_string(), Arg::Float(0.05)),
+        ];
+
+        let result = AnomalyDetector::new(Some(params), named_params);
+        assert!(result.is_err());
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("pthresh"));
+        assert!(err_msg.contains("iqr"));
+    }
+
+    #[test]
+    fn test_action_abbreviation_rm() {
+        // Test that "rm" is accepted as abbreviation for "remove"
+        let params = vec![];
+        let named_params = vec![
+            ("method".to_string(), Arg::String("iqr".to_string())),
+            ("action".to_string(), Arg::String("rm".to_string())),
+        ];
+
+        let result = AnomalyDetector::new(Some(params), named_params);
+        assert!(result.is_ok());
+
+        let detector = result.unwrap();
+        assert_eq!(detector.action, "rm");
+    }
+
+    #[test]
+    fn test_action_abbreviation_tf() {
+        // Test that "tf" is accepted as abbreviation for "transform"
+        let params = vec![];
+        let named_params = vec![
+            ("method".to_string(), Arg::String("iqr".to_string())),
+            ("action".to_string(), Arg::String("tf".to_string())),
+        ];
+
+        let result = AnomalyDetector::new(Some(params), named_params);
+        assert!(result.is_ok());
+
+        let detector = result.unwrap();
+        assert_eq!(detector.action, "tf");
+    }
+
+    #[test]
+    fn test_action_summary_output() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("status", DataType::Utf8, false),
+            Field::new("code", DataType::Int64, false),
+        ]));
+
+        let status_col = Arc::new(StringArray::from(
+            std::iter::repeat("success")
+                .take(100)
+                .chain(std::iter::repeat("error").take(3))
+                .chain(std::iter::once("unknown"))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let code_col = Arc::new(Int64Array::from(
+            std::iter::repeat(200i64)
+                .take(100)
+                .chain(std::iter::repeat(500i64).take(3))
+                .chain(std::iter::once(999i64))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+
+        let input_batch = RecordBatch::try_new(schema, vec![status_col, code_col])
+            .expect("Failed to create record batch");
+
+        let params = vec![];
+        let named_params = vec![("action".to_string(), Arg::String("summary".to_string()))];
+        let mut detector = AnomalyDetector::new(Some(params), named_params)
+            .expect("Failed to create AnomalyDetector");
+
+        let output = detector.process(input_batch).expect("Processing failed");
+
+        assert!(output.is_some());
+        let output_batch = output.unwrap();
+
+        // Summary should have exactly 1 row
+        assert_eq!(output_batch.num_rows(), 1);
+
+        // Summary should have 6 summary fields + original fields
+        assert!(output_batch.num_columns() >= 6);
+
+        // First column should be num_anomalies
+        let num_anomalies_col = output_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert!(num_anomalies_col.value(0) > 0);
+    }
+
+    #[test]
+    fn test_action_annotate_output() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("status", DataType::Utf8, false),
+            Field::new("code", DataType::Int64, false),
+        ]));
+
+        let status_col = Arc::new(StringArray::from(
+            std::iter::repeat("success")
+                .take(100)
+                .chain(std::iter::repeat("error").take(3))
+                .chain(std::iter::once("unknown"))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let code_col = Arc::new(Int64Array::from(
+            std::iter::repeat(200i64)
+                .take(100)
+                .chain(std::iter::repeat(500i64).take(3))
+                .chain(std::iter::once(999i64))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+
+        let input_batch = RecordBatch::try_new(schema, vec![status_col, code_col])
+            .expect("Failed to create record batch");
+
+        let params = vec![];
+        let named_params = vec![("action".to_string(), Arg::String("annotate".to_string()))];
+        let mut detector = AnomalyDetector::new(Some(params), named_params)
+            .expect("Failed to create AnomalyDetector");
+
+        let output = detector.process(input_batch).expect("Processing failed");
+
+        assert!(output.is_some());
+        let output_batch = output.unwrap();
+
+        // Annotate should return all rows (104)
+        assert_eq!(output_batch.num_rows(), 104);
+
+        // Annotate should have 2 original + 5 annotation fields = 7 columns
+        assert_eq!(output_batch.num_columns(), 7);
+
+        // Third column should be is_anomaly (boolean)
+        let is_anomaly_col = output_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+        let anomaly_count = (0..104).filter(|i| is_anomaly_col.value(*i)).count();
+        assert!(anomaly_count > 0);
+    }
+
+    #[test]
+    fn test_default_action_is_filter() {
+        // Default method is histogram, so default action should be filter
+        let params = vec![];
+        let named_params = vec![];
+
+        let detector = AnomalyDetector::new(Some(params), named_params)
+            .expect("Failed to create AnomalyDetector");
+
+        // histogram/zscore default action is filter
+        assert_eq!(detector.method, "histogram");
+        assert_eq!(detector.action, "filter");
+    }
+
+    #[test]
+    fn test_iqr_default_action_is_transform() {
+        // IQR method should have default action = transform
+        let params = vec![];
+        let named_params = vec![("method".to_string(), Arg::String("iqr".to_string()))];
+
+        let detector = AnomalyDetector::new(Some(params), named_params)
+            .expect("Failed to create AnomalyDetector");
+
+        assert_eq!(detector.method, "iqr");
+        assert_eq!(detector.action, "transform");
+    }
+
+    #[test]
+    fn test_action_rm_processing() {
+        // Test that "rm" (abbreviation for "remove") actually removes anomalies
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("status", DataType::Utf8, false),
+            Field::new("code", DataType::Int64, false),
+        ]));
+
+        let status_col = Arc::new(StringArray::from(
+            std::iter::repeat("success")
+                .take(100)
+                .chain(std::iter::repeat("error").take(3))
+                .chain(std::iter::once("unknown"))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let code_col = Arc::new(Int64Array::from(
+            std::iter::repeat(200i64)
+                .take(100)
+                .chain(std::iter::repeat(500i64).take(3))
+                .chain(std::iter::once(999i64))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+
+        let input_batch = RecordBatch::try_new(schema, vec![status_col, code_col])
+            .expect("Failed to create record batch");
+
+        let params = vec![];
+        let named_params = vec![
+            ("method".to_string(), Arg::String("iqr".to_string())),
+            ("action".to_string(), Arg::String("rm".to_string())),
+        ];
+        let mut detector = AnomalyDetector::new(Some(params), named_params)
+            .expect("Failed to create AnomalyDetector");
+
+        let output = detector.process(input_batch).expect("Processing failed");
+
+        assert!(output.is_some());
+        let output_batch = output.unwrap();
+
+        // rm (remove) should return fewer rows than input (anomalies removed)
+        // Input has 104 rows, anomalies should be removed
+        assert!(output_batch.num_rows() < 104);
+        assert!(output_batch.num_rows() > 0);
+    }
+
+    #[test]
+    fn test_action_tf_processing() {
+        // Test that "tf" (abbreviation for "transform") actually transforms values
+        // Create data with obvious outliers: normal values around 100, outliers at 1000
+        let value_col = Arc::new(Float64Array::from(
+            std::iter::repeat(100.0)
+                .take(50)
+                .chain(std::iter::repeat(1000.0).take(5))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+
+        let input_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Float64,
+                false,
+            )])),
+            vec![value_col],
+        )
+        .expect("Failed to create record batch");
+
+        let params = vec![];
+        let named_params = vec![
+            ("method".to_string(), Arg::String("iqr".to_string())),
+            ("action".to_string(), Arg::String("tf".to_string())),
+        ];
+        let mut detector = AnomalyDetector::new(Some(params), named_params)
+            .expect("Failed to create AnomalyDetector");
+
+        let output = detector.process(input_batch).expect("Processing failed");
+
+        assert!(output.is_some());
+        let output_batch = output.unwrap();
+
+        // tf (transform) should return same number of rows
+        assert_eq!(output_batch.num_rows(), 55);
+
+        // The transformed values should be truncated to the upper bound
+        let value_col_result = output_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        // All values should be <= the original max (100) since outliers are truncated
+        for i in 0..value_col_result.len() {
+            if !value_col_result.is_null(i) {
+                let value = value_col_result.value(i);
+                // Values should be <= 100 (or close to it after truncation)
+                assert!(
+                    value <= 150.0,
+                    "Transformed value {} should be truncated",
+                    value
+                );
+            }
+        }
     }
 }

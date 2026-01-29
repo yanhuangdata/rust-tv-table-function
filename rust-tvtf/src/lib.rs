@@ -119,10 +119,14 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
             .signature(
                 Signature::builder()
                     .parameter((Some("method"), ArgType::String, Some("histogram")))
+                    .parameter((Some("action"), ArgType::String, Some("filter")))
                     .parameter((Some("bins"), ArgType::Int, Some(10)))
                     .parameter((Some("cutoff"), ArgType::Bool, Some(true)))
                     .parameter((Some("pthresh"), ArgType::Float, Some(0.01)))
                     .parameter((Some("sensitivity"), ArgType::String, Some("default")))
+                    .parameter((Some("param"), ArgType::Float, Some(1.5)))
+                    .parameter((Some("uselower"), ArgType::Bool, Some(false)))
+                    .parameter((Some("mark"), ArgType::Bool, Some(false)))
                     .build()
                     .context("Failed to build signature parameters")?,
             )
