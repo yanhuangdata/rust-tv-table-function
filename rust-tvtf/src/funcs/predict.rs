@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use arrow::array::{Array, ArrayRef, AsArray, Float64Array};
-use arrow::compute::{cast, concat};
+use arrow::compute::{cast, concat, sort_to_indices, take, SortOptions};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
@@ -954,7 +954,59 @@ impl TableFunction for Predict {
         let first_batch = &self.data_buffer[0];
         let schema = first_batch.schema();
 
-        // Detect time span information
+        // First, concatenate all batches into a single batch
+        let mut concatenated_columns: Vec<ArrayRef> = Vec::new();
+        for col_idx in 0..schema.fields().len() {
+            let mut arrays_to_concat = Vec::new();
+            for batch in &self.data_buffer {
+                arrays_to_concat.push(batch.column(col_idx).clone());
+            }
+            let concatenated = if arrays_to_concat.is_empty() {
+                self.data_buffer[0].column(col_idx).clone()
+            } else {
+                let refs: Vec<&dyn Array> = arrays_to_concat.iter().map(|a| a.as_ref()).collect();
+                concat(&refs).context("Failed to concatenate arrays")?
+            };
+            concatenated_columns.push(concatenated);
+        }
+
+        // Create the concatenated batch
+        let mut combined_batch =
+            RecordBatch::try_new(schema.clone(), concatenated_columns.clone())
+                .context("Failed to create concatenated batch")?;
+
+        // Sort by _time column (ascending - earliest first) before prediction
+        if let Some(time_idx) = schema.fields().iter().position(|f| f.name() == "_time") {
+            let time_array = combined_batch.column(time_idx);
+
+            // Sort in ascending order (earliest time first)
+            let sort_options = SortOptions {
+                descending: false,
+                nulls_first: true,
+            };
+
+            let indices = sort_to_indices(time_array.as_ref(), Some(sort_options), None)
+                .context("Failed to sort by _time")?;
+
+            // Reorder all columns based on sorted indices
+            let mut sorted_columns: Vec<ArrayRef> = Vec::new();
+            for col in combined_batch.columns() {
+                let sorted_col =
+                    take(col.as_ref(), &indices, None).context("Failed to reorder column")?;
+                sorted_columns.push(sorted_col);
+            }
+
+            combined_batch = RecordBatch::try_new(schema.clone(), sorted_columns)
+                .context("Failed to create sorted batch")?;
+
+            // Update concatenated_columns with sorted data
+            concatenated_columns = combined_batch.columns().to_vec();
+        }
+
+        // Update data_buffer with the sorted combined batch for time span detection
+        self.data_buffer = vec![combined_batch.clone()];
+
+        // Detect time span information (now from sorted data)
         let time_span_info = self.detect_time_span(&schema, &self.data_buffer)?;
 
         // Extract time series data for each field and calculate beginning/missing_valued
@@ -965,12 +1017,9 @@ impl TableFunction for Predict {
                 .position(|f| f.name().as_str() == config.field_name.as_str())
                 .ok_or_else(|| anyhow!("Field not found: {}", config.field_name))?;
 
-            let mut values = Vec::new();
-            for batch in &self.data_buffer {
-                let array = batch.column(field_idx);
-                let batch_values = self.extract_numeric_values(array, batch.num_rows());
-                values.extend(batch_values);
-            }
+            // Extract values from the sorted combined batch
+            let array = combined_batch.column(field_idx);
+            let values = self.extract_numeric_values(array, combined_batch.num_rows());
 
             // Calculate beginning (leading nulls) for this field
             let beginning = self.calculate_beginning(&values);
@@ -994,19 +1043,9 @@ impl TableFunction for Predict {
         let mut output_columns: Vec<ArrayRef> = Vec::new();
         let mut output_fields: Vec<Field> = Vec::new();
 
-        // First, concatenate all original columns from all batches
+        // Use the already sorted and concatenated columns
         for (col_idx, field) in schema.fields().iter().enumerate() {
-            let mut arrays_to_concat = Vec::new();
-            for batch in &self.data_buffer {
-                arrays_to_concat.push(batch.column(col_idx).clone());
-            }
-
-            let mut concatenated = if arrays_to_concat.is_empty() {
-                self.data_buffer[0].column(col_idx).clone()
-            } else {
-                let refs: Vec<&dyn Array> = arrays_to_concat.iter().map(|a| a.as_ref()).collect();
-                concat(&refs).context("Failed to concatenate arrays")?
-            };
+            let mut concatenated = concatenated_columns[col_idx].clone();
 
             // Extend original columns with values for future_timespan rows
             if self.future_timespan > 0 {
