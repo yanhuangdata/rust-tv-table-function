@@ -120,7 +120,7 @@ impl Predict {
                 }
                 "future_timespan" => {
                     future_timespan = match arg {
-                        Arg::Int(i) if i > 0 => i as usize,
+                        Arg::Int(i) if i >= 0 => i as usize,
                         Arg::String(s) => s.parse().context("future_timespan must be a number")?,
                         _ => return Err(anyhow!("future_timespan must be a positive integer")),
                     };
