@@ -1388,8 +1388,8 @@ impl TableFunction for Predict {
 
             // Determine the output column names (using underscores instead of parentheses)
             let predicted_col_name = format!("prediction_{}", config.field_name);
-            let lower_col_name = format!("lower95_{}", predicted_col_name);
-            let upper_col_name = format!("upper95_{}", predicted_col_name);
+            let lower_col_name = format!("lower_{}", predicted_col_name);
+            let upper_col_name = format!("upper_{}", predicted_col_name);
 
             let predicted_array = Arc::new(Float64Array::from(predicted_values)) as ArrayRef;
             let lower_array = Arc::new(Float64Array::from(lower_bounds)) as ArrayRef;
@@ -1480,8 +1480,8 @@ mod tests {
         // Check prediction columns exist
         let schema = output.schema();
         assert!(schema.field_with_name("prediction_value").is_ok());
-        assert!(schema.field_with_name("lower95_prediction_value").is_ok());
-        assert!(schema.field_with_name("upper95_prediction_value").is_ok());
+        assert!(schema.field_with_name("lower_prediction_value").is_ok());
+        assert!(schema.field_with_name("upper_prediction_value").is_ok());
     }
 
     #[test]
@@ -1869,8 +1869,8 @@ mod tests {
         // Check that prediction columns exist (matching Python output format)
         let schema = output.schema();
         assert!(schema.field_with_name("prediction_count").is_ok());
-        assert!(schema.field_with_name("lower95_prediction_count").is_ok());
-        assert!(schema.field_with_name("upper95_prediction_count").is_ok());
+        assert!(schema.field_with_name("lower_prediction_count").is_ok());
+        assert!(schema.field_with_name("upper_prediction_count").is_ok());
 
         // Extract prediction values
         let predicted_idx = schema
@@ -1881,12 +1881,12 @@ mod tests {
         let lower_idx = schema
             .fields()
             .iter()
-            .position(|f| f.name() == "lower95_prediction_count")
+            .position(|f| f.name() == "lower_prediction_count")
             .unwrap();
         let upper_idx = schema
             .fields()
             .iter()
-            .position(|f| f.name() == "upper95_prediction_count")
+            .position(|f| f.name() == "upper_prediction_count")
             .unwrap();
 
         let predicted_array = output
@@ -2043,8 +2043,8 @@ mod tests {
         // Check prediction columns exist
         let schema = output.schema();
         assert!(schema.field_with_name("prediction_value").is_ok());
-        assert!(schema.field_with_name("lower95_prediction_value").is_ok());
-        assert!(schema.field_with_name("upper95_prediction_value").is_ok());
+        assert!(schema.field_with_name("lower_prediction_value").is_ok());
+        assert!(schema.field_with_name("upper_prediction_value").is_ok());
     }
 
     #[test]
