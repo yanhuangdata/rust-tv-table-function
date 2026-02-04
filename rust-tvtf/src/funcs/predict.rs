@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use arrow::array::{Array, ArrayRef, AsArray, Float64Array};
-use arrow::compute::{cast, concat, sort_to_indices, take, SortOptions};
+use arrow::compute::{SortOptions, cast, concat, sort_to_indices, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
@@ -971,9 +971,8 @@ impl TableFunction for Predict {
         }
 
         // Create the concatenated batch
-        let mut combined_batch =
-            RecordBatch::try_new(schema.clone(), concatenated_columns.clone())
-                .context("Failed to create concatenated batch")?;
+        let mut combined_batch = RecordBatch::try_new(schema.clone(), concatenated_columns.clone())
+            .context("Failed to create concatenated batch")?;
 
         // Sort by _time column (ascending - earliest first) before prediction
         if let Some(time_idx) = schema.fields().iter().position(|f| f.name() == "_time") {
