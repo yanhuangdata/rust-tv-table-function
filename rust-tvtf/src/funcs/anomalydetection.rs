@@ -1301,7 +1301,7 @@ impl TableFunction for AnomalyDetector {
                 // probable_cause_freq, max_freq. The is_anomaly field is a custom addition
                 // for convenience.
                 let mut output_fields = schema.fields().to_vec();
-                output_fields.push(Arc::new(Field::new("is_anomaly", DataType::Boolean, false)));
+                output_fields.push(Arc::new(Field::new("is_anomaly", DataType::Boolean, true)));
                 output_fields.push(Arc::new(Field::new(
                     "log_event_prob",
                     DataType::Float64,
