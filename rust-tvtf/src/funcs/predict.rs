@@ -685,9 +685,18 @@ impl Predict {
 
             if let (Some(t1), Some(t2)) = (first_time, second_time) {
                 let span = (t2 - t1).abs();
+
+                // Normalize span to seconds if timestamps are in microseconds
+                // Timestamps > 32503680000 are likely in microseconds (year 3000+ in seconds)
+                let span_in_seconds = if t1.abs() > 32503680000 {
+                    span / 1_000_000 // Convert from microseconds to seconds
+                } else {
+                    span
+                };
+
                 return Ok(Some((
                     TimeSpan {
-                        span_seconds: span,
+                        span_seconds: span_in_seconds,
                         spandays: None,
                         spanmonths: None,
                     },
@@ -818,7 +827,7 @@ impl Predict {
         time_span: &TimeSpan,
         _time_idx: usize,
         future_timespan: usize,
-        last_valid_idx: usize,
+        _last_valid_idx: usize,
     ) -> Result<ArrayRef> {
         if future_timespan == 0 {
             return Ok(arrow::array::new_null_array(time_array.data_type(), 0));
@@ -832,24 +841,44 @@ impl Predict {
             ));
         }
 
-        // Get the last valid timestamp
-        let last_timestamp =
-            if let Some(ts) = Self::extract_single_i64_from_array(time_array, last_valid_idx) {
-                ts
-            } else {
+        // Find the last valid timestamp by searching backwards
+        let mut last_timestamp: Option<i64> = None;
+        for i in (0..time_array.len()).rev() {
+            if let Some(ts) = Self::extract_single_i64_from_array(time_array, i) {
+                last_timestamp = Some(ts);
+                break;
+            }
+        }
+
+        let last_timestamp = match last_timestamp {
+            Some(ts) => ts,
+            None => {
                 return Ok(arrow::array::new_null_array(
                     time_array.data_type(),
                     future_timespan,
                 ));
-            };
+            }
+        };
+
+        // Detect if timestamp is in microseconds (> year 3000 in seconds)
+        // If so, we need to convert to seconds for DateTime operations, then back to microseconds
+        let is_microseconds = last_timestamp > 32503680000;
+        let last_ts_seconds = if is_microseconds {
+            last_timestamp / 1_000_000
+        } else {
+            last_timestamp
+        };
+
+        // span_seconds is always in seconds (normalized in detect_time_span)
+        let span_seconds = time_span.span_seconds;
 
         // Get the hour from the last timestamp (for DST handling)
-        let last_datetime = DateTime::<Utc>::from_timestamp(last_timestamp, 0).unwrap_or_default();
+        let last_datetime = DateTime::<Utc>::from_timestamp(last_ts_seconds, 0).unwrap_or_default();
         let last_hour = last_datetime.hour() as i64;
 
         // Calculate the span increment and generate future timestamps
         let mut future_timestamps: Vec<i64> = Vec::with_capacity(future_timespan);
-        let mut current_ts = last_timestamp;
+        let mut current_ts = last_ts_seconds;
 
         // DST handling: if spandays is set, we need to handle DST transitions
         // The goal is to keep the same "wall clock time" (e.g., 12AM) even when DST changes
@@ -905,21 +934,33 @@ impl Predict {
                     }
                 }
             } else {
-                // Use the span from _span field (already in seconds)
-                current_ts += time_span.span_seconds;
+                // Use the calculated span (in seconds)
+                current_ts += span_seconds;
             }
 
-            future_timestamps.push(current_ts);
+            // Convert back to microseconds if original was in microseconds
+            let ts_to_push = if is_microseconds {
+                current_ts * 1_000_000
+            } else {
+                current_ts
+            };
+            future_timestamps.push(ts_to_push);
         }
 
         // Create the output array based on the original type - ONLY future timestamps
-        Self::create_time_array_from_timestamps(time_array.data_type(), &future_timestamps)
+        Self::create_time_array_from_timestamps(
+            time_array.data_type(),
+            &future_timestamps,
+            Some(time_array),
+        )
     }
 
     /// Create time array from timestamps, matching the original data type
+    /// For string types, uses the timezone offset from the original array
     fn create_time_array_from_timestamps(
         original_type: &DataType,
         timestamps: &[i64],
+        original_array: Option<&ArrayRef>,
     ) -> Result<ArrayRef> {
         match original_type {
             DataType::Int64 => {
@@ -930,6 +971,21 @@ impl Predict {
                 Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
             }
             DataType::Utf8 | DataType::LargeUtf8 => {
+                // Try to extract timezone offset from original array
+                let tz_offset = original_array.and_then(|arr| {
+                    if matches!(arr.data_type(), DataType::Utf8) {
+                        let str_arr = arr.as_string::<i32>();
+                        // Find first valid string and extract timezone
+                        for i in 0..str_arr.len() {
+                            if str_arr.is_valid(i) {
+                                let s = str_arr.value(i);
+                                return Self::extract_timezone_offset(s);
+                            }
+                        }
+                    }
+                    None
+                });
+
                 // Convert timestamps to ISO8601 format strings with timezone
                 let string_values: Vec<String> = timestamps
                     .iter()
@@ -940,9 +996,33 @@ impl Predict {
                         } else {
                             *ts
                         };
-                        DateTime::<Utc>::from_timestamp(ts_seconds, 0)
-                            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3f+0000").to_string())
-                            .unwrap_or_else(|| ts.to_string())
+
+                        if let Some(offset_seconds) = tz_offset {
+                            // Use the original timezone offset
+                            let offset = chrono::FixedOffset::east_opt(offset_seconds)
+                                .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap());
+                            DateTime::<Utc>::from_timestamp(ts_seconds, 0)
+                                .map(|dt| {
+                                    let local_dt = dt.with_timezone(&offset);
+                                    // Format with the timezone offset
+                                    let offset_hours = offset_seconds / 3600;
+                                    let offset_mins = (offset_seconds.abs() % 3600) / 60;
+                                    let sign = if offset_seconds >= 0 { '+' } else { '-' };
+                                    format!(
+                                        "{}{}{:02}{:02}",
+                                        local_dt.format("%Y-%m-%dT%H:%M:%S%.3f"),
+                                        sign,
+                                        offset_hours.abs(),
+                                        offset_mins
+                                    )
+                                })
+                                .unwrap_or_else(|| ts.to_string())
+                        } else {
+                            // Default to UTC
+                            DateTime::<Utc>::from_timestamp(ts_seconds, 0)
+                                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3f+0000").to_string())
+                                .unwrap_or_else(|| ts.to_string())
+                        }
                     })
                     .collect();
                 Ok(Arc::new(arrow::array::StringArray::from(string_values)) as ArrayRef)
@@ -954,6 +1034,40 @@ impl Predict {
         }
     }
 
+    /// Extract timezone offset in seconds from a timestamp string
+    /// e.g., "+0800" -> 28800 seconds, "-0530" -> -19800 seconds
+    fn extract_timezone_offset(s: &str) -> Option<i32> {
+        let s = s.trim();
+        // Look for timezone pattern at the end: +HHMM, -HHMM, +HH:MM, -HH:MM, Z
+        if s.ends_with('Z') {
+            return Some(0);
+        }
+
+        // Find the last + or - that indicates timezone
+        let tz_start = s.rfind(['+', '-'])?;
+        let tz_str = &s[tz_start..];
+
+        // Parse +HHMM or +HH:MM format
+        let (sign, rest) = if let Some(stripped) = tz_str.strip_prefix('+') {
+            (1, stripped)
+        } else if let Some(stripped) = tz_str.strip_prefix('-') {
+            (-1, stripped)
+        } else {
+            return None;
+        };
+
+        // Remove colon if present
+        let rest = rest.replace(':', "");
+        if rest.len() < 4 {
+            return None;
+        }
+
+        let hours: i32 = rest[0..2].parse().ok()?;
+        let mins: i32 = rest[2..4].parse().ok()?;
+
+        Some(sign * (hours * 3600 + mins * 60))
+    }
+
     /// Automatically extend time column by computing span from the data itself
     /// This is used when _span field is not available
     /// Returns ONLY the extension array (future timestamps), not the full array
@@ -961,9 +1075,10 @@ impl Predict {
         &self,
         time_array: &ArrayRef,
         future_timespan: usize,
-        num_rows: usize,
+        _num_rows: usize,
     ) -> Result<ArrayRef> {
-        if future_timespan == 0 || num_rows == 0 {
+        let array_len = time_array.len();
+        if future_timespan == 0 || array_len == 0 {
             return Ok(arrow::array::new_null_array(time_array.data_type(), 0));
         }
 
@@ -977,7 +1092,7 @@ impl Predict {
 
         // Try to extract timestamps and compute span
         let mut timestamps: Vec<Option<i64>> = Vec::new();
-        for i in 0..num_rows {
+        for i in 0..array_len {
             timestamps.push(Self::extract_single_i64_from_array(time_array, i));
         }
 
@@ -1005,7 +1120,11 @@ impl Predict {
                 }
 
                 // Create array based on original type - ONLY the future timestamps
-                Self::create_time_array_from_timestamps(time_array.data_type(), &future_timestamps)
+                Self::create_time_array_from_timestamps(
+                    time_array.data_type(),
+                    &future_timestamps,
+                    Some(time_array),
+                )
             }
             _ => {
                 // Cannot compute span, return null array
@@ -2533,6 +2652,206 @@ mod tests {
             time_array.value(4),
             expected_time_4,
             "Row 4 should have correct future timestamp"
+        );
+    }
+
+    #[test]
+    fn test_predict_time_extension_with_microseconds_2hour_interval() {
+        // Test time extension with Int64 timestamps in microseconds format
+        // with 2-hour intervals (like the user's actual data)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_time", DataType::Int64, true),
+            Field::new("bits_transferred", DataType::Float64, true),
+        ]));
+
+        // Create test data with 2-hour intervals in microseconds
+        // 2 hours = 7200 seconds = 7200 * 1_000_000 = 7200000000 microseconds
+        let two_hours_in_micros: i64 = 7200 * 1_000_000;
+        // 2005-06-07T22:00:00+0800 in microseconds (Unix epoch)
+        let base_time: i64 = 1118156400 * 1_000_000; // seconds * 1M
+
+        let mut times: Vec<i64> = Vec::new();
+        let mut values: Vec<f64> = Vec::new();
+        for i in 0..5 {
+            times.push(base_time + i as i64 * two_hours_in_micros);
+            values.push(5548947933.0 + i as f64 * 100000000.0);
+        }
+
+        let time_array = Arc::new(arrow::array::Int64Array::from(times.clone())) as ArrayRef;
+        let value_array = Arc::new(Float64Array::from(values)) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
+            .expect("Failed to create test RecordBatch");
+
+        let named_args = vec![
+            (
+                "fields".to_string(),
+                Arg::String("bits_transferred".to_string()),
+            ),
+            ("future_timespan".to_string(), Arg::Int(3)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        // Should have 5 original rows + 3 future rows = 8 rows
+        assert_eq!(output.num_rows(), 8);
+
+        // Check that _time column has been extended
+        let time_col_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "_time")
+            .expect("_time column not found");
+
+        let time_col = output.column(time_col_idx);
+        let time_array = time_col.as_primitive::<arrow::datatypes::Int64Type>();
+
+        // All 8 rows should have valid time values
+        for i in 0..8 {
+            assert!(time_array.is_valid(i), "Row {} should have valid time", i);
+            let time_val = time_array.value(i);
+            println!("Row {}: _time = {} (microseconds)", i, time_val);
+        }
+
+        // Verify that future timestamps are correctly computed with 2-hour intervals
+        let expected_time_5 = base_time + 5 * two_hours_in_micros;
+        let expected_time_6 = base_time + 6 * two_hours_in_micros;
+        let expected_time_7 = base_time + 7 * two_hours_in_micros;
+
+        assert_eq!(
+            time_array.value(5),
+            expected_time_5,
+            "Row 5 should have correct future timestamp"
+        );
+        assert_eq!(
+            time_array.value(6),
+            expected_time_6,
+            "Row 6 should have correct future timestamp"
+        );
+        assert_eq!(
+            time_array.value(7),
+            expected_time_7,
+            "Row 7 should have correct future timestamp"
+        );
+
+        // Print human-readable times for verification
+        println!("\nHuman-readable times:");
+        for i in 0..8 {
+            let ts = time_array.value(i);
+            let ts_seconds = ts / 1_000_000;
+            if let Some(dt) = DateTime::<Utc>::from_timestamp(ts_seconds, 0) {
+                println!("Row {}: {}", i, dt.format("%Y-%m-%dT%H:%M:%S+0000"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_predict_time_extension_with_string_2hour_interval() {
+        // Test time extension with STRING timestamps in the exact format user provided
+        // with 2-hour intervals: 2005-07-27T20:00:00.000+0800
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_time", DataType::Utf8, true),
+            Field::new("bits_transferred", DataType::Float64, true),
+        ]));
+
+        // Create test data with 2-hour intervals using user's exact format
+        let times = vec![
+            "2005-06-07T22:00:00.000+0800",
+            "2005-06-08T00:00:00.000+0800",
+            "2005-06-08T02:00:00.000+0800",
+            "2005-06-08T04:00:00.000+0800",
+            "2005-06-08T06:00:00.000+0800",
+        ];
+        let values = vec![
+            5548947933.0,
+            7138793066.0,
+            7516418311.0,
+            7517711314.0,
+            6700932379.0,
+        ];
+
+        let time_array = Arc::new(arrow::array::StringArray::from(times)) as ArrayRef;
+        let value_array = Arc::new(Float64Array::from(values)) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
+            .expect("Failed to create test RecordBatch");
+
+        let named_args = vec![
+            (
+                "fields".to_string(),
+                Arg::String("bits_transferred".to_string()),
+            ),
+            ("future_timespan".to_string(), Arg::Int(3)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        // Should have 5 original rows + 3 future rows = 8 rows
+        assert_eq!(output.num_rows(), 8);
+
+        // Check that _time column has been extended
+        let time_col_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "_time")
+            .expect("_time column not found");
+
+        let time_col = output.column(time_col_idx);
+        let time_array = time_col.as_string::<i32>();
+
+        println!("String timestamp time extension test (2-hour interval):");
+        // All 8 rows should have valid time values
+        for i in 0..8 {
+            assert!(time_array.is_valid(i), "Row {} should have valid time", i);
+            let time_val = time_array.value(i);
+            println!("Row {}: _time = {}", i, time_val);
+        }
+
+        // Verify that future timestamps continue the 2-hour pattern
+        // Last original time: 2005-06-08T06:00:00.000+0800 (UTC: 2005-06-07T22:00:00)
+        // Next should be: 2005-06-08T08:00:00.000+0800 (UTC: 2005-06-08T00:00:00)
+        // But output format is +0000, so we expect UTC times
+        // Row 5 should be 2 hours after Row 4
+        // Row 4 (06:00+0800) = 22:00 UTC on June 7
+        // Row 5 should be 00:00 UTC on June 8 = 2005-06-08T00:00:00.000+0000
+        let row5_time = time_array.value(5);
+        let row6_time = time_array.value(6);
+        let row7_time = time_array.value(7);
+
+        println!("\nFuture timestamps:");
+        println!("Row 5 (should be +2h from Row 4): {}", row5_time);
+        println!("Row 6 (should be +4h from Row 4): {}", row6_time);
+        println!("Row 7 (should be +6h from Row 4): {}", row7_time);
+
+        // Verify the timestamps contain expected date patterns
+        assert!(
+            row5_time.contains("2005-06-08"),
+            "Row 5 should be on June 8: {}",
+            row5_time
+        );
+        assert!(
+            row6_time.contains("2005-06-08"),
+            "Row 6 should be on June 8: {}",
+            row6_time
+        );
+        assert!(
+            row7_time.contains("2005-06-08"),
+            "Row 7 should be on June 8: {}",
+            row7_time
         );
     }
 
