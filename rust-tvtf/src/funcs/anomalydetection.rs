@@ -6,6 +6,7 @@ use anyhow::Context;
 use arrow::{
     array::{Array, ArrayRef, AsArray, Float64Array, StringArray},
     compute,
+    datatypes::{Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type},
     record_batch::RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
@@ -1260,21 +1261,37 @@ impl TableFunction for AnomalyDetector {
                     } else {
                         match col.data_type() {
                             DataType::Utf8 => col.as_string::<i32>().value(row_idx).to_string(),
-                            DataType::Int8
-                            | DataType::Int16
-                            | DataType::Int32
-                            | DataType::Int64 => {
-                                let arr = col
-                                    .as_any()
-                                    .downcast_ref::<arrow::array::Int64Array>()
-                                    .unwrap();
-                                arr.value(row_idx).to_string()
+                            DataType::LargeUtf8 => {
+                                col.as_string::<i64>().value(row_idx).to_string()
                             }
-                            DataType::Float32 | DataType::Float64 => {
-                                let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-                                arr.value(row_idx).to_string()
+                            DataType::Int8 => {
+                                col.as_primitive::<Int8Type>().value(row_idx).to_string()
                             }
-                            _ => col.as_string::<i32>().value(row_idx).to_string(),
+                            DataType::Int16 => {
+                                col.as_primitive::<Int16Type>().value(row_idx).to_string()
+                            }
+                            DataType::Int32 => {
+                                col.as_primitive::<Int32Type>().value(row_idx).to_string()
+                            }
+                            DataType::Int64 => {
+                                col.as_primitive::<Int64Type>().value(row_idx).to_string()
+                            }
+                            DataType::Float32 => {
+                                col.as_primitive::<Float32Type>().value(row_idx).to_string()
+                            }
+                            DataType::Float64 => {
+                                col.as_primitive::<Float64Type>().value(row_idx).to_string()
+                            }
+                            DataType::Boolean => col.as_boolean().value(row_idx).to_string(),
+                            _ => {
+                                // For unsupported types, use arrow's cast to Utf8
+                                match compute::cast(col, &DataType::Utf8) {
+                                    Ok(casted) => {
+                                        casted.as_string::<i32>().value(row_idx).to_string()
+                                    }
+                                    Err(_) => "".to_string(),
+                                }
+                            }
                         }
                     };
 
