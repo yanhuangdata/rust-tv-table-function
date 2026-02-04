@@ -264,15 +264,15 @@ impl Predict {
 
         for config in field_configs {
             let field_name = &config.field_name;
-            let predicted_name = format!("prediction({})", field_name);
+            let predicted_name = format!("prediction_{}", field_name);
 
             upper_names.insert(
                 field_name.clone(),
-                format!("upper{}({})", ci, predicted_name),
+                format!("upper{}_{}", ci, predicted_name),
             );
             lower_names.insert(
                 field_name.clone(),
-                format!("lower{}({})", ci, predicted_name),
+                format!("lower{}_{}", ci, predicted_name),
             );
             ui_upper_names.insert(field_name.clone(), format!("_upper{}", field_name));
             ui_lower_names.insert(field_name.clone(), format!("_lower{}", field_name));
@@ -750,19 +750,36 @@ impl Predict {
     /// Supports formats like:
     /// - 2024-01-15T10:30:00Z
     /// - 2024-01-15T10:30:00+08:00
+    /// - 2024-01-15T10:30:00.000+0800 (common format without colon in timezone)
     /// - 2024-01-15 10:30:00
     /// - 20240115T103000Z
     fn parse_iso8601_timestamp(s: &str) -> Option<i64> {
         let s = s.trim();
 
         // Try various formats
-        // Format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+HH:MM
+        // Format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+HH:MM (RFC 3339)
         if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+            return Some(dt.timestamp());
+        }
+
+        // Format: YYYY-MM-DDTHH:MM:SS.fff+HHMM (without colon in timezone)
+        // This is a common format used by many systems
+        if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.3f%z") {
+            return Some(dt.timestamp());
+        }
+
+        // Format: YYYY-MM-DDTHH:MM:SS+HHMM (without milliseconds, without colon in timezone)
+        if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%z") {
             return Some(dt.timestamp());
         }
 
         // Format: YYYY-MM-DD HH:MM:SS
         if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+            return Some(naive.and_utc().timestamp());
+        }
+
+        // Format: YYYY-MM-DDTHH:MM:SS.fff (with milliseconds, no timezone)
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.3f") {
             return Some(naive.and_utc().timestamp());
         }
 
@@ -784,13 +801,16 @@ impl Predict {
         None
     }
 
-    /// Check if an array contains numeric timestamps (Int64 or Float64)
-    fn is_numeric_timestamp(array: &ArrayRef) -> bool {
-        matches!(array.data_type(), DataType::Int64 | DataType::Float64)
+    /// Check if an array contains timestamps (Int64, Float64, or Utf8 string format)
+    fn is_timestamp_type(array: &ArrayRef) -> bool {
+        matches!(
+            array.data_type(),
+            DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::LargeUtf8
+        )
     }
 
     /// Extend time column with computed future timestamps
-    /// Returns the extended time array
+    /// Returns ONLY the extension array (future timestamps), not the full array
     /// Handles DST (Daylight Saving Time) transitions for daily spans
     fn extend_time_column(
         &self,
@@ -801,12 +821,15 @@ impl Predict {
         last_valid_idx: usize,
     ) -> Result<ArrayRef> {
         if future_timespan == 0 {
-            return Ok(time_array.clone());
+            return Ok(arrow::array::new_null_array(time_array.data_type(), 0));
         }
 
-        // Only extend numeric timestamps
-        if !Self::is_numeric_timestamp(time_array) {
-            return Ok(time_array.clone());
+        // Check if this is a supported timestamp type
+        if !Self::is_timestamp_type(time_array) {
+            return Ok(arrow::array::new_null_array(
+                time_array.data_type(),
+                future_timespan,
+            ));
         }
 
         // Get the last valid timestamp
@@ -814,7 +837,10 @@ impl Predict {
             if let Some(ts) = Self::extract_single_i64_from_array(time_array, last_valid_idx) {
                 ts
             } else {
-                return Ok(time_array.clone());
+                return Ok(arrow::array::new_null_array(
+                    time_array.data_type(),
+                    future_timespan,
+                ));
             };
 
         // Get the hour from the last timestamp (for DST handling)
@@ -886,42 +912,140 @@ impl Predict {
             future_timestamps.push(current_ts);
         }
 
-        // Combine original with future timestamps
-        let original_len = time_array.len();
-        let total_len = original_len + future_timespan;
+        // Create the output array based on the original type - ONLY future timestamps
+        Self::create_time_array_from_timestamps(time_array.data_type(), &future_timestamps)
+    }
 
-        // Create new array with original + future values
-        let mut all_timestamps: Vec<Option<i64>> = Vec::with_capacity(total_len);
+    /// Create time array from timestamps, matching the original data type
+    fn create_time_array_from_timestamps(
+        original_type: &DataType,
+        timestamps: &[i64],
+    ) -> Result<ArrayRef> {
+        match original_type {
+            DataType::Int64 => {
+                Ok(Arc::new(arrow::array::Int64Array::from(timestamps.to_vec())) as ArrayRef)
+            }
+            DataType::Float64 => {
+                let values: Vec<f64> = timestamps.iter().map(|v| *v as f64).collect();
+                Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+            }
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                // Convert timestamps to ISO8601 format strings with timezone
+                let string_values: Vec<String> = timestamps
+                    .iter()
+                    .map(|ts| {
+                        // Check if timestamp is in microseconds (> year 3000 in seconds)
+                        let ts_seconds = if *ts > 32503680000 {
+                            *ts / 1_000_000 // Convert microseconds to seconds
+                        } else {
+                            *ts
+                        };
+                        DateTime::<Utc>::from_timestamp(ts_seconds, 0)
+                            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3f+0000").to_string())
+                            .unwrap_or_else(|| ts.to_string())
+                    })
+                    .collect();
+                Ok(Arc::new(arrow::array::StringArray::from(string_values)) as ArrayRef)
+            }
+            _ => {
+                // Default to Int64
+                Ok(Arc::new(arrow::array::Int64Array::from(timestamps.to_vec())) as ArrayRef)
+            }
+        }
+    }
 
-        // Copy original values
-        for i in 0..original_len {
-            if let Some(ts) = Self::extract_single_i64_from_array(time_array, i) {
-                all_timestamps.push(Some(ts));
-            } else {
-                all_timestamps.push(None);
+    /// Automatically extend time column by computing span from the data itself
+    /// This is used when _span field is not available
+    /// Returns ONLY the extension array (future timestamps), not the full array
+    fn extend_time_column_auto(
+        &self,
+        time_array: &ArrayRef,
+        future_timespan: usize,
+        num_rows: usize,
+    ) -> Result<ArrayRef> {
+        if future_timespan == 0 || num_rows == 0 {
+            return Ok(arrow::array::new_null_array(time_array.data_type(), 0));
+        }
+
+        // Check if this is a supported timestamp type
+        if !Self::is_timestamp_type(time_array) {
+            return Ok(arrow::array::new_null_array(
+                time_array.data_type(),
+                future_timespan,
+            ));
+        }
+
+        // Try to extract timestamps and compute span
+        let mut timestamps: Vec<Option<i64>> = Vec::new();
+        for i in 0..num_rows {
+            timestamps.push(Self::extract_single_i64_from_array(time_array, i));
+        }
+
+        // Find two consecutive valid timestamps to compute span
+        let mut span: Option<i64> = None;
+        for i in 0..timestamps.len().saturating_sub(1) {
+            if let (Some(t1), Some(t2)) = (timestamps[i], timestamps[i + 1]) {
+                span = Some((t2 - t1).abs());
+                break;
             }
         }
 
-        // Add future timestamps
-        for ts in future_timestamps {
-            all_timestamps.push(Some(ts));
+        // Get the last valid timestamp
+        let last_timestamp = timestamps.iter().rev().find_map(|t| *t);
+
+        match (span, last_timestamp) {
+            (Some(time_span), Some(last_ts)) => {
+                // Generate future timestamps only
+                let mut future_timestamps: Vec<i64> = Vec::with_capacity(future_timespan);
+                let mut current_ts = last_ts;
+
+                for _ in 0..future_timespan {
+                    current_ts += time_span;
+                    future_timestamps.push(current_ts);
+                }
+
+                // Create array based on original type - ONLY the future timestamps
+                Self::create_time_array_from_timestamps(time_array.data_type(), &future_timestamps)
+            }
+            _ => {
+                // Cannot compute span, return null array
+                Ok(arrow::array::new_null_array(
+                    time_array.data_type(),
+                    future_timespan,
+                ))
+            }
+        }
+    }
+
+    /// Extend an array by repeating the last value
+    fn extend_with_last_value(
+        &self,
+        array: &ArrayRef,
+        last_idx: usize,
+        count: usize,
+    ) -> Result<ArrayRef> {
+        if count == 0 {
+            return Ok(arrow::array::new_null_array(array.data_type(), 0));
         }
 
-        // Create the output array based on the original type
-        // Try to match the original array type
-        if matches!(time_array.data_type(), DataType::Int64) {
-            let values: Vec<i64> = all_timestamps.iter().map(|v| v.unwrap_or(0)).collect();
-            Ok(Arc::new(arrow::array::Int64Array::from(values)) as ArrayRef)
-        } else if matches!(time_array.data_type(), DataType::Float64) {
-            let values: Vec<f64> = all_timestamps
-                .iter()
-                .map(|v| v.unwrap_or(0) as f64)
-                .collect();
-            Ok(Arc::new(arrow::array::Float64Array::from(values)) as ArrayRef)
-        } else {
-            // For other types, use Int64 and let downstream handle it
-            let values: Vec<i64> = all_timestamps.iter().map(|v| v.unwrap_or(0)).collect();
-            Ok(Arc::new(arrow::array::Int64Array::from(values)) as ArrayRef)
+        match array.data_type() {
+            DataType::Int64 => {
+                if let Some(val) = Self::extract_single_i64_from_array(array, last_idx) {
+                    Ok(Arc::new(arrow::array::Int64Array::from(vec![val; count])) as ArrayRef)
+                } else {
+                    Ok(arrow::array::new_null_array(array.data_type(), count))
+                }
+            }
+            DataType::Float64 => {
+                let arr = array.as_primitive::<arrow::datatypes::Float64Type>();
+                if arr.is_valid(last_idx) {
+                    let val = arr.value(last_idx);
+                    Ok(Arc::new(Float64Array::from(vec![val; count])) as ArrayRef)
+                } else {
+                    Ok(arrow::array::new_null_array(array.data_type(), count))
+                }
+            }
+            _ => Ok(arrow::array::new_null_array(array.data_type(), count)),
         }
     }
 }
@@ -1049,22 +1173,33 @@ impl TableFunction for Predict {
             // Extend original columns with values for future_timespan rows
             if self.future_timespan > 0 {
                 // Check if this is a time column that should be extended with computed timestamps
-                let is_time_column = field.name() == "_time"
-                    || field.name() == "_span"
-                    || field.name() == "_spandays";
+                let is_time_column = field.name() == "_time";
 
-                let extension_array = if is_time_column
-                    && let Some((time_span, time_idx)) = time_span_info.as_ref()
-                {
-                    // Extend time column with computed future timestamps
-                    let last_valid_idx = all_rows.saturating_sub(1);
-                    self.extend_time_column(
-                        &concatenated,
-                        time_span,
-                        *time_idx,
-                        self.future_timespan,
-                        last_valid_idx,
-                    )?
+                let extension_array = if is_time_column {
+                    // Try to extend _time column with computed future timestamps
+                    if let Some((time_span, time_idx)) = time_span_info.as_ref() {
+                        // Use detected time span info
+                        let last_valid_idx = all_rows.saturating_sub(1);
+                        self.extend_time_column(
+                            &concatenated,
+                            time_span,
+                            *time_idx,
+                            self.future_timespan,
+                            last_valid_idx,
+                        )?
+                    } else {
+                        // Try to compute time span directly from _time column
+                        self.extend_time_column_auto(&concatenated, self.future_timespan, all_rows)?
+                    }
+                } else if field.name() == "_span" || field.name() == "_spandays" {
+                    // Keep _span and _spandays constant for future rows
+                    if all_rows > 0 {
+                        // Get the last value and repeat it
+                        let last_idx = all_rows - 1;
+                        self.extend_with_last_value(&concatenated, last_idx, self.future_timespan)?
+                    } else {
+                        arrow::array::new_null_array(field.data_type(), self.future_timespan)
+                    }
                 } else if field.is_nullable() {
                     // For nullable fields, use null array
                     arrow::array::new_null_array(field.data_type(), self.future_timespan)
@@ -1132,10 +1267,10 @@ impl TableFunction for Predict {
                 upper_bounds.truncate(total_rows);
             }
 
-            // Determine the output column names (matching Python output)
-            let predicted_col_name = format!("prediction({})", config.field_name);
-            let lower_col_name = format!("lower95({})", predicted_col_name);
-            let upper_col_name = format!("upper95({})", predicted_col_name);
+            // Determine the output column names (using underscores instead of parentheses)
+            let predicted_col_name = format!("prediction_{}", config.field_name);
+            let lower_col_name = format!("lower95_{}", predicted_col_name);
+            let upper_col_name = format!("upper95_{}", predicted_col_name);
 
             let predicted_array = Arc::new(Float64Array::from(predicted_values)) as ArrayRef;
             let lower_array = Arc::new(Float64Array::from(lower_bounds)) as ArrayRef;
@@ -1225,9 +1360,9 @@ mod tests {
 
         // Check prediction columns exist
         let schema = output.schema();
-        assert!(schema.field_with_name("prediction(value)").is_ok());
-        assert!(schema.field_with_name("lower95(prediction(value))").is_ok());
-        assert!(schema.field_with_name("upper95(prediction(value))").is_ok());
+        assert!(schema.field_with_name("prediction_value").is_ok());
+        assert!(schema.field_with_name("lower95_prediction_value").is_ok());
+        assert!(schema.field_with_name("upper95_prediction_value").is_ok());
     }
 
     #[test]
@@ -1356,8 +1491,8 @@ mod tests {
 
         // Check both fields have prediction columns (matching Python output format)
         let schema = output.schema();
-        assert!(schema.field_with_name("prediction(value1)").is_ok());
-        assert!(schema.field_with_name("prediction(value2)").is_ok());
+        assert!(schema.field_with_name("prediction_value1").is_ok());
+        assert!(schema.field_with_name("prediction_value2").is_ok());
     }
 
     #[test]
@@ -1614,25 +1749,25 @@ mod tests {
 
         // Check that prediction columns exist (matching Python output format)
         let schema = output.schema();
-        assert!(schema.field_with_name("prediction(count)").is_ok());
-        assert!(schema.field_with_name("lower95(prediction(count))").is_ok());
-        assert!(schema.field_with_name("upper95(prediction(count))").is_ok());
+        assert!(schema.field_with_name("prediction_count").is_ok());
+        assert!(schema.field_with_name("lower95_prediction_count").is_ok());
+        assert!(schema.field_with_name("upper95_prediction_count").is_ok());
 
         // Extract prediction values
         let predicted_idx = schema
             .fields()
             .iter()
-            .position(|f| f.name() == "prediction(count)")
+            .position(|f| f.name() == "prediction_count")
             .unwrap();
         let lower_idx = schema
             .fields()
             .iter()
-            .position(|f| f.name() == "lower95(prediction(count))")
+            .position(|f| f.name() == "lower95_prediction_count")
             .unwrap();
         let upper_idx = schema
             .fields()
             .iter()
-            .position(|f| f.name() == "upper95(prediction(count))")
+            .position(|f| f.name() == "upper95_prediction_count")
             .unwrap();
 
         let predicted_array = output
@@ -1788,9 +1923,9 @@ mod tests {
 
         // Check prediction columns exist
         let schema = output.schema();
-        assert!(schema.field_with_name("prediction(value)").is_ok());
-        assert!(schema.field_with_name("lower95(prediction(value))").is_ok());
-        assert!(schema.field_with_name("upper95(prediction(value))").is_ok());
+        assert!(schema.field_with_name("prediction_value").is_ok());
+        assert!(schema.field_with_name("lower95_prediction_value").is_ok());
+        assert!(schema.field_with_name("upper95_prediction_value").is_ok());
     }
 
     #[test]
@@ -1816,7 +1951,7 @@ mod tests {
 
         // Check prediction columns exist (matching Python output format)
         let schema = output.schema();
-        assert!(schema.field_with_name("prediction(value)").is_ok());
+        assert!(schema.field_with_name("prediction_value").is_ok());
     }
 
     #[test]
@@ -1970,7 +2105,7 @@ mod tests {
         // Should have prediction columns
         assert!(output.num_columns() >= 3);
         let schema = output.schema();
-        assert!(schema.field_with_name("prediction(value)").is_ok());
+        assert!(schema.field_with_name("prediction_value").is_ok());
     }
 
     #[test]
@@ -2223,5 +2358,251 @@ mod tests {
             let result = predict.finalize();
             assert!(result.is_ok(), "{} should work with periodic data", algo);
         }
+    }
+
+    // ==================== Time Extension Tests ====================
+
+    #[test]
+    fn test_predict_time_extension_with_string_timestamps() {
+        // Test time extension with ISO8601 string format timestamps
+        // like "2005-06-07T22:00:00.000+0800"
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_time", DataType::Utf8, true),
+            Field::new("bits_transferred", DataType::Float64, true),
+        ]));
+
+        // Create test data with ISO8601 string timestamps (daily intervals)
+        let time_array = Arc::new(arrow::array::StringArray::from(vec![
+            "2005-06-05T22:00:00.000+0800",
+            "2005-06-06T22:00:00.000+0800",
+            "2005-06-07T22:00:00.000+0800",
+        ])) as ArrayRef;
+
+        let value_array = Arc::new(Float64Array::from(vec![
+            5548947933.0,
+            5648947933.0,
+            5748947933.0,
+        ])) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
+            .expect("Failed to create test RecordBatch");
+
+        let named_args = vec![
+            (
+                "fields".to_string(),
+                Arg::String("bits_transferred".to_string()),
+            ),
+            ("future_timespan".to_string(), Arg::Int(3)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        // Should have 3 original rows + 3 future rows = 6 rows
+        assert_eq!(output.num_rows(), 6);
+
+        // Check that _time column has been extended
+        let time_col_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "_time")
+            .expect("_time column not found");
+
+        let time_col = output.column(time_col_idx);
+
+        // Time column should be string type
+        assert!(
+            matches!(time_col.data_type(), DataType::Utf8),
+            "_time column should be Utf8"
+        );
+
+        let time_str_array = time_col.as_string::<i32>();
+
+        // All 6 rows should have non-null time values
+        for i in 0..6 {
+            assert!(
+                time_str_array.is_valid(i),
+                "Row {} should have valid time",
+                i
+            );
+            let time_val = time_str_array.value(i);
+            assert!(!time_val.is_empty(), "Row {} should have non-empty time", i);
+            println!("Row {}: _time = {}", i, time_val);
+        }
+
+        // Check prediction column
+        let pred_col_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "prediction_bits_transferred")
+            .expect("prediction_bits_transferred column not found");
+
+        let pred_col = output
+            .column(pred_col_idx)
+            .as_primitive::<arrow::datatypes::Float64Type>();
+
+        // All 6 rows should have prediction values
+        for i in 0..6 {
+            assert!(
+                pred_col.is_valid(i),
+                "Row {} should have valid prediction",
+                i
+            );
+            let pred_val = pred_col.value(i);
+            println!("Row {}: prediction_bits_transferred = {}", i, pred_val);
+        }
+    }
+
+    #[test]
+    fn test_predict_time_extension_with_int64_timestamps() {
+        // Test time extension with Int64 timestamps (microseconds)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_time", DataType::Int64, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        // Create test data with Int64 timestamps (daily intervals in microseconds)
+        // 86400 seconds = 1 day, 86400 * 1_000_000 = 86400000000 microseconds
+        let day_in_micros: i64 = 86400 * 1_000_000;
+        let base_time: i64 = 1117987200000000; // 2005-06-05 in microseconds
+
+        let time_array = Arc::new(arrow::array::Int64Array::from(vec![
+            base_time,
+            base_time + day_in_micros,
+            base_time + 2 * day_in_micros,
+        ])) as ArrayRef;
+
+        let value_array = Arc::new(Float64Array::from(vec![100.0, 200.0, 300.0])) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
+            .expect("Failed to create test RecordBatch");
+
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("future_timespan".to_string(), Arg::Int(2)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        // Should have 3 original rows + 2 future rows = 5 rows
+        assert_eq!(output.num_rows(), 5);
+
+        // Check that _time column has been extended
+        let time_col_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "_time")
+            .expect("_time column not found");
+
+        let time_col = output.column(time_col_idx);
+        let time_array = time_col.as_primitive::<arrow::datatypes::Int64Type>();
+
+        // All 5 rows should have non-null time values
+        for i in 0..5 {
+            assert!(time_array.is_valid(i), "Row {} should have valid time", i);
+            let time_val = time_array.value(i);
+            println!("Row {}: _time = {}", i, time_val);
+        }
+
+        // Verify that future timestamps are correctly computed
+        // Row 3 should be base_time + 3 * day_in_micros
+        // Row 4 should be base_time + 4 * day_in_micros
+        let expected_time_3 = base_time + 3 * day_in_micros;
+        let expected_time_4 = base_time + 4 * day_in_micros;
+
+        assert_eq!(
+            time_array.value(3),
+            expected_time_3,
+            "Row 3 should have correct future timestamp"
+        );
+        assert_eq!(
+            time_array.value(4),
+            expected_time_4,
+            "Row 4 should have correct future timestamp"
+        );
+    }
+
+    #[test]
+    fn test_predict_time_sorting_before_prediction() {
+        // Test that data is sorted by _time before prediction
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_time", DataType::Int64, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        // Create test data with out-of-order timestamps
+        let time_array = Arc::new(arrow::array::Int64Array::from(vec![
+            300, // Should be last in sorted order
+            100, // Should be first in sorted order
+            200, // Should be middle in sorted order
+        ])) as ArrayRef;
+
+        let value_array = Arc::new(Float64Array::from(vec![30.0, 10.0, 20.0])) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
+            .expect("Failed to create test RecordBatch");
+
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("future_timespan".to_string(), Arg::Int(2)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        // Check that _time column is sorted
+        let time_col_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "_time")
+            .expect("_time column not found");
+
+        let time_col = output.column(time_col_idx);
+        let time_array = time_col.as_primitive::<arrow::datatypes::Int64Type>();
+
+        // First 3 rows should be sorted (100, 200, 300)
+        assert_eq!(time_array.value(0), 100, "Row 0 should be 100");
+        assert_eq!(time_array.value(1), 200, "Row 1 should be 200");
+        assert_eq!(time_array.value(2), 300, "Row 2 should be 300");
+
+        // Future rows should continue the pattern (400, 500)
+        assert_eq!(time_array.value(3), 400, "Row 3 should be 400");
+        assert_eq!(time_array.value(4), 500, "Row 4 should be 500");
+
+        // Check that values are also reordered
+        let value_col_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "value")
+            .expect("value column not found");
+
+        let value_col = output.column(value_col_idx);
+        let value_array = value_col.as_primitive::<arrow::datatypes::Float64Type>();
+
+        // Values should be reordered to match sorted times (10, 20, 30)
+        assert_eq!(value_array.value(0), 10.0, "Row 0 value should be 10.0");
+        assert_eq!(value_array.value(1), 20.0, "Row 1 value should be 20.0");
+        assert_eq!(value_array.value(2), 30.0, "Row 2 value should be 30.0");
     }
 }
