@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use crate::TableFunction;
 use anyhow::Context;
@@ -11,6 +11,92 @@ use arrow::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use rust_tvtf_api::arg::{Arg, Args};
+
+/// Global once flag for logger initialization
+static LOGGER_INIT: Once = Once::new();
+
+/// Initialize FFI logger - call this early in the FFI lifecycle
+/// This function is safe to call multiple times - it will only initialize once
+pub fn init_ffi_logger() {
+    LOGGER_INIT.call_once(|| {
+        use log4rs::append::file::FileAppender;
+        use log4rs::config::{Appender, Config, Root};
+        use log4rs::encode::pattern::PatternEncoder;
+
+        let log_file = "/tmp/rust_tvtf_ffi.log";
+
+        // Create file appender with detailed pattern including thread info
+        let file_appender_result = FileAppender::builder()
+            .encoder(Box::new(PatternEncoder::new(
+                "{d(%Y-%m-%d %H:%M:%S%.3f)} | {l:5} | {t} | {m}{n}",
+            )))
+            .build(log_file);
+
+        let appender: Box<dyn log4rs::append::Append> = match file_appender_result {
+            Ok(file_appender) => Box::new(file_appender),
+            Err(_) => {
+                // Fallback to console if file creation fails
+                Box::new(
+                    log4rs::append::console::ConsoleAppender::builder()
+                        .encoder(Box::new(PatternEncoder::new(
+                            "{d(%Y-%m-%d %H:%M:%S%.3f)} | {l:5} | {t} | {m}{n}",
+                        )))
+                        .build(),
+                )
+            }
+        };
+
+        // Create config with appender
+        let config = Config::builder()
+            .appender(Appender::builder().build("main", appender))
+            .build(
+                Root::builder()
+                    .appender("main")
+                    .build(log::LevelFilter::Debug),
+            );
+
+        match config {
+            Ok(cfg) => {
+                let _ = log4rs::init_config(cfg);
+                log::info!("=== FFI Logger initialized successfully ===");
+                log::info!("Log file: {}", log_file);
+            }
+            Err(e) => {
+                eprintln!("Failed to create logger config: {:?}", e);
+            }
+        }
+    });
+}
+
+/// Log with location information for FFI debugging
+macro_rules! ffi_log {
+    (debug, $($arg:tt)*) => {
+        log::debug!("[FFI:{}:{}] {}", file!(), line!(), format!($($arg)*))
+    };
+    (info, $($arg:tt)*) => {
+        log::info!("[FFI:{}:{}] {}", file!(), line!(), format!($($arg)*))
+    };
+    (warn, $($arg:tt)*) => {
+        log::warn!("[FFI:{}:{}] {}", file!(), line!(), format!($($arg)*))
+    };
+    (error, $($arg:tt)*) => {
+        log::error!("[FFI:{}:{}] {}", file!(), line!(), format!($($arg)*))
+    };
+}
+
+/// Log entry to function for call chain tracing
+macro_rules! ffi_log_entry {
+    ($fn_name:expr) => {
+        log::debug!("[FFI ENTRY] {}", $fn_name)
+    };
+}
+
+/// Log exit from function for call chain tracing
+macro_rules! ffi_log_exit {
+    ($fn_name:expr) => {
+        log::debug!("[FFI EXIT] {}", $fn_name)
+    };
+}
 
 /// Field type analysis result
 #[derive(Debug, Clone, PartialEq)]
@@ -109,16 +195,26 @@ impl AnomalyDetector {
         _params: Option<Args>,
         named_params: Vec<(String, Arg)>,
     ) -> anyhow::Result<AnomalyDetector> {
+        ffi_log_entry!("AnomalyDetector::new");
+        ffi_log!(
+            debug,
+            "new: Creating AnomalyDetector with {} named parameters",
+            named_params.len()
+        );
+
         let mut detector = Self::default();
         let mut action_specified = false;
 
         // Parse all parameters first without validation
         for (name, arg) in named_params {
+            ffi_log!(debug, "new: Parsing parameter '{}' = {:?}", name, arg);
             match name.as_str() {
                 "method" => {
                     if let Arg::String(method) = arg {
                         detector.method = method.to_lowercase();
+                        ffi_log!(debug, "new: Method set to '{}'", detector.method);
                         if !matches!(detector.method.as_str(), "histogram" | "zscore" | "iqr") {
+                            ffi_log!(error, "new: Invalid method '{}'", method);
                             return Err(anyhow::anyhow!(
                                 "Invalid method '{}'. Must be 'histogram', 'zscore', or 'iqr'",
                                 method
@@ -130,12 +226,15 @@ impl AnomalyDetector {
                     if let Arg::String(action) = arg {
                         detector.action = action.to_lowercase();
                         action_specified = true;
+                        ffi_log!(debug, "new: Action set to '{}'", detector.action);
                     }
                 }
                 "bins" | "n_bins" => {
                     if let Arg::Int(n) = arg {
                         detector.n_bins = n as usize;
+                        ffi_log!(debug, "new: Number of bins set to {}", detector.n_bins);
                         if detector.n_bins == 0 {
+                            ffi_log!(error, "new: Number of bins is 0");
                             return Err(anyhow::anyhow!("Number of bins must be greater than 0"));
                         }
                     }
@@ -143,26 +242,31 @@ impl AnomalyDetector {
                 "cutoff" => {
                     if let Arg::Bool(cutoff) = arg {
                         detector.cutoff = cutoff;
+                        ffi_log!(debug, "new: Cutoff set to {}", detector.cutoff);
                     }
                 }
                 "pthresh" => {
                     if let Arg::Float(p) = arg {
                         if p <= 0.0 || p >= 1.0 {
+                            ffi_log!(error, "new: Invalid pthresh value {}", p);
                             return Err(anyhow::anyhow!(
                                 "pthresh must be between 0 and 1, got {}",
                                 p
                             ));
                         }
                         detector.pthresh = Some(p);
+                        ffi_log!(debug, "new: Probability threshold set to {}", p);
                     }
                 }
                 "sensitivity" => {
                     if let Arg::String(sensitivity) = arg {
                         detector.sensitivity = sensitivity.to_lowercase();
+                        ffi_log!(debug, "new: Sensitivity set to '{}'", detector.sensitivity);
                         if !matches!(
                             detector.sensitivity.as_str(),
                             "strict" | "default" | "lenient" | "very_lenient"
                         ) {
+                            ffi_log!(error, "new: Invalid sensitivity '{}'", sensitivity);
                             return Err(anyhow::anyhow!(
                                 "Invalid sensitivity '{}'. Must be 'strict', 'default', 'lenient', or 'very_lenient'",
                                 sensitivity
@@ -174,22 +278,27 @@ impl AnomalyDetector {
                 "mark" => {
                     if let Arg::Bool(mark) = arg {
                         detector.mark = mark;
+                        ffi_log!(debug, "new: Mark set to {}", detector.mark);
                     }
                 }
                 "param" => {
                     if let Arg::Float(p) = arg {
                         if p <= 0.0 {
+                            ffi_log!(error, "new: Invalid param value {}", p);
                             return Err(anyhow::anyhow!("param must be greater than 0, got {}", p));
                         }
                         detector.param = Some(p);
+                        ffi_log!(debug, "new: IQR param set to {}", p);
                     }
                 }
                 "uselower" => {
                     if let Arg::Bool(uselower) = arg {
                         detector.uselower = uselower;
+                        ffi_log!(debug, "new: Uselower set to {}", detector.uselower);
                     }
                 }
                 _ => {
+                    ffi_log!(warn, "new: Ignoring unknown parameter '{}'", name);
                     // Ignore unknown parameters
                 }
             }
@@ -201,12 +310,24 @@ impl AnomalyDetector {
                 "iqr" => "transform".to_string(), // IQR default is transform
                 _ => "filter".to_string(),        // histogram/zscore default is filter
             };
+            ffi_log!(
+                debug,
+                "new: Default action set to '{}' for method '{}'",
+                detector.action,
+                detector.method
+            );
         }
 
         // Validate action based on method (after all parameters are parsed)
         match detector.method.as_str() {
             "histogram" | "zscore" => {
                 if !matches!(detector.action.as_str(), "filter" | "annotate" | "summary") {
+                    ffi_log!(
+                        error,
+                        "new: Invalid action '{}' for method '{}'",
+                        detector.action,
+                        detector.method
+                    );
                     return Err(anyhow::anyhow!(
                         "Invalid action '{}' for method '{}'. Must be 'filter', 'annotate', or 'summary'",
                         detector.action,
@@ -217,6 +338,7 @@ impl AnomalyDetector {
             "iqr" => {
                 // pthresh is not supported for IQR method
                 if detector.pthresh.is_some() {
+                    ffi_log!(error, "new: pthresh not supported with iqr method");
                     return Err(anyhow::anyhow!(
                         "Invalid argument: 'pthresh' is not supported with method 'iqr'"
                     ));
@@ -225,6 +347,11 @@ impl AnomalyDetector {
                     detector.action.as_str(),
                     "remove" | "transform" | "rm" | "tf"
                 ) {
+                    ffi_log!(
+                        error,
+                        "new: Invalid action '{}' for method 'iqr'",
+                        detector.action
+                    );
                     return Err(anyhow::anyhow!(
                         "Invalid action '{}' for method 'iqr'. Must be 'remove', 'transform', or their abbreviations 'rm', 'tf'",
                         detector.action
@@ -233,6 +360,17 @@ impl AnomalyDetector {
             }
             _ => {}
         }
+
+        ffi_log!(
+            debug,
+            "new: AnomalyDetector created successfully - method={}, action={}, bins={}, cutoff={}, sensitivity={}",
+            detector.method,
+            detector.action,
+            detector.n_bins,
+            detector.cutoff,
+            detector.sensitivity
+        );
+        ffi_log_exit!("AnomalyDetector::new");
 
         Ok(detector)
     }
@@ -330,6 +468,14 @@ impl AnomalyDetector {
 
     /// Build frequency distributions for each field
     fn build_field_frequencies(&mut self, data: &[Vec<(String, String)>], fields: &[String]) {
+        ffi_log_entry!("AnomalyDetector::build_field_frequencies");
+        ffi_log!(
+            debug,
+            "build_field_frequencies: Processing {} fields for {} rows",
+            fields.len(),
+            data.len()
+        );
+
         self.field_frequencies.clear();
         self.field_types.clear();
 
@@ -342,6 +488,13 @@ impl AnomalyDetector {
                 .collect();
 
             let field_type = Self::analyze_field_type(&values);
+            ffi_log!(
+                debug,
+                "build_field_frequencies: Field '{}' - {} values, type={:?}",
+                field,
+                values.len(),
+                field_type
+            );
             self.field_types.insert(field.clone(), field_type);
         }
 
@@ -354,17 +507,45 @@ impl AnomalyDetector {
 
             match field_type {
                 FieldType::Numerical => {
+                    ffi_log!(
+                        debug,
+                        "build_field_frequencies: Processing field '{}' as numerical",
+                        field
+                    );
                     self.build_numerical_field_frequency(field, data);
                 }
                 _ => {
+                    ffi_log!(
+                        debug,
+                        "build_field_frequencies: Processing field '{}' as categorical",
+                        field
+                    );
                     self.build_categorical_field_frequency(field, data);
                 }
             }
         }
+
+        // Log frequency summary
+        let total_unique_values: usize = self.field_frequencies.values().map(|h| h.len()).sum();
+        ffi_log!(
+            debug,
+            "build_field_frequencies: Completed - {} total unique field values",
+            total_unique_values
+        );
+
+        ffi_log_exit!("AnomalyDetector::build_field_frequencies");
     }
 
     /// Build frequency distribution for a numerical field - exactly matching Python
     fn build_numerical_field_frequency(&mut self, field: &str, data: &[Vec<(String, String)>]) {
+        ffi_log_entry!("AnomalyDetector::build_numerical_field_frequency");
+        ffi_log!(
+            debug,
+            "build_numerical_field_frequency: Field='{}', data rows={}",
+            field,
+            data.len()
+        );
+
         // Collect numeric values (matching Python's _clean_numeric_value)
         let values: Vec<f64> = data
             .iter()
@@ -372,7 +553,18 @@ impl AnomalyDetector {
             .map(|(_, v)| Self::clean_numeric_value(v))
             .collect();
 
+        ffi_log!(
+            debug,
+            "build_numerical_field_frequency: Collected {} numeric values",
+            values.len()
+        );
+
         if values.is_empty() {
+            ffi_log!(
+                warn,
+                "build_numerical_field_frequency: No numeric values found for field '{}'",
+                field
+            );
             return;
         }
 
@@ -384,9 +576,21 @@ impl AnomalyDetector {
             unique.len()
         };
 
+        ffi_log!(
+            debug,
+            "build_numerical_field_frequency: Unique count={}, configured bins={}",
+            unique_count,
+            self.n_bins
+        );
+
         let n_bins = self.n_bins.min(unique_count);
 
         if unique_count > n_bins {
+            ffi_log!(
+                debug,
+                "build_numerical_field_frequency: Using histogram binning with {} bins",
+                n_bins
+            );
             // Use histogram binning - exactly matching NumPy
             let value_to_bin = Self::create_histogram_bins(&values, n_bins);
 
@@ -396,6 +600,12 @@ impl AnomalyDetector {
                 if let Some(&bin_idx) = value_to_bin.get(&value.to_string()) {
                     bin_counts[bin_idx] += 1;
                 }
+            }
+
+            // Log bin distribution
+            ffi_log!(debug, "build_numerical_field_frequency: Bin distribution:");
+            for (i, count) in bin_counts.iter().enumerate() {
+                ffi_log!(debug, "  Bin {}: {} values", i, count);
             }
 
             let total_count = values.len() as f64;
@@ -415,6 +625,11 @@ impl AnomalyDetector {
             self.field_frequencies
                 .insert(field.to_string(), value_frequencies);
         } else {
+            ffi_log!(
+                debug,
+                "build_numerical_field_frequency: Using direct frequency counting for {} unique values",
+                unique_count
+            );
             // Use direct frequency counting - matching Python
             let mut counter: HashMap<String, usize> = HashMap::new();
             for row in data {
@@ -429,13 +644,32 @@ impl AnomalyDetector {
                 .map(|(value, count)| (value, count as f64 / total))
                 .collect();
 
+            // Log frequency distribution
+            ffi_log!(
+                debug,
+                "build_numerical_field_frequency: Frequency distribution:"
+            );
+            for (value, freq) in &value_frequencies {
+                ffi_log!(debug, "  {}: {:.4}", value, freq);
+            }
+
             self.field_frequencies
                 .insert(field.to_string(), value_frequencies);
         }
+
+        ffi_log_exit!("AnomalyDetector::build_numerical_field_frequency");
     }
 
     /// Build frequency distribution for a categorical field
     fn build_categorical_field_frequency(&mut self, field: &str, data: &[Vec<(String, String)>]) {
+        ffi_log_entry!("AnomalyDetector::build_categorical_field_frequency");
+        ffi_log!(
+            debug,
+            "build_categorical_field_frequency: Field='{}', data rows={}",
+            field,
+            data.len()
+        );
+
         let counter: HashMap<String, usize> = data
             .iter()
             .filter_map(|row| row.iter().find(|(f, _)| f == field))
@@ -445,14 +679,32 @@ impl AnomalyDetector {
                 acc
             });
 
+        ffi_log!(
+            debug,
+            "build_categorical_field_frequency: Found {} unique categories",
+            counter.len()
+        );
+
         let total = counter.values().sum::<usize>() as f64;
         let value_frequencies: HashMap<String, f64> = counter
-            .into_iter()
-            .map(|(value, count)| (value, count as f64 / total))
+            .iter()
+            .map(|(value, count)| (value.clone(), *count as f64 / total))
             .collect();
+
+        // Log frequency distribution
+        ffi_log!(
+            debug,
+            "build_categorical_field_frequency: Frequency distribution:"
+        );
+        for (value, freq) in &value_frequencies {
+            let count = (freq * total).round() as usize;
+            ffi_log!(debug, "  '{}': {:.4} (count={})", value, freq, count);
+        }
 
         self.field_frequencies
             .insert(field.to_string(), value_frequencies);
+
+        ffi_log_exit!("AnomalyDetector::build_categorical_field_frequency");
     }
 
     /// Calculate event probability as product of field value frequencies
@@ -473,7 +725,19 @@ impl AnomalyDetector {
 
     /// Calculate threshold based on the selected method
     fn calculate_threshold(&mut self, log_probabilities: &[f64], fields: &[String]) -> f64 {
+        ffi_log_entry!("AnomalyDetector::calculate_threshold");
+        ffi_log!(
+            debug,
+            "calculate_threshold: Method={}, {} probabilities",
+            self.method,
+            log_probabilities.len()
+        );
+
         if log_probabilities.is_empty() {
+            ffi_log!(
+                warn,
+                "calculate_threshold: Empty probabilities, using default threshold -10.0"
+            );
             return -10.0;
         }
 
@@ -481,14 +745,41 @@ impl AnomalyDetector {
         sorted_probs.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         let threshold = match self.method.as_str() {
-            "histogram" => self.calculate_histogram_threshold(&sorted_probs, fields),
-            "zscore" => self.calculate_zscore_threshold(log_probabilities),
-            "iqr" => self.calculate_iqr_threshold(&sorted_probs),
-            _ => self.calculate_histogram_threshold(&sorted_probs, fields),
+            "histogram" => {
+                ffi_log!(debug, "calculate_threshold: Using histogram method");
+                self.calculate_histogram_threshold(&sorted_probs, fields)
+            }
+            "zscore" => {
+                ffi_log!(debug, "calculate_threshold: Using zscore method");
+                self.calculate_zscore_threshold(log_probabilities)
+            }
+            "iqr" => {
+                ffi_log!(debug, "calculate_threshold: Using iqr method");
+                self.calculate_iqr_threshold(&sorted_probs)
+            }
+            _ => {
+                ffi_log!(
+                    warn,
+                    "calculate_threshold: Unknown method {}, defaulting to histogram",
+                    self.method
+                );
+                self.calculate_histogram_threshold(&sorted_probs, fields)
+            }
         };
 
+        ffi_log!(debug, "calculate_threshold: Raw threshold={}", threshold);
+
         // Apply sensitivity adjustment (Python 逻辑)
-        self.apply_sensitivity_adjustment(threshold, log_probabilities)
+        let adjusted_threshold = self.apply_sensitivity_adjustment(threshold, log_probabilities);
+        ffi_log!(
+            debug,
+            "calculate_threshold: Sensitivity={}, adjusted threshold={}",
+            self.sensitivity,
+            adjusted_threshold
+        );
+
+        ffi_log_exit!("AnomalyDetector::calculate_threshold");
+        adjusted_threshold
     }
 
     /// Calculate threshold using histogram method (Splunk default)
@@ -676,19 +967,74 @@ impl AnomalyDetector {
         data: &[Vec<(String, String)>],
         fields: &[String],
     ) -> Vec<AnomalyRecord> {
-        // Build field frequencies
-        self.build_field_frequencies(data, fields);
+        ffi_log_entry!("AnomalyDetector::detect_anomalies");
+        ffi_log!(
+            debug,
+            "detect_anomalies: Starting with {} rows, {} fields",
+            data.len(),
+            fields.len()
+        );
 
-        if data.is_empty() || fields.is_empty() {
+        // Build field frequencies
+        ffi_log!(debug, "detect_anomalies: Building field frequencies");
+        let freq_start = std::time::Instant::now();
+        self.build_field_frequencies(data, fields);
+        let freq_time = freq_start.elapsed();
+        ffi_log!(
+            debug,
+            "detect_anomalies: Field frequencies built in {:?}ms",
+            freq_time.as_millis()
+        );
+
+        // Log field type analysis
+        ffi_log!(debug, "detect_anomalies: Field types:");
+        for (field, field_type) in &self.field_types {
+            ffi_log!(debug, "  - {}: {:?}", field, field_type);
+        }
+
+        if data.is_empty() {
+            ffi_log!(
+                warn,
+                "detect_anomalies: Empty data received, returning empty results"
+            );
+            return Vec::new();
+        }
+
+        if fields.is_empty() {
+            ffi_log!(
+                warn,
+                "detect_anomalies: Empty fields received, returning empty results"
+            );
             return Vec::new();
         }
 
         // Calculate event probabilities
+        ffi_log!(
+            debug,
+            "detect_anomalies: Calculating event probabilities for {} rows",
+            data.len()
+        );
+        let prob_start = std::time::Instant::now();
         let mut records: Vec<AnomalyRecord> = data
             .iter()
             .map(|row| {
                 let probability = self.calculate_event_probability(row, fields);
                 let log_prob = probability.ln();
+
+                // Log probability calculation details
+                if probability == 0.0 {
+                    ffi_log!(
+                        debug,
+                        "detect_anomalies: Zero probability for row, log_prob will be -inf"
+                    );
+                } else if probability < 1e-10 {
+                    ffi_log!(
+                        debug,
+                        "detect_anomalies: Very small probability: {}, log_prob: {}",
+                        probability,
+                        log_prob
+                    );
+                }
 
                 // Find probable cause
                 let mut min_freq = f64::INFINITY;
@@ -780,13 +1126,51 @@ impl AnomalyDetector {
                 }
             })
             .collect();
+        let prob_time = prob_start.elapsed();
+        ffi_log!(
+            debug,
+            "detect_anomalies: Probabilities calculated in {:?}ms",
+            prob_time.as_millis()
+        );
+
+        // Log probability distribution
+        let log_probs: Vec<f64> = records.iter().map(|r| r.log_prob).collect();
+        let min_prob = log_probs.iter().fold(f64::INFINITY, |acc, &p| acc.min(p));
+        let max_prob = log_probs
+            .iter()
+            .fold(f64::NEG_INFINITY, |acc, &p| acc.max(p));
+        ffi_log!(
+            debug,
+            "detect_anomalies: Probability distribution - min={}, max={}",
+            min_prob,
+            max_prob
+        );
 
         // Calculate threshold
-        let log_probs: Vec<f64> = records.iter().map(|r| r.log_prob).collect();
+        ffi_log!(
+            debug,
+            "detect_anomalies: Calculating threshold using method={}",
+            self.method
+        );
+        let threshold_start = std::time::Instant::now();
         self.threshold = Some(self.calculate_threshold(&log_probs, fields));
+        let threshold_time = threshold_start.elapsed();
+        ffi_log!(
+            debug,
+            "detect_anomalies: Threshold calculated in {:?}ms, threshold={:?}",
+            threshold_time.as_millis(),
+            self.threshold
+        );
 
         // Mark anomalies
         if let Some(threshold) = self.threshold {
+            ffi_log!(
+                debug,
+                "detect_anomalies: Marking anomalies with threshold={}",
+                threshold
+            );
+            let anomaly_start = std::time::Instant::now();
+
             let mut anomalous_probs: Vec<f64> = records
                 .iter()
                 .filter(|r| r.log_prob < threshold)
@@ -795,6 +1179,12 @@ impl AnomalyDetector {
             anomalous_probs.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
             let representative_log_prob = anomalous_probs.first().copied();
+            ffi_log!(
+                debug,
+                "detect_anomalies: Found {} anomalous records, representative log_prob={:?}",
+                anomalous_probs.len(),
+                representative_log_prob
+            );
 
             for record in &mut records {
                 if record.log_prob < threshold {
@@ -804,14 +1194,32 @@ impl AnomalyDetector {
                     }
                 }
             }
+
+            let anomaly_time = anomaly_start.elapsed();
+            let anomaly_count = records.iter().filter(|r| r.is_anomaly).count();
+            ffi_log!(
+                debug,
+                "detect_anomalies: Anomaly marking completed in {:?}ms, {} anomalies marked",
+                anomaly_time.as_millis(),
+                anomaly_count
+            );
         }
 
+        ffi_log_exit!("AnomalyDetector::detect_anomalies");
         records
     }
 
     /// Build summary data for action=summary
     fn build_summary(&self, anomaly_records: &[AnomalyRecord], log_probs: &[f64]) -> SummaryData {
+        ffi_log_entry!("AnomalyDetector::build_summary");
+        ffi_log!(
+            debug,
+            "build_summary: Processing {} records",
+            anomaly_records.len()
+        );
+
         let num_anomalies = anomaly_records.iter().filter(|r| r.is_anomaly).count();
+        ffi_log!(debug, "build_summary: Found {} anomalies", num_anomalies);
 
         let thresh = self.threshold.unwrap_or(0.0);
 
@@ -820,6 +1228,13 @@ impl AnomalyDetector {
             .fold(f64::NEG_INFINITY, |acc, &p| acc.max(p));
         let min_logprob = log_probs.iter().fold(f64::INFINITY, |acc, &p| acc.min(p));
 
+        ffi_log!(
+            debug,
+            "build_summary: Log probability range - min={}, max={}",
+            min_logprob,
+            max_logprob
+        );
+
         // Sort log_probs for percentile calculation
         let mut sorted_probs: Vec<f64> = log_probs.to_vec();
         sorted_probs.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -827,14 +1242,24 @@ impl AnomalyDetector {
         let first_quartile = percentile(&sorted_probs, 25.0);
         let third_quartile = percentile(&sorted_probs, 75.0);
 
-        SummaryData {
+        ffi_log!(
+            debug,
+            "build_summary: Quartiles - Q1={}, Q3={}",
+            first_quartile,
+            third_quartile
+        );
+
+        let summary = SummaryData {
             num_anomalies,
             thresh,
             max_logprob,
             min_logprob,
             first_quartile,
             third_quartile,
-        }
+        };
+
+        ffi_log_exit!("AnomalyDetector::build_summary");
+        summary
     }
 
     /// Create summary output for action=summary (following Splunk docs - only 6 fields)
@@ -842,6 +1267,17 @@ impl AnomalyDetector {
         &self,
         summary: SummaryData,
     ) -> anyhow::Result<Option<RecordBatch>> {
+        ffi_log_entry!("AnomalyDetector::create_summary_output_only");
+        ffi_log!(debug, "create_summary_output_only: Creating summary output");
+        ffi_log!(
+            debug,
+            "create_summary_output_only: Summary data - num_anomalies={}, thresh={}, max_logprob={}, min_logprob={}",
+            summary.num_anomalies,
+            summary.thresh,
+            summary.max_logprob,
+            summary.min_logprob
+        );
+
         let fields = vec![
             Arc::new(Field::new("num_anomalies", DataType::Int64, false)),
             Arc::new(Field::new("thresh", DataType::Float64, false)),
@@ -864,9 +1300,35 @@ impl AnomalyDetector {
             Arc::new(Float64Array::from(vec![summary.third_quartile])),
         ];
 
-        RecordBatch::try_new(schema, columns)
+        ffi_log!(
+            debug,
+            "create_summary_output_only: Creating RecordBatch with {} columns, 1 row",
+            columns.len()
+        );
+
+        let result = RecordBatch::try_new(schema, columns)
             .map(Some)
-            .context("Failed to create summary output")
+            .context("Failed to create summary output");
+
+        match &result {
+            Ok(Some(batch)) => {
+                ffi_log!(
+                    debug,
+                    "create_summary_output_only: Success - {} columns, {} rows",
+                    batch.num_columns(),
+                    batch.num_rows()
+                );
+            }
+            Ok(None) => {
+                ffi_log!(warn, "create_summary_output_only: Warning - batch is None");
+            }
+            Err(e) => {
+                ffi_log!(error, "create_summary_output_only: Error - {:?}", e);
+            }
+        }
+
+        ffi_log_exit!("AnomalyDetector::create_summary_output_only");
+        result
     }
 
     /// Create filter output for action=filter
@@ -876,8 +1338,22 @@ impl AnomalyDetector {
         anomaly_records: &[AnomalyRecord],
         input: &RecordBatch,
     ) -> anyhow::Result<Option<RecordBatch>> {
+        ffi_log_entry!("AnomalyDetector::create_filter_output");
+        ffi_log!(
+            debug,
+            "create_filter_output: {} total records, {} anomalies",
+            anomaly_records.len(),
+            anomaly_records.iter().filter(|r| r.is_anomaly).count()
+        );
+
         let anomalies: Vec<&AnomalyRecord> =
             anomaly_records.iter().filter(|r| r.is_anomaly).collect();
+
+        ffi_log!(
+            debug,
+            "create_filter_output: {} anomalies to output",
+            anomalies.len()
+        );
 
         self.build_filter_output(&anomalies, anomaly_records, input)
     }
@@ -889,8 +1365,22 @@ impl AnomalyDetector {
         anomaly_records: &[AnomalyRecord],
         input: &RecordBatch,
     ) -> anyhow::Result<Option<RecordBatch>> {
+        ffi_log_entry!("AnomalyDetector::create_remove_output");
+        ffi_log!(
+            debug,
+            "create_remove_output: {} total records, {} anomalies",
+            anomaly_records.len(),
+            anomaly_records.iter().filter(|r| r.is_anomaly).count()
+        );
+
         let normal_events: Vec<&AnomalyRecord> =
             anomaly_records.iter().filter(|r| !r.is_anomaly).collect();
+
+        ffi_log!(
+            debug,
+            "create_remove_output: {} normal events to output",
+            normal_events.len()
+        );
 
         self.build_filter_output(&normal_events, anomaly_records, input)
     }
@@ -902,6 +1392,14 @@ impl AnomalyDetector {
         anomaly_records: &[AnomalyRecord],
         input: &RecordBatch,
     ) -> anyhow::Result<Option<RecordBatch>> {
+        ffi_log_entry!("AnomalyDetector::build_filter_output");
+        ffi_log!(
+            debug,
+            "build_filter_output: Building output for {} records from {} total",
+            records.len(),
+            anomaly_records.len()
+        );
+
         // Build output schema with additional columns
         let mut output_fields = input.schema().fields().to_vec();
         output_fields.push(Arc::new(Field::new(
@@ -921,8 +1419,17 @@ impl AnomalyDetector {
             false,
         )));
         let output_schema = Arc::new(Schema::new(output_fields));
+        ffi_log!(
+            debug,
+            "build_filter_output: Output schema has {} fields",
+            output_schema.fields().len()
+        );
 
         if records.is_empty() {
+            ffi_log!(
+                warn,
+                "build_filter_output: No records to output, returning empty batch"
+            );
             return Ok(Some(RecordBatch::new_empty(output_schema)));
         }
 
@@ -932,6 +1439,11 @@ impl AnomalyDetector {
         // Collect the actual row indices from the original input
         // records are references to AnomalyRecords, which correspond to input rows
         let num_output_rows = records.len();
+        ffi_log!(
+            debug,
+            "build_filter_output: Processing {} output rows",
+            num_output_rows
+        );
 
         // Copy original columns for selected rows
         for col_idx in 0..input.num_columns() {
@@ -968,6 +1480,14 @@ impl AnomalyDetector {
 
         // Add anomaly information columns
         let log_probs: Vec<f64> = records.iter().map(|r| r.log_prob).collect();
+        ffi_log!(
+            debug,
+            "build_filter_output: Log probabilities range: [{:?}, {:?}]",
+            log_probs.iter().fold(f64::INFINITY, |acc, &p| acc.min(p)),
+            log_probs
+                .iter()
+                .fold(f64::NEG_INFINITY, |acc, &p| acc.max(p))
+        );
         output_columns.push(Arc::new(Float64Array::from(log_probs)));
 
         let max_freqs: Vec<f64> = records.iter().map(|r| r.max_freq).collect();
@@ -981,10 +1501,31 @@ impl AnomalyDetector {
             records.iter().map(|r| r.probable_cause_freq).collect();
         output_columns.push(Arc::new(Float64Array::from(probable_cause_freqs)));
 
-        let output_batch = RecordBatch::try_new(output_schema, output_columns)
-            .context("Failed to create output RecordBatch")?;
+        ffi_log!(
+            debug,
+            "build_filter_output: Creating RecordBatch with {} columns",
+            output_columns.len()
+        );
 
-        Ok(Some(output_batch))
+        let output_batch = RecordBatch::try_new(output_schema, output_columns)
+            .context("Failed to create output RecordBatch");
+
+        match &output_batch {
+            Ok(batch) => {
+                ffi_log!(
+                    debug,
+                    "build_filter_output: Success - {} rows, {} columns",
+                    batch.num_rows(),
+                    batch.num_columns()
+                );
+            }
+            Err(e) => {
+                ffi_log!(error, "build_filter_output: Error - {:?}", e);
+            }
+        }
+
+        ffi_log_exit!("AnomalyDetector::build_filter_output");
+        output_batch.map(Some)
     }
 
     /// Create transform output for IQR method - truncates outlier values
@@ -1004,6 +1545,21 @@ impl AnomalyDetector {
         anomaly_records: &[AnomalyRecord],
         input: &RecordBatch,
     ) -> anyhow::Result<Option<RecordBatch>> {
+        ffi_log_entry!("AnomalyDetector::create_transform_output");
+        ffi_log!(
+            debug,
+            "create_transform_output: {} total records, {} anomalies",
+            anomaly_records.len(),
+            anomaly_records.iter().filter(|r| r.is_anomaly).count()
+        );
+        ffi_log!(
+            debug,
+            "create_transform_output: param={}, uselower={}, mark={}",
+            self.param.unwrap_or(1.5),
+            self.uselower,
+            self.mark
+        );
+
         let param = self.param.unwrap_or(1.5);
 
         // Build output schema (same as input for transform)
@@ -1015,6 +1571,12 @@ impl AnomalyDetector {
         // Pre-calculate field bounds for each numeric column
         // According to Splunk outlier docs, IQR should be calculated per numeric field
         let mut field_bounds: HashMap<usize, (f64, f64)> = HashMap::new();
+
+        ffi_log!(
+            debug,
+            "create_transform_output: Calculating IQR bounds for {} columns",
+            input.num_columns()
+        );
 
         for col_idx in 0..input.num_columns() {
             let col = input.column(col_idx);
@@ -1035,6 +1597,16 @@ impl AnomalyDetector {
                     let upper_bound = q3 + param * iqr;
                     let lower_bound = q1 - param * iqr;
                     field_bounds.insert(col_idx, (upper_bound, lower_bound));
+                    ffi_log!(
+                        debug,
+                        "create_transform_output: Column {} (Int64) - q1={}, q3={}, iqr={}, bounds=[{}, {}]",
+                        col_idx,
+                        q1,
+                        q3,
+                        iqr,
+                        lower_bound,
+                        upper_bound
+                    );
                 }
                 DataType::Float64 => {
                     let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
@@ -1047,12 +1619,30 @@ impl AnomalyDetector {
                     let upper_bound = q3 + param * iqr;
                     let lower_bound = q1 - param * iqr;
                     field_bounds.insert(col_idx, (upper_bound, lower_bound));
+                    ffi_log!(
+                        debug,
+                        "create_transform_output: Column {} (Float64) - q1={}, q3={}, iqr={}, bounds=[{}, {}]",
+                        col_idx,
+                        q1,
+                        q3,
+                        iqr,
+                        lower_bound,
+                        upper_bound
+                    );
                 }
-                _ => {}
+                _ => {
+                    ffi_log!(
+                        debug,
+                        "create_transform_output: Column {} ({}) - non-numeric, no transformation",
+                        col_idx,
+                        col.data_type()
+                    );
+                }
             }
         }
 
         // Process each column - numeric columns get transformed based on their own bounds
+        let mut transformed_count = 0;
         for col_idx in 0..input.num_columns() {
             let col = input.column(col_idx);
 
@@ -1091,8 +1681,10 @@ impl AnomalyDetector {
                             // Truncate to upper_bound or lower_bound based on direction and field bounds
                             if original_value > upper_bound as i64 {
                                 values.push(upper_bound as i64);
+                                transformed_count += 1;
                             } else if original_value < lower_bound as i64 && self.uselower {
                                 values.push(lower_bound as i64);
+                                transformed_count += 1;
                             } else {
                                 values.push(original_value);
                             }
@@ -1134,8 +1726,10 @@ impl AnomalyDetector {
                             // Truncate to upper_bound or lower_bound based on direction and field bounds
                             if original_value > upper_bound {
                                 values.push(upper_bound);
+                                transformed_count += 1;
                             } else if original_value < lower_bound && self.uselower {
                                 values.push(lower_bound);
+                                transformed_count += 1;
                             } else {
                                 values.push(original_value);
                             }
@@ -1152,14 +1746,47 @@ impl AnomalyDetector {
             }
         }
 
+        ffi_log!(
+            debug,
+            "create_transform_output: Transformed {} values",
+            transformed_count
+        );
+
         if num_rows > 0 {
-            RecordBatch::try_new(output_schema, output_columns)
+            let result = RecordBatch::try_new(output_schema, output_columns)
                 .map(Some)
-                .context("Failed to create transform output")
+                .context("Failed to create transform output");
+
+            match &result {
+                Ok(Some(batch)) => {
+                    ffi_log!(
+                        debug,
+                        "create_transform_output: Success - {} rows, {} columns",
+                        batch.num_rows(),
+                        batch.num_columns()
+                    );
+                }
+                Ok(None) => {
+                    ffi_log!(warn, "create_transform_output: Result is None");
+                }
+                Err(e) => {
+                    ffi_log!(error, "create_transform_output: Error - {:?}", e);
+                }
+            }
+
+            ffi_log_exit!("AnomalyDetector::create_transform_output");
+            result
         } else {
-            RecordBatch::try_new(output_schema, output_columns)
+            let result = RecordBatch::try_new(output_schema, output_columns)
                 .map(Some)
-                .context("Failed to create empty transform output")
+                .context("Failed to create empty transform output");
+
+            ffi_log!(
+                debug,
+                "create_transform_output: Empty input, created empty batch"
+            );
+            ffi_log_exit!("AnomalyDetector::create_transform_output");
+            result
         }
     }
 
@@ -1170,6 +1797,14 @@ impl AnomalyDetector {
         input: &RecordBatch,
         output_schema: Arc<Schema>,
     ) -> anyhow::Result<Option<RecordBatch>> {
+        ffi_log_entry!("AnomalyDetector::create_annotated_output");
+        ffi_log!(
+            debug,
+            "create_annotated_output: {} records, input columns={}",
+            anomaly_records.len(),
+            input.num_columns()
+        );
+
         let num_rows = input.num_rows();
         let mut output_columns: Vec<ArrayRef> = Vec::new();
 
@@ -1181,6 +1816,13 @@ impl AnomalyDetector {
 
         // Add annotation fields
         let is_anomaly: Vec<bool> = anomaly_records.iter().map(|r| r.is_anomaly).collect();
+        let anomaly_count = is_anomaly.iter().filter(|&&b| b).count();
+        ffi_log!(
+            debug,
+            "create_annotated_output: {} anomalies out of {} total",
+            anomaly_count,
+            is_anomaly.len()
+        );
         output_columns.push(Arc::new(arrow::array::BooleanArray::from(is_anomaly)));
 
         let log_probs: Vec<f64> = anomaly_records.iter().map(|r| r.log_prob).collect();
@@ -1202,13 +1844,40 @@ impl AnomalyDetector {
         output_columns.push(Arc::new(Float64Array::from(probable_cause_freqs)));
 
         if num_rows > 0 {
-            RecordBatch::try_new(output_schema, output_columns)
+            let result = RecordBatch::try_new(output_schema, output_columns)
                 .map(Some)
-                .context("Failed to create annotated output")
+                .context("Failed to create annotated output");
+
+            match &result {
+                Ok(Some(batch)) => {
+                    ffi_log!(
+                        debug,
+                        "create_annotated_output: Success - {} rows, {} columns",
+                        batch.num_rows(),
+                        batch.num_columns()
+                    );
+                }
+                Ok(None) => {
+                    ffi_log!(warn, "create_annotated_output: Result is None");
+                }
+                Err(e) => {
+                    ffi_log!(error, "create_annotated_output: Error - {:?}", e);
+                }
+            }
+
+            ffi_log_exit!("AnomalyDetector::create_annotated_output");
+            result
         } else {
-            RecordBatch::try_new(output_schema, output_columns)
+            let result = RecordBatch::try_new(output_schema, output_columns)
                 .map(Some)
-                .context("Failed to create empty annotated output")
+                .context("Failed to create empty annotated output");
+
+            ffi_log!(
+                debug,
+                "create_annotated_output: Empty input, created empty batch"
+            );
+            ffi_log_exit!("AnomalyDetector::create_annotated_output");
+            result
         }
     }
 }
@@ -1241,14 +1910,43 @@ fn median(sorted: &[f64]) -> f64 {
 
 impl TableFunction for AnomalyDetector {
     fn process(&mut self, input: RecordBatch) -> anyhow::Result<Option<RecordBatch>> {
+        // FFI Entry logging - critical for debugging FFI errors
+        ffi_log_entry!("AnomalyDetector::process");
+        ffi_log!(
+            debug,
+            "FFI: process called with input: {} rows, {} columns",
+            input.num_rows(),
+            input.num_columns()
+        );
+
         if input.num_rows() == 0 {
+            ffi_log!(debug, "FFI: Empty input received, returning early");
             return Ok(Some(input));
         }
 
+        // Log schema information
         let schema = input.schema();
         let fields: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+        ffi_log!(debug, "FFI: Input schema fields: {:?}", fields);
 
-        // Convert RecordBatch to Vec<Vec<(String, String)>>
+        // Log data types
+        for (idx, field) in schema.fields().iter().enumerate() {
+            ffi_log!(
+                debug,
+                "FFI: Field {}: {} -> {:?}",
+                idx,
+                field.name(),
+                field.data_type()
+            );
+        }
+
+        // Convert RecordBatch to internal data representation
+        ffi_log!(
+            debug,
+            "FFI: Starting data conversion from RecordBatch to Vec<Vec<(String, String)>>"
+        );
+        let conversion_start = std::time::Instant::now();
+
         let data: Vec<Vec<(String, String)>> = (0..input.num_rows())
             .map(|row_idx| {
                 let mut row = Vec::new();
@@ -1285,11 +1983,24 @@ impl TableFunction for AnomalyDetector {
                             DataType::Boolean => col.as_boolean().value(row_idx).to_string(),
                             _ => {
                                 // For unsupported types, use arrow's cast to Utf8
+                                ffi_log!(
+                                    debug,
+                                    "FFI: Casting unsupported type {} to Utf8",
+                                    col.data_type()
+                                );
                                 match compute::cast(col, &DataType::Utf8) {
                                     Ok(casted) => {
                                         casted.as_string::<i32>().value(row_idx).to_string()
                                     }
-                                    Err(_) => "".to_string(),
+                                    Err(e) => {
+                                        ffi_log!(
+                                            error,
+                                            "FFI: Failed to cast column {}: {}",
+                                            field_name,
+                                            e
+                                        );
+                                        "".to_string()
+                                    }
                                 }
                             }
                         }
@@ -1301,22 +2012,79 @@ impl TableFunction for AnomalyDetector {
             })
             .collect();
 
-        // Detect anomalies
+        let conversion_time = conversion_start.elapsed();
+        ffi_log!(
+            debug,
+            "FFI: Data conversion completed in {:?}ms - {} rows processed",
+            conversion_time.as_millis(),
+            data.len()
+        );
+
+        // Log first row as sample for debugging
+        if !data.is_empty() {
+            ffi_log!(debug, "FFI: Sample first row: {:?}", data.first());
+        }
+
+        // Detect anomalies - core FFI functionality
+        ffi_log!(
+            debug,
+            "FFI: Starting anomaly detection with method={}, action={}",
+            self.method,
+            self.action
+        );
+        ffi_log!(
+            debug,
+            "FFI: Detection parameters - bins={}, cutoff={}, sensitivity={}",
+            self.n_bins,
+            self.cutoff,
+            self.sensitivity
+        );
+
+        let detect_start = std::time::Instant::now();
         let anomaly_records = self.detect_anomalies(&data, &fields);
+        let detect_time = detect_start.elapsed();
+
+        ffi_log!(
+            debug,
+            "FFI: Anomaly detection completed in {:?}ms - found {} anomalies out of {} records",
+            detect_time.as_millis(),
+            anomaly_records.iter().filter(|r| r.is_anomaly).count(),
+            anomaly_records.len()
+        );
+
+        if let Some(threshold) = self.threshold {
+            ffi_log!(debug, "FFI: Detection threshold: {}", threshold);
+        }
+
         let log_probs: Vec<f64> = anomaly_records.iter().map(|r| r.log_prob).collect();
+        ffi_log!(
+            debug,
+            "FFI: Log probabilities - min={:?}, max={:?}, count={}",
+            log_probs.iter().fold(f64::INFINITY, |acc, &p| acc.min(p)),
+            log_probs
+                .iter()
+                .fold(f64::NEG_INFINITY, |acc, &p| acc.max(p)),
+            log_probs.len()
+        );
 
         // Handle different actions
-        match self.action.as_str() {
+        ffi_log!(debug, "FFI: Processing action '{}'", self.action);
+        let action_start = std::time::Instant::now();
+
+        let result = match self.action.as_str() {
             "summary" => {
-                // Build summary data
+                ffi_log!(debug, "FFI: Building summary output");
                 let summary = self.build_summary(&anomaly_records, &log_probs);
+                ffi_log!(
+                    debug,
+                    "FFI: Summary - num_anomalies={}, thresh={}",
+                    summary.num_anomalies,
+                    summary.thresh
+                );
                 self.create_summary_output_only(summary)
             }
             "annotate" => {
-                // Build output schema with annotation fields
-                // Note: Following Splunk docs, annotate adds log_event_prob, probable_cause,
-                // probable_cause_freq, max_freq. The is_anomaly field is a custom addition
-                // for convenience.
+                ffi_log!(debug, "FFI: Building annotated output");
                 let mut output_fields = schema.fields().to_vec();
                 output_fields.push(Arc::new(Field::new("is_anomaly", DataType::Boolean, true)));
                 output_fields.push(Arc::new(Field::new(
@@ -1339,23 +2107,51 @@ impl TableFunction for AnomalyDetector {
                 self.create_annotated_output(&anomaly_records, &input, output_schema)
             }
             "remove" | "rm" => {
-                // Remove anomalous events (for IQR method)
-                // Returns normal events (non-anomalies), removes outliers
-                // "rm" is the abbreviation for "remove"
+                ffi_log!(
+                    debug,
+                    "FFI: Building remove output - removing anomalous events"
+                );
                 self.create_remove_output(&anomaly_records, &input)
             }
             "transform" | "tf" => {
-                // Transform outlier values (for IQR method)
-                // Truncates outlying values to the threshold
-                // "tf" is the abbreviation for "transform"
+                ffi_log!(
+                    debug,
+                    "FFI: Building transform output - truncating outlier values"
+                );
                 self.create_transform_output(&anomaly_records, &input)
             }
             _ => {
-                // filter (default for histogram/zscore)
-                // Filter anomalies and create output
+                ffi_log!(debug, "FFI: Building filter output (default action)");
                 self.create_filter_output(&anomaly_records, &input)
             }
+        };
+
+        let action_time = action_start.elapsed();
+        ffi_log!(
+            debug,
+            "FFI: Action processing completed in {:?}ms",
+            action_time.as_millis()
+        );
+
+        match &result {
+            Ok(Some(batch)) => {
+                ffi_log!(
+                    debug,
+                    "FFI: Success - Output: {} rows, {} columns",
+                    batch.num_rows(),
+                    batch.num_columns()
+                );
+            }
+            Ok(None) => {
+                ffi_log!(debug, "FFI: Success - Output batch is None");
+            }
+            Err(e) => {
+                ffi_log!(error, "FFI: Error in action processing: {:?}", e);
+            }
         }
+
+        ffi_log_exit!("AnomalyDetector::process");
+        result
     }
 }
 

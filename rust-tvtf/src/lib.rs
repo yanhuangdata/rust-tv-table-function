@@ -11,8 +11,20 @@ pub mod funcs;
 #[allow(clippy::all)]
 mod zngur_generated;
 
+/// Initialize the FFI logger and log the initialization event
+fn ensure_logger_initialized() {
+    // Initialize logger from anomalydetection module
+    crate::funcs::anomalydetection::init_ffi_logger();
+}
+
 pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
-    Ok(vec![
+    // Initialize logger on first call
+    ensure_logger_initialized();
+
+    log::info!("[FFI ENTRY] get_function_registries() called");
+    log::debug!("[FFI] Building function registry list...");
+
+    let result = Ok(vec![
         FunctionRegistry::builder()
             .name("addtotals")
             .init(Arc::new(|ctx| {
@@ -132,7 +144,24 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
             )
             .build()
             .context("create `anomalydetection` registry failed")?,
-    ])
+    ]);
+
+    match &result {
+        Ok(registries) => {
+            log::info!(
+                "[FFI] get_function_registries() success - {} registries",
+                registries.len()
+            );
+            for (i, reg) in registries.iter().enumerate() {
+                log::debug!("[FFI]   Registry[{}]: name={}", i, reg.name());
+            }
+        }
+        Err(e) => {
+            log::error!("[FFI] get_function_registries() failed: {:?}", e);
+        }
+    }
+
+    result
 }
 
 pub fn get_external_dir() -> Option<PathBuf> {
