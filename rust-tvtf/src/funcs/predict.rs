@@ -832,6 +832,43 @@ impl Predict {
 
         let data_type = array.data_type();
 
+        // Handle Arrow Timestamp types (Microsecond, Nanosecond, Millisecond, Second)
+        if let DataType::Timestamp(unit, _tz) = data_type {
+            use arrow::array::{
+                TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+                TimestampSecondArray,
+            };
+            use arrow::datatypes::TimeUnit;
+
+            match unit {
+                TimeUnit::Microsecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>()?;
+                    if arr.is_valid(idx) {
+                        return Some(arr.value(idx)); // Returns microseconds
+                    }
+                }
+                TimeUnit::Nanosecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampNanosecondArray>()?;
+                    if arr.is_valid(idx) {
+                        return Some(arr.value(idx) / 1000); // Convert nanoseconds to microseconds
+                    }
+                }
+                TimeUnit::Millisecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>()?;
+                    if arr.is_valid(idx) {
+                        return Some(arr.value(idx) * 1000); // Convert milliseconds to microseconds
+                    }
+                }
+                TimeUnit::Second => {
+                    let arr = array.as_any().downcast_ref::<TimestampSecondArray>()?;
+                    if arr.is_valid(idx) {
+                        return Some(arr.value(idx) * 1_000_000); // Convert seconds to microseconds
+                    }
+                }
+            }
+            return None;
+        }
+
         // Try Int64 first - only if the array is actually Int64
         if matches!(data_type, DataType::Int64) {
             let arr = array.as_primitive::<arrow::datatypes::Int64Type>();
@@ -968,11 +1005,15 @@ impl Predict {
         None
     }
 
-    /// Check if an array contains timestamps (Int64, Float64, or Utf8 string format)
+    /// Check if an array contains timestamps (Int64, Float64, Utf8 string format, or Arrow Timestamp)
     fn is_timestamp_type(array: &ArrayRef) -> bool {
         matches!(
             array.data_type(),
-            DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::LargeUtf8
+            DataType::Int64
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Timestamp(_, _)
         )
     }
 
@@ -1219,6 +1260,67 @@ impl Predict {
         );
 
         match original_type {
+            // Handle Arrow Timestamp types
+            DataType::Timestamp(unit, tz) => {
+                use arrow::array::{
+                    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+                    TimestampSecondArray,
+                };
+                use arrow::datatypes::TimeUnit;
+
+                predict_log!(
+                    debug,
+                    "        Creating Timestamp array with unit={:?}, tz={:?}",
+                    unit,
+                    tz
+                );
+
+                match unit {
+                    TimeUnit::Microsecond => {
+                        // timestamps are already in microseconds
+                        let arr = TimestampMicrosecondArray::from(timestamps.to_vec());
+                        // If there's a timezone, we need to create with timezone
+                        if let Some(tz_str) = tz {
+                            Ok(Arc::new(arr.with_timezone(tz_str.clone())) as ArrayRef)
+                        } else {
+                            Ok(Arc::new(arr) as ArrayRef)
+                        }
+                    }
+                    TimeUnit::Nanosecond => {
+                        // Convert microseconds to nanoseconds
+                        let ns_timestamps: Vec<i64> =
+                            timestamps.iter().map(|ts| ts * 1000).collect();
+                        let arr = TimestampNanosecondArray::from(ns_timestamps);
+                        if let Some(tz_str) = tz {
+                            Ok(Arc::new(arr.with_timezone(tz_str.clone())) as ArrayRef)
+                        } else {
+                            Ok(Arc::new(arr) as ArrayRef)
+                        }
+                    }
+                    TimeUnit::Millisecond => {
+                        // Convert microseconds to milliseconds
+                        let ms_timestamps: Vec<i64> =
+                            timestamps.iter().map(|ts| ts / 1000).collect();
+                        let arr = TimestampMillisecondArray::from(ms_timestamps);
+                        if let Some(tz_str) = tz {
+                            Ok(Arc::new(arr.with_timezone(tz_str.clone())) as ArrayRef)
+                        } else {
+                            Ok(Arc::new(arr) as ArrayRef)
+                        }
+                    }
+                    TimeUnit::Second => {
+                        // Convert microseconds to seconds
+                        let s_timestamps: Vec<i64> =
+                            timestamps.iter().map(|ts| ts / 1_000_000).collect();
+                        let arr = TimestampSecondArray::from(s_timestamps);
+                        if let Some(tz_str) = tz {
+                            Ok(Arc::new(arr.with_timezone(tz_str.clone())) as ArrayRef)
+                        } else {
+                            Ok(Arc::new(arr) as ArrayRef)
+                        }
+                    }
+                }
+            }
             DataType::Int64 => {
                 predict_log!(debug, "        Creating Int64 array");
                 Ok(Arc::new(arrow::array::Int64Array::from(timestamps.to_vec())) as ArrayRef)
@@ -1287,6 +1389,11 @@ impl Predict {
                 Ok(Arc::new(arrow::array::StringArray::from(string_values)) as ArrayRef)
             }
             _ => {
+                predict_log!(
+                    warn,
+                    "        Unknown data type {:?}, defaulting to Int64",
+                    original_type
+                );
                 // Default to Int64
                 Ok(Arc::new(arrow::array::Int64Array::from(timestamps.to_vec())) as ArrayRef)
             }
