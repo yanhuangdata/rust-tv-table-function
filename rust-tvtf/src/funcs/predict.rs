@@ -14,6 +14,22 @@ use rust_tvtf_api::arg::{Arg, Args};
 
 use predict::statespace::prediction_interval;
 
+/// Logging macros for predict module
+macro_rules! predict_log {
+    (debug, $($arg:tt)*) => {
+        log::debug!("[PREDICT:{}:{}] {}", file!(), line!(), format!($($arg)*))
+    };
+    (info, $($arg:tt)*) => {
+        log::info!("[PREDICT:{}:{}] {}", file!(), line!(), format!($($arg)*))
+    };
+    (warn, $($arg:tt)*) => {
+        log::warn!("[PREDICT:{}:{}] {}", file!(), line!(), format!($($arg)*))
+    };
+    (error, $($arg:tt)*) => {
+        log::error!("[PREDICT:{}:{}] {}", file!(), line!(), format!($($arg)*))
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Algorithm {
     #[default]
@@ -83,6 +99,12 @@ pub struct Predict {
 
 impl Predict {
     pub fn new(_: Option<Args>, named_arguments: Vec<(String, Arg)>) -> Result<Self> {
+        predict_log!(info, "=== Predict::new() called ===");
+        predict_log!(info, "Named arguments count: {}", named_arguments.len());
+        for (name, arg) in &named_arguments {
+            predict_log!(debug, "  Argument: {} = {:?}", name, arg);
+        }
+
         // Parse named arguments
         let mut algorithm = Algorithm::default();
         let mut period = None;
@@ -217,6 +239,27 @@ impl Predict {
         // Set upper/lower names for output columns
         let (upper_names, lower_names, ui_upper_names, ui_lower_names, ui_predict_names) =
             Self::set_upper_lower_names(&field_configs);
+
+        predict_log!(info, "=== Predict instance created ===");
+        predict_log!(info, "  field_configs count: {}", field_configs.len());
+        for (i, config) in field_configs.iter().enumerate() {
+            predict_log!(
+                info,
+                "    Field[{}]: name={}, algorithm={:?}, period={:?}, is_count={}",
+                i,
+                config.field_name,
+                config.algorithm,
+                config.period,
+                config.is_count
+            );
+        }
+        predict_log!(info, "  future_timespan: {}", future_timespan);
+        predict_log!(info, "  holdback: {}", holdback);
+        predict_log!(info, "  upper_confidence: {}", upper_confidence);
+        predict_log!(info, "  lower_confidence: {}", lower_confidence);
+        predict_log!(info, "  nonnegative: {}", nonnegative);
+        predict_log!(info, "  data_start: {}", data_start);
+        predict_log!(info, "  period: {:?}", period);
 
         Ok(Predict {
             field_configs,
@@ -610,20 +653,36 @@ impl Predict {
         schema: &Schema,
         batches: &[RecordBatch],
     ) -> Result<Option<(TimeSpan, usize)>> {
+        predict_log!(info, "  === detect_time_span() ===");
+
         // Look for _span, _spandays, and _time fields
         let span_field_idx = schema.fields().iter().position(|f| f.name() == "_span");
         let spandays_field_idx = schema.fields().iter().position(|f| f.name() == "_spandays");
         let time_field_idx = schema.fields().iter().position(|f| f.name() == "_time");
 
+        predict_log!(info, "    _span field index: {:?}", span_field_idx);
+        predict_log!(info, "    _spandays field index: {:?}", spandays_field_idx);
+        predict_log!(info, "    _time field index: {:?}", time_field_idx);
+
         // Try to get span from _span field
         let mut span_seconds: Option<i64> = None;
         if let Some(idx) = span_field_idx {
+            predict_log!(debug, "    Extracting _span value from index {}", idx);
             // Get the first non-null value from _span
             for batch in batches {
                 let array = batch.column(idx);
+                predict_log!(
+                    debug,
+                    "      _span array type: {:?}, len: {}",
+                    array.data_type(),
+                    array.len()
+                );
                 if let Some(val) = Self::extract_single_i64_from_array(array, 0) {
+                    predict_log!(info, "    _span value extracted: {}", val);
                     span_seconds = Some(val);
                     break;
+                } else {
+                    predict_log!(warn, "    Failed to extract _span value");
                 }
             }
         }
@@ -631,22 +690,37 @@ impl Predict {
         // Try to get spandays from _spandays field
         let mut spandays: Option<i64> = None;
         if let Some(idx) = spandays_field_idx {
+            predict_log!(debug, "    Extracting _spandays value from index {}", idx);
             for batch in batches {
                 let array = batch.column(idx);
+                predict_log!(
+                    debug,
+                    "      _spandays array type: {:?}, len: {}",
+                    array.data_type(),
+                    array.len()
+                );
                 if let Some(val) = Self::extract_single_i64_from_array(array, 0) {
+                    predict_log!(info, "    _spandays value extracted: {}", val);
                     spandays = Some(val);
                     break;
+                } else {
+                    predict_log!(warn, "    Failed to extract _spandays value");
                 }
             }
         }
 
+        predict_log!(info, "    span_seconds from _span: {:?}", span_seconds);
+        predict_log!(info, "    spandays from _spandays: {:?}", spandays);
+
         // If we have span info, return it
         if span_seconds.is_some() || spandays.is_some() {
             let spanmonths = spandays.and_then(|d| if d >= 28 { Some(d / 28) } else { None });
+            predict_log!(info, "    Computed spanmonths: {:?}", spanmonths);
 
             let time_idx = time_field_idx
                 .ok_or_else(|| anyhow!("_span or _spandays is set but _time field is missing"))?;
 
+            predict_log!(info, "    Returning TimeSpan with explicit span info");
             return Ok(Some((
                 TimeSpan {
                     span_seconds: span_seconds.unwrap_or(0),
@@ -659,23 +733,39 @@ impl Predict {
 
         // Calculate span from _time field difference
         if let Some(time_idx) = time_field_idx {
+            predict_log!(
+                info,
+                "    No _span/_spandays, computing from _time differences"
+            );
             // Get first two valid timestamps
             let mut first_time: Option<i64> = None;
             let mut second_time: Option<i64> = None;
 
             for batch in batches {
                 let array = batch.column(time_idx);
+                predict_log!(
+                    debug,
+                    "      _time array type: {:?}, len: {}",
+                    array.data_type(),
+                    array.len()
+                );
+
                 for i in 0..batch.num_rows().min(10) {
                     // Try to parse as int64 first (Unix timestamp)
                     if let Some(ts) = Self::extract_single_i64_from_array(array, i) {
+                        predict_log!(debug, "        _time[{}] = {}", i, ts);
                         if first_time.is_none() {
                             first_time = Some(ts);
+                            predict_log!(info, "      first_time set to: {}", ts);
                         } else if let Some(ref first) = first_time
                             && ts != *first
                         {
                             second_time = Some(ts);
+                            predict_log!(info, "      second_time set to: {}", ts);
                             break;
                         }
+                    } else {
+                        predict_log!(debug, "        _time[{}] = NULL or unparseable", i);
                     }
                 }
                 if second_time.is_some() {
@@ -683,16 +773,32 @@ impl Predict {
                 }
             }
 
+            predict_log!(
+                info,
+                "    first_time: {:?}, second_time: {:?}",
+                first_time,
+                second_time
+            );
+
             if let (Some(t1), Some(t2)) = (first_time, second_time) {
                 let span = (t2 - t1).abs();
+                predict_log!(info, "    Raw span (t2 - t1): {}", span);
 
                 // Normalize span to seconds if timestamps are in microseconds
                 // Timestamps > 32503680000 are likely in microseconds (year 3000+ in seconds)
-                let span_in_seconds = if t1.abs() > 32503680000 {
+                let is_microseconds = t1.abs() > 32503680000;
+                predict_log!(
+                    info,
+                    "    Timestamp appears to be microseconds: {}",
+                    is_microseconds
+                );
+
+                let span_in_seconds = if is_microseconds {
                     span / 1_000_000 // Convert from microseconds to seconds
                 } else {
                     span
                 };
+                predict_log!(info, "    Normalized span_in_seconds: {}", span_in_seconds);
 
                 return Ok(Some((
                     TimeSpan {
@@ -702,10 +808,18 @@ impl Predict {
                     },
                     time_idx,
                 )));
+            } else {
+                predict_log!(
+                    warn,
+                    "    Could not find two distinct timestamps to compute span"
+                );
             }
+        } else {
+            predict_log!(warn, "    _time field not found in schema");
         }
 
         // No time span detected
+        predict_log!(warn, "    No time span could be detected");
         Ok(None)
     }
 
@@ -716,24 +830,28 @@ impl Predict {
             return None;
         }
 
+        let data_type = array.data_type();
+
         // Try Int64 first - only if the array is actually Int64
-        if matches!(array.data_type(), DataType::Int64) {
+        if matches!(data_type, DataType::Int64) {
             let arr = array.as_primitive::<arrow::datatypes::Int64Type>();
             if arr.is_valid(idx) {
                 return Some(arr.value(idx));
             }
+            return None;
         }
 
         // Try Float64 - only if the array is actually Float64
-        if matches!(array.data_type(), DataType::Float64) {
+        if matches!(data_type, DataType::Float64) {
             let arr = array.as_primitive::<arrow::datatypes::Float64Type>();
             if arr.is_valid(idx) {
                 return Some(arr.value(idx) as i64);
             }
+            return None;
         }
 
         // Try to parse string as timestamp (ISO8601 or numeric)
-        if matches!(array.data_type(), DataType::Utf8) {
+        if matches!(data_type, DataType::Utf8) {
             let arr = array.as_string::<i32>();
             if arr.is_valid(idx) {
                 let s = arr.value(idx);
@@ -749,9 +867,49 @@ impl Predict {
                 if let Some(ts) = Self::parse_iso8601_timestamp(s) {
                     return Some(ts);
                 }
+                // Log if we couldn't parse the string
+                log::debug!(
+                    "[PREDICT] Failed to parse timestamp string at idx {}: '{}'",
+                    idx,
+                    s
+                );
             }
+            return None;
         }
 
+        // Try LargeUtf8 as well
+        if matches!(data_type, DataType::LargeUtf8) {
+            let arr = array.as_string::<i64>();
+            if arr.is_valid(idx) {
+                let s = arr.value(idx);
+                // Try to parse as Unix timestamp string (numeric)
+                if let Ok(ts) = s.parse::<i64>() {
+                    return Some(ts);
+                }
+                // Try to parse as float
+                if let Ok(ts) = s.parse::<f64>() {
+                    return Some(ts as i64);
+                }
+                // Try to parse ISO8601 format
+                if let Some(ts) = Self::parse_iso8601_timestamp(s) {
+                    return Some(ts);
+                }
+                // Log if we couldn't parse the string
+                log::debug!(
+                    "[PREDICT] Failed to parse LargeUtf8 timestamp string at idx {}: '{}'",
+                    idx,
+                    s
+                );
+            }
+            return None;
+        }
+
+        // Log unsupported data type
+        log::debug!(
+            "[PREDICT] Unsupported data type for timestamp extraction: {:?} at idx {}",
+            data_type,
+            idx
+        );
         None
     }
 
@@ -829,12 +987,37 @@ impl Predict {
         future_timespan: usize,
         _last_valid_idx: usize,
     ) -> Result<ArrayRef> {
+        predict_log!(info, "    === extend_time_column() ===");
+        predict_log!(
+            info,
+            "      time_array type: {:?}, len: {}",
+            time_array.data_type(),
+            time_array.len()
+        );
+        predict_log!(
+            info,
+            "      time_span.span_seconds: {}",
+            time_span.span_seconds
+        );
+        predict_log!(info, "      time_span.spandays: {:?}", time_span.spandays);
+        predict_log!(
+            info,
+            "      time_span.spanmonths: {:?}",
+            time_span.spanmonths
+        );
+        predict_log!(info, "      future_timespan: {}", future_timespan);
+
         if future_timespan == 0 {
+            predict_log!(info, "      future_timespan is 0, returning empty array");
             return Ok(arrow::array::new_null_array(time_array.data_type(), 0));
         }
 
         // Check if this is a supported timestamp type
         if !Self::is_timestamp_type(time_array) {
+            predict_log!(
+                warn,
+                "      Unsupported timestamp type, returning null array"
+            );
             return Ok(arrow::array::new_null_array(
                 time_array.data_type(),
                 future_timespan,
@@ -842,9 +1025,20 @@ impl Predict {
         }
 
         // Find the last valid timestamp by searching backwards
+        predict_log!(
+            debug,
+            "      Searching for last valid timestamp (backwards from index {})",
+            time_array.len().saturating_sub(1)
+        );
         let mut last_timestamp: Option<i64> = None;
         for i in (0..time_array.len()).rev() {
             if let Some(ts) = Self::extract_single_i64_from_array(time_array, i) {
+                predict_log!(
+                    info,
+                    "      Found last valid timestamp at index {}: {}",
+                    i,
+                    ts
+                );
                 last_timestamp = Some(ts);
                 break;
             }
@@ -853,6 +1047,10 @@ impl Predict {
         let last_timestamp = match last_timestamp {
             Some(ts) => ts,
             None => {
+                predict_log!(
+                    error,
+                    "      No valid timestamp found in array, returning null array"
+                );
                 return Ok(arrow::array::new_null_array(
                     time_array.data_type(),
                     future_timespan,
@@ -868,13 +1066,23 @@ impl Predict {
         } else {
             last_timestamp
         };
+        predict_log!(info, "      last_timestamp: {} (raw)", last_timestamp);
+        predict_log!(info, "      is_microseconds: {}", is_microseconds);
+        predict_log!(info, "      last_ts_seconds: {}", last_ts_seconds);
 
         // span_seconds is always in seconds (normalized in detect_time_span)
         let span_seconds = time_span.span_seconds;
+        predict_log!(info, "      Using span_seconds: {}", span_seconds);
 
         // Get the hour from the last timestamp (for DST handling)
         let last_datetime = DateTime::<Utc>::from_timestamp(last_ts_seconds, 0).unwrap_or_default();
         let last_hour = last_datetime.hour() as i64;
+        predict_log!(
+            debug,
+            "      last_datetime: {}, last_hour: {}",
+            last_datetime,
+            last_hour
+        );
 
         // Calculate the span increment and generate future timestamps
         let mut future_timestamps: Vec<i64> = Vec::with_capacity(future_timespan);
@@ -883,10 +1091,17 @@ impl Predict {
         // DST handling: if spandays is set, we need to handle DST transitions
         // The goal is to keep the same "wall clock time" (e.g., 12AM) even when DST changes
         let handle_dst = time_span.spandays.is_some();
+        predict_log!(debug, "      handle_dst: {}", handle_dst);
 
-        for _ in 0..future_timespan {
+        predict_log!(
+            info,
+            "      Generating {} future timestamps...",
+            future_timespan
+        );
+        for i in 0..future_timespan {
             // Use chrono to correctly handle month/day increments
             if let Some(months) = time_span.spanmonths {
+                predict_log!(debug, "        Using monthly increment: {} months", months);
                 // Monthly increment using chrono (handles month boundaries correctly)
                 if let Some(datetime) = DateTime::<Utc>::from_timestamp(current_ts, 0) {
                     // Use Months struct with checked_add_months
@@ -905,6 +1120,7 @@ impl Predict {
                     }
                 }
             } else if let Some(days) = time_span.spandays {
+                predict_log!(debug, "        Using daily increment: {} days", days);
                 // Daily increment - needs DST handling
                 current_ts += days * 24 * 3600;
 
@@ -935,6 +1151,11 @@ impl Predict {
                 }
             } else {
                 // Use the calculated span (in seconds)
+                predict_log!(
+                    debug,
+                    "        Using span_seconds increment: {} seconds",
+                    span_seconds
+                );
                 current_ts += span_seconds;
             }
 
@@ -945,14 +1166,42 @@ impl Predict {
                 current_ts
             };
             future_timestamps.push(ts_to_push);
+
+            if i < 10 || i == future_timespan - 1 {
+                predict_log!(
+                    info,
+                    "        future_timestamp[{}] = {} (current_ts_seconds={})",
+                    i,
+                    ts_to_push,
+                    current_ts
+                );
+            }
         }
 
+        predict_log!(
+            info,
+            "      Generated {} future timestamps",
+            future_timestamps.len()
+        );
+
         // Create the output array based on the original type - ONLY future timestamps
-        Self::create_time_array_from_timestamps(
+        let result = Self::create_time_array_from_timestamps(
             time_array.data_type(),
             &future_timestamps,
             Some(time_array),
-        )
+        );
+
+        match &result {
+            Ok(arr) => predict_log!(
+                info,
+                "      Created output array: type={:?}, len={}",
+                arr.data_type(),
+                arr.len()
+            ),
+            Err(e) => predict_log!(error, "      Failed to create output array: {:?}", e),
+        }
+
+        result
     }
 
     /// Create time array from timestamps, matching the original data type
@@ -962,15 +1211,25 @@ impl Predict {
         timestamps: &[i64],
         original_array: Option<&ArrayRef>,
     ) -> Result<ArrayRef> {
+        predict_log!(
+            debug,
+            "      create_time_array_from_timestamps: type={:?}, count={}",
+            original_type,
+            timestamps.len()
+        );
+
         match original_type {
             DataType::Int64 => {
+                predict_log!(debug, "        Creating Int64 array");
                 Ok(Arc::new(arrow::array::Int64Array::from(timestamps.to_vec())) as ArrayRef)
             }
             DataType::Float64 => {
+                predict_log!(debug, "        Creating Float64 array");
                 let values: Vec<f64> = timestamps.iter().map(|v| *v as f64).collect();
                 Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
             }
             DataType::Utf8 | DataType::LargeUtf8 => {
+                predict_log!(debug, "        Creating String array from timestamps");
                 // Try to extract timezone offset from original array
                 let tz_offset = original_array.and_then(|arr| {
                     if matches!(arr.data_type(), DataType::Utf8) {
@@ -1077,13 +1336,30 @@ impl Predict {
         future_timespan: usize,
         _num_rows: usize,
     ) -> Result<ArrayRef> {
+        predict_log!(info, "    === extend_time_column_auto() ===");
+        predict_log!(
+            info,
+            "      time_array type: {:?}, len: {}",
+            time_array.data_type(),
+            time_array.len()
+        );
+        predict_log!(info, "      future_timespan: {}", future_timespan);
+
         let array_len = time_array.len();
         if future_timespan == 0 || array_len == 0 {
+            predict_log!(
+                info,
+                "      Returning empty array (future_timespan=0 or array empty)"
+            );
             return Ok(arrow::array::new_null_array(time_array.data_type(), 0));
         }
 
         // Check if this is a supported timestamp type
         if !Self::is_timestamp_type(time_array) {
+            predict_log!(
+                warn,
+                "      Unsupported timestamp type, returning null array"
+            );
             return Ok(arrow::array::new_null_array(
                 time_array.data_type(),
                 future_timespan,
@@ -1091,43 +1367,96 @@ impl Predict {
         }
 
         // Try to extract timestamps and compute span
+        predict_log!(debug, "      Extracting timestamps from array...");
         let mut timestamps: Vec<Option<i64>> = Vec::new();
         for i in 0..array_len {
-            timestamps.push(Self::extract_single_i64_from_array(time_array, i));
+            let ts = Self::extract_single_i64_from_array(time_array, i);
+            if i < 5 || i == array_len - 1 {
+                predict_log!(debug, "        timestamp[{}] = {:?}", i, ts);
+            }
+            timestamps.push(ts);
         }
 
         // Find two consecutive valid timestamps to compute span
+        predict_log!(debug, "      Finding span from consecutive timestamps...");
         let mut span: Option<i64> = None;
         for i in 0..timestamps.len().saturating_sub(1) {
             if let (Some(t1), Some(t2)) = (timestamps[i], timestamps[i + 1]) {
                 span = Some((t2 - t1).abs());
+                predict_log!(
+                    info,
+                    "      Found span from timestamps[{}]={} and timestamps[{}]={}: span={}",
+                    i,
+                    t1,
+                    i + 1,
+                    t2,
+                    span.unwrap()
+                );
                 break;
             }
         }
 
         // Get the last valid timestamp
         let last_timestamp = timestamps.iter().rev().find_map(|t| *t);
+        predict_log!(info, "      last_timestamp: {:?}", last_timestamp);
+        predict_log!(info, "      computed span: {:?}", span);
 
         match (span, last_timestamp) {
             (Some(time_span), Some(last_ts)) => {
+                predict_log!(
+                    info,
+                    "      Generating future timestamps with span={}",
+                    time_span
+                );
                 // Generate future timestamps only
                 let mut future_timestamps: Vec<i64> = Vec::with_capacity(future_timespan);
                 let mut current_ts = last_ts;
 
-                for _ in 0..future_timespan {
+                for i in 0..future_timespan {
                     current_ts += time_span;
                     future_timestamps.push(current_ts);
+                    if i < 10 || i == future_timespan - 1 {
+                        predict_log!(info, "        future_timestamp[{}] = {}", i, current_ts);
+                    }
                 }
 
+                predict_log!(
+                    info,
+                    "      Generated {} future timestamps",
+                    future_timestamps.len()
+                );
+
                 // Create array based on original type - ONLY the future timestamps
-                Self::create_time_array_from_timestamps(
+                let result = Self::create_time_array_from_timestamps(
                     time_array.data_type(),
                     &future_timestamps,
                     Some(time_array),
-                )
+                );
+
+                match &result {
+                    Ok(arr) => predict_log!(
+                        info,
+                        "      Created output array: type={:?}, len={}",
+                        arr.data_type(),
+                        arr.len()
+                    ),
+                    Err(e) => predict_log!(error, "      Failed to create output array: {:?}", e),
+                }
+
+                result
             }
             _ => {
                 // Cannot compute span, return null array
+                predict_log!(
+                    error,
+                    "      Cannot compute span or find last timestamp, returning null array"
+                );
+                predict_log!(
+                    error,
+                    "        span: {:?}, last_timestamp: {:?}",
+                    span,
+                    last_timestamp
+                );
                 Ok(arrow::array::new_null_array(
                     time_array.data_type(),
                     future_timespan,
@@ -1171,31 +1500,130 @@ impl Predict {
 
 impl TableFunction for Predict {
     fn process(&mut self, input: RecordBatch) -> Result<Option<RecordBatch>> {
+        predict_log!(info, "=== Predict::process() called ===");
+        predict_log!(
+            info,
+            "  Input batch: {} rows, {} columns",
+            input.num_rows(),
+            input.num_columns()
+        );
+
+        // Log schema info
+        let schema = input.schema();
+        predict_log!(debug, "  Schema fields:");
+        for (i, field) in schema.fields().iter().enumerate() {
+            predict_log!(
+                debug,
+                "    Field[{}]: name='{}', type={:?}, nullable={}",
+                i,
+                field.name(),
+                field.data_type(),
+                field.is_nullable()
+            );
+        }
+
+        // Log _time column info if present
+        if let Some(time_idx) = schema.fields().iter().position(|f| f.name() == "_time") {
+            let time_array = input.column(time_idx);
+            predict_log!(info, "  _time column found at index {}", time_idx);
+            predict_log!(info, "    _time data type: {:?}", time_array.data_type());
+            predict_log!(info, "    _time array length: {}", time_array.len());
+            predict_log!(info, "    _time null count: {}", time_array.null_count());
+
+            // Log first few _time values
+            let sample_count = std::cmp::min(5, time_array.len());
+            for i in 0..sample_count {
+                if let Some(ts) = Self::extract_single_i64_from_array(time_array, i) {
+                    predict_log!(debug, "    _time[{}] = {} (raw i64)", i, ts);
+                } else {
+                    predict_log!(debug, "    _time[{}] = NULL or unparseable", i);
+                }
+            }
+        } else {
+            predict_log!(warn, "  _time column NOT FOUND in schema!");
+        }
+
+        // Log _span and _spandays if present
+        if let Some(span_idx) = schema.fields().iter().position(|f| f.name() == "_span") {
+            let span_array = input.column(span_idx);
+            predict_log!(
+                info,
+                "  _span column found at index {}, type={:?}",
+                span_idx,
+                span_array.data_type()
+            );
+            if let Some(val) = Self::extract_single_i64_from_array(span_array, 0) {
+                predict_log!(info, "    _span[0] = {}", val);
+            }
+        } else {
+            predict_log!(debug, "  _span column not found (will auto-detect span)");
+        }
+
+        if let Some(spandays_idx) = schema.fields().iter().position(|f| f.name() == "_spandays") {
+            let spandays_array = input.column(spandays_idx);
+            predict_log!(
+                info,
+                "  _spandays column found at index {}, type={:?}",
+                spandays_idx,
+                spandays_array.data_type()
+            );
+            if let Some(val) = Self::extract_single_i64_from_array(spandays_array, 0) {
+                predict_log!(info, "    _spandays[0] = {}", val);
+            }
+        } else {
+            predict_log!(debug, "  _spandays column not found");
+        }
+
+        predict_log!(info, "  Buffering batch #{}", self.data_buffer.len() + 1);
+
         // Buffer all data for time series analysis
         self.data_buffer.push(input);
         Ok(None)
     }
 
     fn finalize(&mut self) -> Result<Option<RecordBatch>> {
+        predict_log!(info, "=== Predict::finalize() called ===");
+        predict_log!(
+            info,
+            "  data_buffer size: {} batches",
+            self.data_buffer.len()
+        );
+
         if self.data_buffer.is_empty() {
+            predict_log!(warn, "  data_buffer is empty, returning None");
             return Ok(None);
         }
 
         // Validate parameters before processing (matching Python's lastCheck behavior)
+        predict_log!(debug, "  Validating parameters...");
         self.validate_parameters()?;
+        predict_log!(debug, "  Parameters validated successfully");
 
         // Concatenate all buffered batches
         let mut all_rows = 0;
-        for batch in &self.data_buffer {
+        for (i, batch) in self.data_buffer.iter().enumerate() {
+            predict_log!(debug, "  Batch[{}]: {} rows", i, batch.num_rows());
             all_rows += batch.num_rows();
         }
+        predict_log!(info, "  Total rows to process: {}", all_rows);
 
         if all_rows == 0 {
+            predict_log!(warn, "  all_rows is 0, returning None");
             return Ok(None);
         }
 
         let first_batch = &self.data_buffer[0];
         let schema = first_batch.schema();
+        predict_log!(info, "  Schema: {} fields", schema.fields().len());
+        for (i, field) in schema.fields().iter().enumerate() {
+            predict_log!(
+                debug,
+                "    Field[{}]: '{}' type={:?}",
+                i,
+                field.name(),
+                field.data_type()
+            );
+        }
 
         // First, concatenate all batches into a single batch
         let mut concatenated_columns: Vec<ArrayRef> = Vec::new();
@@ -1219,7 +1647,14 @@ impl TableFunction for Predict {
 
         // Sort by _time column (ascending - earliest first) before prediction
         if let Some(time_idx) = schema.fields().iter().position(|f| f.name() == "_time") {
+            predict_log!(info, "  Sorting by _time column at index {}", time_idx);
             let time_array = combined_batch.column(time_idx);
+            predict_log!(
+                debug,
+                "    _time array type: {:?}, len: {}",
+                time_array.data_type(),
+                time_array.len()
+            );
 
             // Sort in ascending order (earliest time first)
             let sort_options = SortOptions {
@@ -1229,6 +1664,11 @@ impl TableFunction for Predict {
 
             let indices = sort_to_indices(time_array.as_ref(), Some(sort_options), None)
                 .context("Failed to sort by _time")?;
+            predict_log!(
+                debug,
+                "    Sort indices computed, length: {}",
+                indices.len()
+            );
 
             // Reorder all columns based on sorted indices
             let mut sorted_columns: Vec<ArrayRef> = Vec::new();
@@ -1243,21 +1683,72 @@ impl TableFunction for Predict {
 
             // Update concatenated_columns with sorted data
             concatenated_columns = combined_batch.columns().to_vec();
+
+            // Log sorted _time values
+            let sorted_time = combined_batch.column(time_idx);
+            predict_log!(info, "    Sorted _time values (first 5):");
+            for i in 0..std::cmp::min(5, sorted_time.len()) {
+                if let Some(ts) = Self::extract_single_i64_from_array(sorted_time, i) {
+                    predict_log!(info, "      _time[{}] = {}", i, ts);
+                } else {
+                    predict_log!(info, "      _time[{}] = NULL", i);
+                }
+            }
+            predict_log!(info, "    Sorted _time values (last 5):");
+            let start_idx = sorted_time.len().saturating_sub(5);
+            for i in start_idx..sorted_time.len() {
+                if let Some(ts) = Self::extract_single_i64_from_array(sorted_time, i) {
+                    predict_log!(info, "      _time[{}] = {}", i, ts);
+                } else {
+                    predict_log!(info, "      _time[{}] = NULL", i);
+                }
+            }
+        } else {
+            predict_log!(warn, "  _time column NOT FOUND - cannot sort by time!");
         }
 
         // Update data_buffer with the sorted combined batch for time span detection
         self.data_buffer = vec![combined_batch.clone()];
 
         // Detect time span information (now from sorted data)
+        predict_log!(info, "  Detecting time span...");
         let time_span_info = self.detect_time_span(&schema, &self.data_buffer)?;
 
+        match &time_span_info {
+            Some((ts, idx)) => {
+                predict_log!(info, "  Time span detected:");
+                predict_log!(info, "    span_seconds: {}", ts.span_seconds);
+                predict_log!(info, "    spandays: {:?}", ts.spandays);
+                predict_log!(info, "    spanmonths: {:?}", ts.spanmonths);
+                predict_log!(info, "    time_column_index: {}", idx);
+            }
+            None => {
+                predict_log!(
+                    warn,
+                    "  No time span detected - will try auto-detection from _time column"
+                );
+            }
+        }
+
         // Extract time series data for each field and calculate beginning/missing_valued
+        predict_log!(
+            info,
+            "  Extracting time series data for {} fields",
+            self.field_configs.len()
+        );
         for config in &self.field_configs {
             let field_idx = schema
                 .fields()
                 .iter()
                 .position(|f| f.name().as_str() == config.field_name.as_str())
                 .ok_or_else(|| anyhow!("Field not found: {}", config.field_name))?;
+
+            predict_log!(
+                debug,
+                "    Processing field '{}' at index {}",
+                config.field_name,
+                field_idx
+            );
 
             // Extract values from the sorted combined batch
             let array = combined_batch.column(field_idx);
@@ -1268,6 +1759,20 @@ impl TableFunction for Predict {
             // Update the field config with the calculated beginning
             // Also check for missing values
             let missing_valued = self.calculate_missing_valued(&values);
+
+            predict_log!(debug, "      values count: {}", values.len());
+            predict_log!(debug, "      beginning (leading nulls): {}", beginning);
+            predict_log!(debug, "      has missing values: {}", missing_valued);
+
+            // Log sample values
+            let valid_count = values.iter().filter(|v| v.is_some()).count();
+            let null_count = values.iter().filter(|v| v.is_none()).count();
+            predict_log!(
+                debug,
+                "      valid values: {}, null values: {}",
+                valid_count,
+                null_count
+            );
 
             // Store in time_series_data
             self.time_series_data
@@ -1280,8 +1785,19 @@ impl TableFunction for Predict {
                 self.missing_valued = missing_valued;
             }
         }
+        predict_log!(
+            info,
+            "  Global beginning: {}, missing_valued: {}",
+            self.beginning,
+            self.missing_valued
+        );
 
         // Generate predictions for each field
+        predict_log!(
+            info,
+            "  Generating output columns with future_timespan={}",
+            self.future_timespan
+        );
         let mut output_columns: Vec<ArrayRef> = Vec::new();
         let mut output_fields: Vec<Field> = Vec::new();
 
@@ -1295,20 +1811,68 @@ impl TableFunction for Predict {
                 let is_time_column = field.name() == "_time";
 
                 let extension_array = if is_time_column {
+                    predict_log!(info, "  === Extending _time column ===");
+                    predict_log!(
+                        info,
+                        "    Original _time array length: {}",
+                        concatenated.len()
+                    );
+                    predict_log!(info, "    future_timespan to add: {}", self.future_timespan);
+
                     // Try to extend _time column with computed future timestamps
                     if let Some((time_span, time_idx)) = time_span_info.as_ref() {
+                        predict_log!(info, "    Using detected time span info");
+                        predict_log!(info, "      span_seconds: {}", time_span.span_seconds);
+                        predict_log!(info, "      spandays: {:?}", time_span.spandays);
                         // Use detected time span info
                         let last_valid_idx = all_rows.saturating_sub(1);
-                        self.extend_time_column(
+                        predict_log!(info, "      last_valid_idx: {}", last_valid_idx);
+
+                        let result = self.extend_time_column(
                             &concatenated,
                             time_span,
                             *time_idx,
                             self.future_timespan,
                             last_valid_idx,
-                        )?
+                        )?;
+
+                        predict_log!(
+                            info,
+                            "    extend_time_column returned array of length: {}",
+                            result.len()
+                        );
+                        // Log the extended timestamps
+                        for i in 0..std::cmp::min(result.len(), 10) {
+                            if let Some(ts) = Self::extract_single_i64_from_array(&result, i) {
+                                predict_log!(info, "      extended_time[{}] = {}", i, ts);
+                            } else {
+                                predict_log!(info, "      extended_time[{}] = NULL", i);
+                            }
+                        }
+                        result
                     } else {
+                        predict_log!(info, "    No time span info, using auto-detection");
                         // Try to compute time span directly from _time column
-                        self.extend_time_column_auto(&concatenated, self.future_timespan, all_rows)?
+                        let result = self.extend_time_column_auto(
+                            &concatenated,
+                            self.future_timespan,
+                            all_rows,
+                        )?;
+
+                        predict_log!(
+                            info,
+                            "    extend_time_column_auto returned array of length: {}",
+                            result.len()
+                        );
+                        // Log the extended timestamps
+                        for i in 0..std::cmp::min(result.len(), 10) {
+                            if let Some(ts) = Self::extract_single_i64_from_array(&result, i) {
+                                predict_log!(info, "      extended_time[{}] = {}", i, ts);
+                            } else {
+                                predict_log!(info, "      extended_time[{}] = NULL", i);
+                            }
+                        }
+                        result
                     }
                 } else if field.name() == "_span" || field.name() == "_spandays" {
                     // Keep _span and _spandays constant for future rows
@@ -1356,13 +1920,25 @@ impl TableFunction for Predict {
         }
 
         // Add prediction columns for each configured field
+        predict_log!(
+            info,
+            "  Adding prediction columns for {} fields",
+            self.field_configs.len()
+        );
         for config in &self.field_configs {
             let values = self
                 .time_series_data
                 .get(&config.field_name)
                 .ok_or_else(|| anyhow!("No data for field: {}", config.field_name))?;
 
+            predict_log!(
+                debug,
+                "    Predicting field '{}': {} values",
+                config.field_name,
+                values.len()
+            );
             let predictions = self.predict_field(values, config)?;
+            predict_log!(debug, "    Got {} predictions", predictions.len());
 
             // Ensure predictions match the length of input data
             let total_rows = all_rows + self.future_timespan;
@@ -1372,6 +1948,12 @@ impl TableFunction for Predict {
 
             // Pad if needed
             if predicted_values.len() < total_rows {
+                predict_log!(
+                    debug,
+                    "    Padding predictions from {} to {} rows",
+                    predicted_values.len(),
+                    total_rows
+                );
                 let last_pred = predicted_values.last().copied().unwrap_or(0.0);
                 let last_lower = lower_bounds.last().copied().unwrap_or(0.0);
                 let last_upper = upper_bounds.last().copied().unwrap_or(0.0);
@@ -1381,6 +1963,12 @@ impl TableFunction for Predict {
                     upper_bounds.push(last_upper);
                 }
             } else if predicted_values.len() > total_rows {
+                predict_log!(
+                    debug,
+                    "    Truncating predictions from {} to {} rows",
+                    predicted_values.len(),
+                    total_rows
+                );
                 predicted_values.truncate(total_rows);
                 lower_bounds.truncate(total_rows);
                 upper_bounds.truncate(total_rows);
@@ -1405,12 +1993,30 @@ impl TableFunction for Predict {
         }
 
         // Create output schema
-        let output_schema = Arc::new(Schema::new(output_fields));
+        let output_schema = Arc::new(Schema::new(output_fields.clone()));
+        predict_log!(info, "  Output schema: {} fields", output_fields.len());
+        for (i, field) in output_fields.iter().enumerate() {
+            predict_log!(
+                debug,
+                "    OutputField[{}]: '{}' type={:?}",
+                i,
+                field.name(),
+                field.data_type()
+            );
+        }
 
         // Ensure all columns have the same length
         let expected_len = output_columns[0].len();
-        for col in &output_columns {
+        predict_log!(info, "  Expected output length: {} rows", expected_len);
+        for (i, col) in output_columns.iter().enumerate() {
             if col.len() != expected_len {
+                predict_log!(
+                    error,
+                    "  Column[{}] length mismatch: expected {}, got {}",
+                    i,
+                    expected_len,
+                    col.len()
+                );
                 return Err(anyhow!(
                     "Column length mismatch: expected {}, got {}",
                     expected_len,
@@ -1421,6 +2027,65 @@ impl TableFunction for Predict {
 
         let output = RecordBatch::try_new(output_schema, output_columns)
             .context("Failed to create output RecordBatch")?;
+
+        predict_log!(info, "=== Predict::finalize() completed ===");
+        predict_log!(
+            info,
+            "  Output: {} rows, {} columns",
+            output.num_rows(),
+            output.num_columns()
+        );
+
+        // Log output _time column if present
+        if let Some(time_idx) = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "_time")
+        {
+            let time_array = output.column(time_idx);
+            predict_log!(info, "  Output _time column:");
+            predict_log!(info, "    type: {:?}", time_array.data_type());
+            predict_log!(info, "    length: {}", time_array.len());
+            predict_log!(info, "    null_count: {}", time_array.null_count());
+
+            // Log first few and last few values
+            predict_log!(info, "    First 5 _time values:");
+            for i in 0..std::cmp::min(5, time_array.len()) {
+                if let Some(ts) = Self::extract_single_i64_from_array(time_array, i) {
+                    predict_log!(info, "      _time[{}] = {}", i, ts);
+                } else {
+                    predict_log!(info, "      _time[{}] = NULL", i);
+                }
+            }
+
+            let last_start = time_array.len().saturating_sub(self.future_timespan + 2);
+            predict_log!(
+                info,
+                "    Last {} _time values (including future timestamps):",
+                time_array.len() - last_start
+            );
+            for i in last_start..time_array.len() {
+                if let Some(ts) = Self::extract_single_i64_from_array(time_array, i) {
+                    let is_future = i >= all_rows;
+                    predict_log!(
+                        info,
+                        "      _time[{}] = {} {}",
+                        i,
+                        ts,
+                        if is_future { "(FUTURE)" } else { "" }
+                    );
+                } else {
+                    let is_future = i >= all_rows;
+                    predict_log!(
+                        info,
+                        "      _time[{}] = NULL {}",
+                        i,
+                        if is_future { "(FUTURE)" } else { "" }
+                    );
+                }
+            }
+        }
 
         self.data_buffer.clear();
         self.time_series_data.clear();

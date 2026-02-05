@@ -128,6 +128,7 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
                 AnomalyDetector::new(ctx.arguments, ctx.named_arguments)
                     .map(|f| Box::new(f) as Box<dyn TableFunction>)
             }))
+            .require_ordered(true)
             .signature(
                 Signature::builder()
                     .parameter((Some("method"), ArgType::String, Some("histogram")))
