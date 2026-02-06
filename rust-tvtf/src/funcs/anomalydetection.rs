@@ -447,8 +447,8 @@ impl AnomalyDetector {
 
         let total = counter.values().sum::<usize>() as f64;
         let value_frequencies: HashMap<String, f64> = counter
-            .into_iter()
-            .map(|(value, count)| (value, count as f64 / total))
+            .iter()
+            .map(|(value, count)| (value.clone(), *count as f64 / total))
             .collect();
 
         self.field_frequencies
