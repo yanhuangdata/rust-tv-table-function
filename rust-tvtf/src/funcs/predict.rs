@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, anyhow};
 use arrow::array::{Array, ArrayRef, AsArray, Float64Array};
-use arrow::compute::{cast, concat};
+use arrow::compute::{SortOptions, cast, concat, sort_to_indices, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
+use regex::Regex;
 use std::collections::HashMap;
 use std::f64;
 use std::sync::Arc;
@@ -10,7 +12,7 @@ use std::sync::Arc;
 use crate::TableFunction;
 use rust_tvtf_api::arg::{Arg, Args};
 
-use predict::{Univar, statespace::prediction_interval};
+use predict::statespace::prediction_interval;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Algorithm {
@@ -50,6 +52,7 @@ pub struct FieldConfig {
     pub field_name: String,
     pub algorithm: Algorithm,
     pub period: Option<usize>,
+    pub is_count: bool, // Whether this is a count field (for nonnegative constraint)
 }
 
 #[derive(Debug)]
@@ -59,47 +62,46 @@ pub struct Predict {
     holdback: usize,
     upper_confidence: f64,
     lower_confidence: f64,
+    _nonnegative: bool,   // Global nonnegative flag (reserved for future use)
+    _data_start: usize,   // Starting position in data (reserved for future use)
+    _data_end: usize,     // End position in data (reserved for future use)
+    _period: Option<i32>, // Period value (reserved for future use)
     data_buffer: Vec<RecordBatch>,
     time_series_data: HashMap<String, Vec<Option<f64>>>,
+    // Time preprocessing state
+    beginning: usize,     // Number of leading null/invalid values
+    missing_valued: bool, // Whether there were any missing values in the data
+    _databegun: bool,     // Whether any valid data has been encountered (reserved for future use)
+    _numvals: usize,      // Number of values (reserved for future use)
+    // Internal tracking for output (reserved for future use)
+    _upper_names: HashMap<String, String>,
+    _lower_names: HashMap<String, String>,
+    _ui_upper_names: HashMap<String, String>,
+    _ui_lower_names: HashMap<String, String>,
+    _ui_predict_names: HashMap<String, String>,
 }
 
 impl Predict {
-    pub fn new(params: Option<Args>, named_arguments: Vec<(String, Arg)>) -> Result<Self> {
-        // Parse field names from positional arguments
-        let field_names = if let Some(params) = params {
-            let scalars = params
-                .into_iter()
-                .filter(|p| p.is_scalar())
-                .collect::<Vec<_>>();
-
-            scalars
-                .into_iter()
-                .map(|arg| {
-                    if let Arg::String(s) = arg {
-                        Ok(s)
-                    } else {
-                        Err(anyhow!("Field names must be strings"))
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            return Err(anyhow!("At least one field name is required"));
-        };
-
-        if field_names.is_empty() {
-            return Err(anyhow!("At least one field name is required"));
-        }
-
+    pub fn new(_: Option<Args>, named_arguments: Vec<(String, Arg)>) -> Result<Self> {
         // Parse named arguments
         let mut algorithm = Algorithm::default();
         let mut period = None;
-        let mut future_timespan = 10;
+        let mut future_timespan = 5; // Match Python default
         let mut holdback = 0;
-        let mut upper_confidence = 0.99;
-        let mut lower_confidence = 0.99;
+        let mut upper_confidence = 0.975; // Will be set based on ci
+        let mut lower_confidence = 0.975; // Will be set based on ci
+        let mut nonnegative = false;
+        let mut data_start = 0;
+        let mut field_names: Vec<String> = Vec::new();
 
         for (name, arg) in named_arguments {
             match name.as_str() {
+                "fields" => {
+                    let Arg::String(s) = arg else {
+                        return Err(anyhow!("fields must be a string"));
+                    };
+                    field_names.push(s);
+                }
                 "algorithm" => {
                     let Arg::String(s) = arg else {
                         return Err(anyhow!("algorithm must be a string"));
@@ -118,7 +120,7 @@ impl Predict {
                 }
                 "future_timespan" => {
                     future_timespan = match arg {
-                        Arg::Int(i) if i > 0 => i as usize,
+                        Arg::Int(i) if i >= 0 => i as usize,
                         Arg::String(s) => s.parse().context("future_timespan must be a number")?,
                         _ => return Err(anyhow!("future_timespan must be a positive integer")),
                     };
@@ -131,56 +133,90 @@ impl Predict {
                     };
                 }
                 "upper" => {
-                    upper_confidence = match arg {
-                        Arg::Float(f) if f > 0.0 && f <= 1.0 => f,
-                        Arg::Int(i) if i > 0 && i <= 100 => i as f64 / 100.0,
+                    // upper95(value) format - extract the number
+                    let upper_val = match arg {
+                        Arg::Float(f) => f,
+                        Arg::Int(i) => i as f64,
                         Arg::String(s) => {
-                            let f: f64 = s
-                                .parse()
-                                .context("upper must be a number between 0 and 1 or 1 and 100")?;
-                            if f > 0.0 && f <= 1.0 {
-                                f
-                            } else if f > 1.0 && f <= 100.0 {
-                                f / 100.0
-                            } else {
-                                return Err(anyhow!("upper must be between 0 and 1 or 1 and 100"));
-                            }
+                            let parsed: f64 = s.parse().context("upper must be a number")?;
+                            parsed
                         }
                         _ => return Err(anyhow!("upper must be a number")),
                     };
+                    // Store as confidence level (0-1)
+                    if upper_val > 0.0 && upper_val <= 1.0 {
+                        upper_confidence = upper_val;
+                    } else if upper_val > 1.0 && upper_val <= 100.0 {
+                        upper_confidence = upper_val / 100.0;
+                    }
                 }
                 "lower" => {
-                    lower_confidence = match arg {
-                        Arg::Float(f) if f > 0.0 && f <= 1.0 => f,
-                        Arg::Int(i) if i > 0 && i <= 100 => i as f64 / 100.0,
+                    let lower_val = match arg {
+                        Arg::Float(f) => f,
+                        Arg::Int(i) => i as f64,
                         Arg::String(s) => {
-                            let f: f64 = s
-                                .parse()
-                                .context("lower must be a number between 0 and 1 or 1 and 100")?;
-                            if f > 0.0 && f <= 1.0 {
-                                f
-                            } else if f > 1.0 && f <= 100.0 {
-                                f / 100.0
-                            } else {
-                                return Err(anyhow!("lower must be between 0 and 1 or 1 and 100"));
-                            }
+                            let parsed: f64 = s.parse().context("lower must be a number")?;
+                            parsed
                         }
                         _ => return Err(anyhow!("lower must be a number")),
+                    };
+                    if lower_val > 0.0 && lower_val <= 1.0 {
+                        lower_confidence = lower_val;
+                    } else if lower_val > 1.0 && lower_val <= 100.0 {
+                        lower_confidence = lower_val / 100.0;
+                    }
+                }
+                "nonnegative" => {
+                    let val = match arg {
+                        Arg::String(s) => s.to_lowercase(),
+                        Arg::Bool(b) => b.to_string(),
+                        _ => return Err(anyhow!("nonnegative must be a boolean or string")),
+                    };
+                    nonnegative = val == "t" || val == "true" || val == "1";
+                }
+                "start" => {
+                    data_start = match arg {
+                        Arg::Int(i) if i >= 0 => i as usize,
+                        Arg::String(s) => s.parse().context("start must be a number")?,
+                        _ => return Err(anyhow!("start must be a non-negative integer")),
                     };
                 }
                 _ => return Err(anyhow!("Unknown parameter: {}", name)),
             }
         }
 
+        if field_names.is_empty() {
+            return Err(anyhow!("At least one field name is required"));
+        }
+
+        // Build regex for count field detection (matching Python behavior)
+        // Python regex: r'^(c|count|dc|distinct_count|estdc)($|\()'
+        // Need to escape \( as \\( in Rust string
+        let count_pattern = Regex::new(r"^(c|count|dc|distinct_count|estdc)($|\()").unwrap();
+
         // Build field configurations
         let mut field_configs = Vec::new();
-        for field_name in field_names {
+        for field_name in &field_names {
+            let is_count = if nonnegative {
+                // If nonnegative is set globally, all fields are treated as counts
+                true
+            } else {
+                // Auto-detect count fields by name (matching Python behavior)
+                let lower_name = field_name.to_lowercase();
+                count_pattern.is_match(&lower_name)
+            };
+
             field_configs.push(FieldConfig {
                 field_name: field_name.clone(),
                 algorithm,
                 period,
+                is_count,
             });
         }
+
+        // Set upper/lower names for output columns
+        let (upper_names, lower_names, ui_upper_names, ui_lower_names, ui_predict_names) =
+            Self::set_upper_lower_names(&field_configs);
 
         Ok(Predict {
             field_configs,
@@ -188,24 +224,123 @@ impl Predict {
             holdback,
             upper_confidence,
             lower_confidence,
+            _nonnegative: nonnegative,
+            _data_start: data_start,
+            _data_end: 0,
+            _period: period.map(|p| p as i32),
             data_buffer: Vec::new(),
             time_series_data: HashMap::new(),
+            beginning: 0,
+            missing_valued: false,
+            _databegun: false,
+            _numvals: 0,
+            _upper_names: upper_names,
+            _lower_names: lower_names,
+            _ui_upper_names: ui_upper_names,
+            _ui_lower_names: ui_lower_names,
+            _ui_predict_names: ui_predict_names,
         })
+    }
+
+    /// Set upper and lower confidence interval names (matching Python setUpperLowerNames)
+    #[allow(clippy::type_complexity)]
+    fn set_upper_lower_names(
+        field_configs: &[FieldConfig],
+    ) -> (
+        HashMap<String, String>,
+        HashMap<String, String>,
+        HashMap<String, String>,
+        HashMap<String, String>,
+        HashMap<String, String>,
+    ) {
+        let mut upper_names = HashMap::new();
+        let mut lower_names = HashMap::new();
+        let mut ui_upper_names = HashMap::new();
+        let mut ui_lower_names = HashMap::new();
+        let mut ui_predict_names = HashMap::new();
+
+        // Fixed 95% confidence interval for naming
+        let ci = 95;
+
+        for config in field_configs {
+            let field_name = &config.field_name;
+            let predicted_name = format!("prediction_{}", field_name);
+
+            upper_names.insert(
+                field_name.clone(),
+                format!("upper{}_{}", ci, predicted_name),
+            );
+            lower_names.insert(
+                field_name.clone(),
+                format!("lower{}_{}", ci, predicted_name),
+            );
+            ui_upper_names.insert(field_name.clone(), format!("_upper{}", field_name));
+            ui_lower_names.insert(field_name.clone(), format!("_lower{}", field_name));
+            ui_predict_names.insert(field_name.clone(), format!("_predicted{}", field_name));
+        }
+
+        (
+            upper_names,
+            lower_names,
+            ui_upper_names,
+            ui_lower_names,
+            ui_predict_names,
+        )
+    }
+
+    /// Parameter validation methods (matching Python's check* methods)
+    fn check_future_timespan(&self) -> Result<()> {
+        // future_timespan is already validated during parsing (usize >= 0)
+        Ok(())
+    }
+
+    fn check_period(&self) -> Result<()> {
+        if let Some(period) = self._period
+            && period < 1
+        {
+            return Err(anyhow!("Invalid period: '{}' - must be >= 1", period));
+        }
+        Ok(())
+    }
+
+    /// Run all parameter validations (matching Python's lastCheck)
+    /// Note: holdback, data_start, and nonnegative are validated during parsing
+    /// due to Rust's type system (usize >= 0, bool is always valid)
+    fn validate_parameters(&self) -> Result<()> {
+        self.check_future_timespan()?;
+        self.check_period()?;
+        // holdback, data_start, nonnegative: validated during Arg parsing
+        Ok(())
     }
 
     fn extract_numeric_values(&self, array: &ArrayRef, num_rows: usize) -> Vec<Option<f64>> {
         let mut values = Vec::with_capacity(num_rows);
 
         // Try to cast to Float64 if needed
-        let array = if !matches!(array.data_type(), DataType::Float64) {
-            if let Ok(casted) = cast(array, &DataType::Float64) {
-                casted
-            } else {
-                // If casting fails, return all None
-                return vec![None; num_rows];
-            }
-        } else {
+        let array = if matches!(array.data_type(), DataType::Float64) {
             array.clone()
+        } else if matches!(array.data_type(), DataType::Int64) {
+            // For Int64, convert directly
+            let arr = array.as_primitive::<arrow::datatypes::Int64Type>();
+            let float_values: Vec<Option<f64>> = (0..num_rows)
+                .map(|i| {
+                    if arr.is_valid(i) {
+                        Some(arr.value(i) as f64)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            return float_values;
+        } else {
+            // Try to cast other types to Float64
+            match cast(array, &DataType::Float64) {
+                Ok(casted) => casted,
+                Err(_) => {
+                    // If cast fails, return all None
+                    return vec![None; num_rows];
+                }
+            }
         };
 
         let float_array = array.as_primitive::<arrow::datatypes::Float64Type>();
@@ -226,73 +361,932 @@ impl Predict {
         values: &[Option<f64>],
         config: &FieldConfig,
     ) -> anyhow::Result<Vec<(f64, f64, f64)>> {
-        // Apply holdback
-        let training_data = if self.holdback > 0 && values.len() > self.holdback {
-            &values[..values.len() - self.holdback]
+        // Calculate effective training data (after holdback)
+        let numvals = values.len();
+        // Calculate data_end based on holdback
+        let data_end = if self.holdback > 0 && numvals > self.holdback {
+            numvals - self.holdback
         } else {
-            values
+            numvals
+        };
+        let _period = self
+            ._period
+            .or(config.period.map(|p| p as i32))
+            .unwrap_or(0);
+
+        // Determine algorithm type for model selection
+        let algorithm_prefix = match config.algorithm {
+            Algorithm::LL => "LL",
+            Algorithm::LLT => "LLT",
+            Algorithm::LLP | Algorithm::LLP1 | Algorithm::LLP2 => "LLP",
+            Algorithm::LLP5 => "LLP5",
+            Algorithm::LLB | Algorithm::LLBmv => "LLB",
+            Algorithm::BiLL | Algorithm::BiLLmv => "Bi",
         };
 
-        // Convert Option<f64> to f64 (None -> NAN)
-        let data_f64: Vec<f64> = training_data
+        let is_multivar = matches!(
+            config.algorithm,
+            Algorithm::LLB | Algorithm::LLBmv | Algorithm::BiLL | Algorithm::BiLLmv
+        );
+
+        // Check minimum data points (matching Python's setModel check)
+        // Based on predict library's least_num_data():
+        // - LL: 1, LLT: 2, LLP/LLP1/LLP2: period, LLP5: 2
+        // - LLB/LLBmv: 2, BiLL/BiLLmv: 1
+        let least_num_data = match config.algorithm {
+            // Univariate models
+            Algorithm::LL => 1,
+            Algorithm::LLT | Algorithm::LLP5 => 2,
+            Algorithm::LLP | Algorithm::LLP1 | Algorithm::LLP2 => config.period.unwrap_or(2),
+            // Multivariate models
+            Algorithm::LLB | Algorithm::LLBmv => 2,
+            Algorithm::BiLL | Algorithm::BiLLmv => 1,
+        };
+
+        if data_end < least_num_data {
+            return Err(anyhow!(
+                "Too few data points: {}. Need at least {} for algorithm {}",
+                data_end,
+                least_num_data,
+                algorithm_prefix
+            ));
+        }
+
+        // Prepare data for model
+        let data_f64: Vec<f64> = values[self.beginning..data_end]
             .iter()
             .map(|v| v.unwrap_or(f64::NAN))
             .collect();
-        let data_len = data_f64.len();
-        let data_start = 0;
-        let data_end = data_len;
 
-        let mut predictions = Vec::new();
-
-        // Determine algorithm name
-        let algorithm_name = match config.algorithm {
-            Algorithm::LL => "LL",
-            Algorithm::LLT => "LLT",
-            Algorithm::LLP => "LLP",
-            Algorithm::LLP1 => "LLP1",
-            Algorithm::LLP2 => "LLP2",
-            Algorithm::LLP5 => "LLP5",
-            Algorithm::LLB => "LLB",
-            Algorithm::LLBmv => "LLBmv",
-            Algorithm::BiLL => "BiLL",
-            Algorithm::BiLLmv => "BiLLmv",
-        };
-
+        let data_start = self.beginning;
+        let data_end_for_model = data_f64.len();
         let period = config.period.map(|p| p as i32).unwrap_or(0);
 
+        // Calculate lag based on algorithm type (matching Python's predict method)
+        // For LLB/BiLL, lag = max(data_end, 1) + data_start
+        // For other algorithms, use algorithm-specific defaults
+        let lag = if is_multivar {
+            let start = std::cmp::max(data_end, 1);
+            start + data_start
+        } else {
+            match config.algorithm {
+                Algorithm::LL => 0,
+                Algorithm::LLT => 2,
+                Algorithm::LLP | Algorithm::LLP1 | Algorithm::LLP2 => config.period.unwrap_or(2),
+                Algorithm::LLP5 => 2,
+                _ => 1,
+            }
+        };
+
+        // Create model based on algorithm type (matching Python's setModel)
+        // Note: Univar and Multivar are different types, so we handle them separately
+        let is_univar = !is_multivar;
+
         // Calculate confidence level for prediction interval
-        // Use average of upper and lower confidence levels
         let confidence = (self.upper_confidence + self.lower_confidence) / 2.0;
 
-        // Use univariate algorithm
-        let data = vec![data_f64];
-        let model = Univar::new(
-            algorithm_name,
-            data,
-            data_start,
-            data_end,
-            period,
-            self.future_timespan,
-        )
-        .context("Failed to create Univar model")?;
+        let mut predictions = Vec::new();
+        let total_pred_points = numvals + self.future_timespan;
 
-        for i in 0..training_data.len() + self.future_timespan {
-            let state = model.state(0, i);
-            let variance = model.var(0, i);
-            let (lower, upper) = prediction_interval(state, variance, confidence)
-                .context("Failed to compute prediction interval")?;
-            predictions.push((state, lower, upper));
-        }
+        if is_univar {
+            // Univariate algorithms (LL, LLT, LLP, LLP1, LLP2, LLP5)
+            let data = vec![data_f64];
+            let model = predict::Univar::new(
+                algorithm_prefix,
+                data,
+                data_start,
+                data_end_for_model,
+                period,
+                self.future_timespan,
+            )
+            .context("Failed to create Univar model")?;
 
-        // If holdback was used, pad with predictions to match original length
-        if self.holdback > 0 && predictions.len() < values.len() {
-            let last_pred = predictions.last().copied().unwrap_or((0.0, 0.0, 0.0));
-            while predictions.len() < values.len() {
-                predictions.push(last_pred);
+            // Generate predictions for Univar
+            for i in 0..total_pred_points {
+                let (state, lower, upper) = if i < self.beginning {
+                    if i < numvals {
+                        if let Some(val) = values[i] {
+                            (val, val, val)
+                        } else {
+                            (0.0, 0.0, 0.0)
+                        }
+                    } else {
+                        (0.0, 0.0, 0.0)
+                    }
+                } else if i < self.beginning + lag {
+                    let obs_idx = i - self.beginning;
+                    if obs_idx < numvals {
+                        if let Some(val) = values[obs_idx] {
+                            (val, val, val)
+                        } else {
+                            (0.0, 0.0, 0.0)
+                        }
+                    } else {
+                        (0.0, 0.0, 0.0)
+                    }
+                } else if i < self.beginning + numvals - self.holdback {
+                    let model_idx = i - self.beginning;
+                    let state = model.state(0, model_idx);
+                    let variance = model.var(0, model_idx);
+                    let (mut lower, upper) = prediction_interval(state, variance, confidence)
+                        .context("Failed to compute prediction interval")?;
+                    if config.is_count && lower < 0.0 {
+                        lower = 0.0;
+                    }
+                    (state, lower, upper)
+                } else {
+                    let model_idx = lag.saturating_sub(self.beginning).max(1);
+                    let state = model.state(0, model_idx);
+                    let variance = model.var(0, model_idx);
+                    let (mut lower, upper) = prediction_interval(state, variance, confidence)
+                        .context("Failed to compute prediction interval")?;
+                    if config.is_count && lower < 0.0 {
+                        lower = 0.0;
+                    }
+                    (state, lower, upper)
+                };
+                predictions.push((state, lower, upper));
+            }
+        } else {
+            // Multivariate algorithms (LLB, BiLL) - use LL as fallback without correlate
+            let model: predict::Univar = predict::Univar::new(
+                "LL",
+                vec![data_f64.clone()],
+                data_start,
+                data_end_for_model,
+                period,
+                self.future_timespan,
+            )
+            .context("Failed to create model for multivariate algorithm")?;
+
+            // Generate predictions for Multivar (using Univar as fallback)
+            for i in 0..total_pred_points {
+                let (state, lower, upper) = if i < self.beginning {
+                    if i < numvals {
+                        if let Some(val) = values[i] {
+                            (val, val, val)
+                        } else {
+                            (0.0, 0.0, 0.0)
+                        }
+                    } else {
+                        (0.0, 0.0, 0.0)
+                    }
+                } else if i < self.beginning + lag {
+                    let obs_idx = i - self.beginning;
+                    if obs_idx < numvals {
+                        if let Some(val) = values[obs_idx] {
+                            (val, val, val)
+                        } else {
+                            (0.0, 0.0, 0.0)
+                        }
+                    } else {
+                        (0.0, 0.0, 0.0)
+                    }
+                } else if i < self.beginning + numvals - self.holdback {
+                    let model_idx = i - self.beginning;
+                    let state = model.state(0, model_idx);
+                    let variance = model.var(0, model_idx);
+                    let (mut lower, upper) = prediction_interval(state, variance, confidence)
+                        .context("Failed to compute prediction interval")?;
+                    if config.is_count && lower < 0.0 {
+                        lower = 0.0;
+                    }
+                    (state, lower, upper)
+                } else {
+                    let model_idx = lag.saturating_sub(self.beginning).max(1);
+                    let state = model.state(0, model_idx);
+                    let variance = model.var(0, model_idx);
+                    let (mut lower, upper) = prediction_interval(state, variance, confidence)
+                        .context("Failed to compute prediction interval")?;
+                    if config.is_count && lower < 0.0 {
+                        lower = 0.0;
+                    }
+                    (state, lower, upper)
+                };
+                predictions.push((state, lower, upper));
             }
         }
 
         Ok(predictions)
+    }
+
+    fn calculate_beginning(&self, values: &[Option<f64>]) -> usize {
+        // Find the first valid (non-null) value
+        // beginning is the number of leading null/invalid values
+        let mut beginning = 0;
+        let mut found_valid = false;
+        for (i, v) in values.iter().enumerate() {
+            if v.is_some() {
+                beginning = i;
+                found_valid = true;
+                break;
+            }
+        }
+        if !found_valid {
+            // All values are null, beginning is the full length
+            beginning = values.len();
+        }
+        beginning
+    }
+
+    fn calculate_missing_valued(&self, values: &[Option<f64>]) -> bool {
+        // Check if there are any missing values in the data
+        values.iter().any(|v| v.is_none())
+    }
+}
+
+/// Time span information for extending timestamps
+struct TimeSpan {
+    span_seconds: i64,       // Span in seconds
+    spandays: Option<i64>,   // Span in days (if explicitly set)
+    spanmonths: Option<i64>, // Span in months (if spandays >= 28)
+}
+
+impl Predict {
+    /// Detect time span from the input schema and data
+    /// Returns span information and the index of the time column if found
+    fn detect_time_span(
+        &self,
+        schema: &Schema,
+        batches: &[RecordBatch],
+    ) -> Result<Option<(TimeSpan, usize)>> {
+        // Look for _span, _spandays, and _time fields
+        let span_field_idx = schema.fields().iter().position(|f| f.name() == "_span");
+        let spandays_field_idx = schema.fields().iter().position(|f| f.name() == "_spandays");
+        let time_field_idx = schema.fields().iter().position(|f| f.name() == "_time");
+
+        // Try to get span from _span field
+        let mut span_seconds: Option<i64> = None;
+        if let Some(idx) = span_field_idx {
+            // Get the first non-null value from _span
+            for batch in batches {
+                let array = batch.column(idx);
+                if let Some(val) = Self::extract_single_i64_from_array(array, 0) {
+                    span_seconds = Some(val);
+                    break;
+                }
+            }
+        }
+
+        // Try to get spandays from _spandays field
+        let mut spandays: Option<i64> = None;
+        if let Some(idx) = spandays_field_idx {
+            for batch in batches {
+                let array = batch.column(idx);
+                if let Some(val) = Self::extract_single_i64_from_array(array, 0) {
+                    spandays = Some(val);
+                    break;
+                }
+            }
+        }
+
+        // If we have span info, return it
+        if span_seconds.is_some() || spandays.is_some() {
+            let spanmonths = spandays.and_then(|d| if d >= 28 { Some(d / 28) } else { None });
+
+            let time_idx = time_field_idx
+                .ok_or_else(|| anyhow!("_span or _spandays is set but _time field is missing"))?;
+
+            return Ok(Some((
+                TimeSpan {
+                    span_seconds: span_seconds.unwrap_or(0),
+                    spandays,
+                    spanmonths,
+                },
+                time_idx,
+            )));
+        }
+
+        // Calculate span from _time field difference
+        if let Some(time_idx) = time_field_idx {
+            // Get first two valid timestamps
+            let mut first_time: Option<i64> = None;
+            let mut second_time: Option<i64> = None;
+
+            for batch in batches {
+                let array = batch.column(time_idx);
+                for i in 0..batch.num_rows().min(10) {
+                    // Try to parse as int64 first (Unix timestamp)
+                    if let Some(ts) = Self::extract_single_i64_from_array(array, i) {
+                        if first_time.is_none() {
+                            first_time = Some(ts);
+                        } else if let Some(ref first) = first_time
+                            && ts != *first
+                        {
+                            second_time = Some(ts);
+                            break;
+                        }
+                    }
+                }
+                if second_time.is_some() {
+                    break;
+                }
+            }
+
+            if let (Some(t1), Some(t2)) = (first_time, second_time) {
+                let span = (t2 - t1).abs();
+
+                // Normalize span to seconds if timestamps are in microseconds
+                // Timestamps > 32503680000 are likely in microseconds (year 3000+ in seconds)
+                let span_in_seconds = if t1.abs() > 32503680000 {
+                    span / 1_000_000 // Convert from microseconds to seconds
+                } else {
+                    span
+                };
+
+                return Ok(Some((
+                    TimeSpan {
+                        span_seconds: span_in_seconds,
+                        spandays: None,
+                        spanmonths: None,
+                    },
+                    time_idx,
+                )));
+            }
+        }
+
+        // No time span detected
+        Ok(None)
+    }
+
+    /// Extract a single int64 value from an array at the given index
+    /// Returns None if the value can't be parsed as a numeric timestamp
+    fn extract_single_i64_from_array(array: &ArrayRef, idx: usize) -> Option<i64> {
+        if idx >= array.len() {
+            return None;
+        }
+
+        let data_type = array.data_type();
+
+        // Handle Arrow Timestamp types (Microsecond, Nanosecond, Millisecond, Second)
+        if let DataType::Timestamp(unit, _tz) = data_type {
+            use arrow::array::{
+                TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+                TimestampSecondArray,
+            };
+            use arrow::datatypes::TimeUnit;
+
+            match unit {
+                TimeUnit::Microsecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>()?;
+                    if arr.is_valid(idx) {
+                        return Some(arr.value(idx)); // Returns microseconds
+                    }
+                }
+                TimeUnit::Nanosecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampNanosecondArray>()?;
+                    if arr.is_valid(idx) {
+                        return Some(arr.value(idx) / 1000); // Convert nanoseconds to microseconds
+                    }
+                }
+                TimeUnit::Millisecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>()?;
+                    if arr.is_valid(idx) {
+                        return Some(arr.value(idx) * 1000); // Convert milliseconds to microseconds
+                    }
+                }
+                TimeUnit::Second => {
+                    let arr = array.as_any().downcast_ref::<TimestampSecondArray>()?;
+                    if arr.is_valid(idx) {
+                        return Some(arr.value(idx) * 1_000_000); // Convert seconds to microseconds
+                    }
+                }
+            }
+            return None;
+        }
+
+        // Try Int64 first - only if the array is actually Int64
+        if matches!(data_type, DataType::Int64) {
+            let arr = array.as_primitive::<arrow::datatypes::Int64Type>();
+            if arr.is_valid(idx) {
+                return Some(arr.value(idx));
+            }
+            return None;
+        }
+
+        // Try Float64 - only if the array is actually Float64
+        if matches!(data_type, DataType::Float64) {
+            let arr = array.as_primitive::<arrow::datatypes::Float64Type>();
+            if arr.is_valid(idx) {
+                return Some(arr.value(idx) as i64);
+            }
+            return None;
+        }
+
+        // Try to parse string as timestamp (ISO8601 or numeric)
+        if matches!(data_type, DataType::Utf8) {
+            let arr = array.as_string::<i32>();
+            if arr.is_valid(idx) {
+                let s = arr.value(idx);
+                // Try to parse as Unix timestamp string (numeric)
+                if let Ok(ts) = s.parse::<i64>() {
+                    return Some(ts);
+                }
+                // Try to parse as float
+                if let Ok(ts) = s.parse::<f64>() {
+                    return Some(ts as i64);
+                }
+                // Try to parse ISO8601 format
+                if let Some(ts) = Self::parse_iso8601_timestamp(s) {
+                    return Some(ts);
+                }
+            }
+            return None;
+        }
+
+        // Try LargeUtf8 as well
+        if matches!(data_type, DataType::LargeUtf8) {
+            let arr = array.as_string::<i64>();
+            if arr.is_valid(idx) {
+                let s = arr.value(idx);
+                // Try to parse as Unix timestamp string (numeric)
+                if let Ok(ts) = s.parse::<i64>() {
+                    return Some(ts);
+                }
+                // Try to parse as float
+                if let Ok(ts) = s.parse::<f64>() {
+                    return Some(ts as i64);
+                }
+                // Try to parse ISO8601 format
+                if let Some(ts) = Self::parse_iso8601_timestamp(s) {
+                    return Some(ts);
+                }
+            }
+            return None;
+        }
+
+        None
+    }
+
+    /// Parse ISO8601 timestamp string to Unix timestamp
+    /// Supports formats like:
+    /// - 2024-01-15T10:30:00Z
+    /// - 2024-01-15T10:30:00+08:00
+    /// - 2024-01-15T10:30:00.000+0800 (common format without colon in timezone)
+    /// - 2024-01-15 10:30:00
+    /// - 20240115T103000Z
+    fn parse_iso8601_timestamp(s: &str) -> Option<i64> {
+        let s = s.trim();
+
+        // Try various formats
+        // Format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+HH:MM (RFC 3339)
+        if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+            return Some(dt.timestamp());
+        }
+
+        // Format: YYYY-MM-DDTHH:MM:SS.fff+HHMM (without colon in timezone)
+        // This is a common format used by many systems
+        if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.3f%z") {
+            return Some(dt.timestamp());
+        }
+
+        // Format: YYYY-MM-DDTHH:MM:SS+HHMM (without milliseconds, without colon in timezone)
+        if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%z") {
+            return Some(dt.timestamp());
+        }
+
+        // Format: YYYY-MM-DD HH:MM:SS
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+            return Some(naive.and_utc().timestamp());
+        }
+
+        // Format: YYYY-MM-DDTHH:MM:SS.fff (with milliseconds, no timezone)
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.3f") {
+            return Some(naive.and_utc().timestamp());
+        }
+
+        // Format: YYYY-MM-DDTHH:MM:SS
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+            return Some(naive.and_utc().timestamp());
+        }
+
+        // Format: YYYYMMDDTHHMMSS
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%M%S") {
+            return Some(naive.and_utc().timestamp());
+        }
+
+        // Format: YYYY-MM-DD
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d") {
+            return Some(naive.and_utc().timestamp());
+        }
+
+        None
+    }
+
+    /// Check if an array contains timestamps (Int64, Float64, Utf8 string format, or Arrow Timestamp)
+    fn is_timestamp_type(array: &ArrayRef) -> bool {
+        matches!(
+            array.data_type(),
+            DataType::Int64
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Timestamp(_, _)
+        )
+    }
+
+    /// Extend time column with computed future timestamps
+    /// Returns ONLY the extension array (future timestamps), not the full array
+    /// Handles DST (Daylight Saving Time) transitions for daily spans
+    fn extend_time_column(
+        &self,
+        time_array: &ArrayRef,
+        time_span: &TimeSpan,
+        _time_idx: usize,
+        future_timespan: usize,
+        _last_valid_idx: usize,
+    ) -> Result<ArrayRef> {
+        if future_timespan == 0 {
+            return Ok(arrow::array::new_null_array(time_array.data_type(), 0));
+        }
+
+        // Check if this is a supported timestamp type
+        if !Self::is_timestamp_type(time_array) {
+            return Ok(arrow::array::new_null_array(
+                time_array.data_type(),
+                future_timespan,
+            ));
+        }
+
+        // Find the last valid timestamp by searching backwards
+        let mut last_timestamp: Option<i64> = None;
+        for i in (0..time_array.len()).rev() {
+            if let Some(ts) = Self::extract_single_i64_from_array(time_array, i) {
+                last_timestamp = Some(ts);
+                break;
+            }
+        }
+
+        let last_timestamp = match last_timestamp {
+            Some(ts) => ts,
+            None => {
+                return Ok(arrow::array::new_null_array(
+                    time_array.data_type(),
+                    future_timespan,
+                ));
+            }
+        };
+
+        // Detect if timestamp is in microseconds (> year 3000 in seconds)
+        // If so, we need to convert to seconds for DateTime operations, then back to microseconds
+        let is_microseconds = last_timestamp > 32503680000;
+        let last_ts_seconds = if is_microseconds {
+            last_timestamp / 1_000_000
+        } else {
+            last_timestamp
+        };
+
+        // span_seconds is always in seconds (normalized in detect_time_span)
+        let span_seconds = time_span.span_seconds;
+
+        // Get the hour from the last timestamp (for DST handling)
+        let last_datetime = DateTime::<Utc>::from_timestamp(last_ts_seconds, 0).unwrap_or_default();
+        let last_hour = last_datetime.hour() as i64;
+
+        // Calculate the span increment and generate future timestamps
+        let mut future_timestamps: Vec<i64> = Vec::with_capacity(future_timespan);
+        let mut current_ts = last_ts_seconds;
+
+        // DST handling: if spandays is set, we need to handle DST transitions
+        // The goal is to keep the same "wall clock time" (e.g., 12AM) even when DST changes
+        let handle_dst = time_span.spandays.is_some();
+
+        for _ in 0..future_timespan {
+            // Use chrono to correctly handle month/day increments
+            if let Some(months) = time_span.spanmonths {
+                // Monthly increment using chrono (handles month boundaries correctly)
+                if let Some(datetime) = DateTime::<Utc>::from_timestamp(current_ts, 0) {
+                    // Use Months struct with checked_add_months
+                    let months_to_add = if months >= 0 {
+                        chrono::Months::new(months as u32)
+                    } else {
+                        chrono::Months::new((-months) as u32)
+                    };
+                    let new_datetime = if months >= 0 {
+                        datetime.checked_add_months(months_to_add)
+                    } else {
+                        datetime.checked_sub_months(months_to_add)
+                    };
+                    if let Some(dt) = new_datetime {
+                        current_ts = dt.timestamp();
+                    }
+                }
+            } else if let Some(days) = time_span.spandays {
+                // Daily increment - needs DST handling
+                current_ts += days * 24 * 3600;
+
+                // DST handling for daily spans
+                if handle_dst {
+                    let next_datetime =
+                        DateTime::<Utc>::from_timestamp(current_ts, 0).unwrap_or_default();
+                    let next_hour = next_datetime.hour() as i64;
+
+                    // Check if DST transition occurred
+                    // If we expected 12AM but got 1AM or 23PM, adjust by 1 hour
+                    if last_hour == 0 {
+                        // We were at midnight
+                        if next_hour == 1 {
+                            // DST started, clock jumped forward - go back 1 hour to stay at midnight
+                            current_ts -= 3600;
+                        } else if next_hour == 23 {
+                            // DST ended, clock fell back - go forward 1 hour to stay at midnight
+                            current_ts += 3600;
+                        }
+                    } else if last_hour == 23 {
+                        // We were at 11PM
+                        if next_hour == 0 {
+                            // DST ended, clock fell back - we're now at midnight, go back to 11PM
+                            current_ts -= 3600;
+                        }
+                    }
+                }
+            } else {
+                // Use the calculated span (in seconds)
+                current_ts += span_seconds;
+            }
+
+            // Convert back to microseconds if original was in microseconds
+            let ts_to_push = if is_microseconds {
+                current_ts * 1_000_000
+            } else {
+                current_ts
+            };
+            future_timestamps.push(ts_to_push);
+        }
+
+        // Create the output array based on the original type - ONLY future timestamps
+        Self::create_time_array_from_timestamps(
+            time_array.data_type(),
+            &future_timestamps,
+            Some(time_array),
+        )
+    }
+
+    /// Create time array from timestamps, matching the original data type
+    /// For string types, uses the timezone offset from the original array
+    fn create_time_array_from_timestamps(
+        original_type: &DataType,
+        timestamps: &[i64],
+        original_array: Option<&ArrayRef>,
+    ) -> Result<ArrayRef> {
+        match original_type {
+            // Handle Arrow Timestamp types
+            DataType::Timestamp(unit, tz) => {
+                use arrow::array::{
+                    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+                    TimestampSecondArray,
+                };
+                use arrow::datatypes::TimeUnit;
+
+                match unit {
+                    TimeUnit::Microsecond => {
+                        // timestamps are already in microseconds
+                        let arr = TimestampMicrosecondArray::from(timestamps.to_vec());
+                        // If there's a timezone, we need to create with timezone
+                        if let Some(tz_str) = tz {
+                            Ok(Arc::new(arr.with_timezone(tz_str.clone())) as ArrayRef)
+                        } else {
+                            Ok(Arc::new(arr) as ArrayRef)
+                        }
+                    }
+                    TimeUnit::Nanosecond => {
+                        // Convert microseconds to nanoseconds
+                        let ns_timestamps: Vec<i64> =
+                            timestamps.iter().map(|ts| ts * 1000).collect();
+                        let arr = TimestampNanosecondArray::from(ns_timestamps);
+                        if let Some(tz_str) = tz {
+                            Ok(Arc::new(arr.with_timezone(tz_str.clone())) as ArrayRef)
+                        } else {
+                            Ok(Arc::new(arr) as ArrayRef)
+                        }
+                    }
+                    TimeUnit::Millisecond => {
+                        // Convert microseconds to milliseconds
+                        let ms_timestamps: Vec<i64> =
+                            timestamps.iter().map(|ts| ts / 1000).collect();
+                        let arr = TimestampMillisecondArray::from(ms_timestamps);
+                        if let Some(tz_str) = tz {
+                            Ok(Arc::new(arr.with_timezone(tz_str.clone())) as ArrayRef)
+                        } else {
+                            Ok(Arc::new(arr) as ArrayRef)
+                        }
+                    }
+                    TimeUnit::Second => {
+                        // Convert microseconds to seconds
+                        let s_timestamps: Vec<i64> =
+                            timestamps.iter().map(|ts| ts / 1_000_000).collect();
+                        let arr = TimestampSecondArray::from(s_timestamps);
+                        if let Some(tz_str) = tz {
+                            Ok(Arc::new(arr.with_timezone(tz_str.clone())) as ArrayRef)
+                        } else {
+                            Ok(Arc::new(arr) as ArrayRef)
+                        }
+                    }
+                }
+            }
+            DataType::Int64 => {
+                Ok(Arc::new(arrow::array::Int64Array::from(timestamps.to_vec())) as ArrayRef)
+            }
+            DataType::Float64 => {
+                let values: Vec<f64> = timestamps.iter().map(|v| *v as f64).collect();
+                Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+            }
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                // Try to extract timezone offset from original array
+                let tz_offset = original_array.and_then(|arr| {
+                    if matches!(arr.data_type(), DataType::Utf8) {
+                        let str_arr = arr.as_string::<i32>();
+                        // Find first valid string and extract timezone
+                        for i in 0..str_arr.len() {
+                            if str_arr.is_valid(i) {
+                                let s = str_arr.value(i);
+                                return Self::extract_timezone_offset(s);
+                            }
+                        }
+                    }
+                    None
+                });
+
+                // Convert timestamps to ISO8601 format strings with timezone
+                let string_values: Vec<String> = timestamps
+                    .iter()
+                    .map(|ts| {
+                        // Check if timestamp is in microseconds (> year 3000 in seconds)
+                        let ts_seconds = if *ts > 32503680000 {
+                            *ts / 1_000_000 // Convert microseconds to seconds
+                        } else {
+                            *ts
+                        };
+
+                        if let Some(offset_seconds) = tz_offset {
+                            // Use the original timezone offset
+                            let offset = chrono::FixedOffset::east_opt(offset_seconds)
+                                .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap());
+                            DateTime::<Utc>::from_timestamp(ts_seconds, 0)
+                                .map(|dt| {
+                                    let local_dt = dt.with_timezone(&offset);
+                                    // Format with the timezone offset
+                                    let offset_hours = offset_seconds / 3600;
+                                    let offset_mins = (offset_seconds.abs() % 3600) / 60;
+                                    let sign = if offset_seconds >= 0 { '+' } else { '-' };
+                                    format!(
+                                        "{}{}{:02}{:02}",
+                                        local_dt.format("%Y-%m-%dT%H:%M:%S%.3f"),
+                                        sign,
+                                        offset_hours.abs(),
+                                        offset_mins
+                                    )
+                                })
+                                .unwrap_or_else(|| ts.to_string())
+                        } else {
+                            // Default to UTC
+                            DateTime::<Utc>::from_timestamp(ts_seconds, 0)
+                                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3f+0000").to_string())
+                                .unwrap_or_else(|| ts.to_string())
+                        }
+                    })
+                    .collect();
+                Ok(Arc::new(arrow::array::StringArray::from(string_values)) as ArrayRef)
+            }
+            _ => {
+                // Default to Int64
+                Ok(Arc::new(arrow::array::Int64Array::from(timestamps.to_vec())) as ArrayRef)
+            }
+        }
+    }
+
+    /// Extract timezone offset in seconds from a timestamp string
+    /// e.g., "+0800" -> 28800 seconds, "-0530" -> -19800 seconds
+    fn extract_timezone_offset(s: &str) -> Option<i32> {
+        let s = s.trim();
+        // Look for timezone pattern at the end: +HHMM, -HHMM, +HH:MM, -HH:MM, Z
+        if s.ends_with('Z') {
+            return Some(0);
+        }
+
+        // Find the last + or - that indicates timezone
+        let tz_start = s.rfind(['+', '-'])?;
+        let tz_str = &s[tz_start..];
+
+        // Parse +HHMM or +HH:MM format
+        let (sign, rest) = if let Some(stripped) = tz_str.strip_prefix('+') {
+            (1, stripped)
+        } else if let Some(stripped) = tz_str.strip_prefix('-') {
+            (-1, stripped)
+        } else {
+            return None;
+        };
+
+        // Remove colon if present
+        let rest = rest.replace(':', "");
+        if rest.len() < 4 {
+            return None;
+        }
+
+        let hours: i32 = rest[0..2].parse().ok()?;
+        let mins: i32 = rest[2..4].parse().ok()?;
+
+        Some(sign * (hours * 3600 + mins * 60))
+    }
+
+    /// Automatically extend time column by computing span from the data itself
+    /// This is used when _span field is not available
+    /// Returns ONLY the extension array (future timestamps), not the full array
+    fn extend_time_column_auto(
+        &self,
+        time_array: &ArrayRef,
+        future_timespan: usize,
+        _num_rows: usize,
+    ) -> Result<ArrayRef> {
+        let array_len = time_array.len();
+        if future_timespan == 0 || array_len == 0 {
+            return Ok(arrow::array::new_null_array(time_array.data_type(), 0));
+        }
+
+        // Check if this is a supported timestamp type
+        if !Self::is_timestamp_type(time_array) {
+            return Ok(arrow::array::new_null_array(
+                time_array.data_type(),
+                future_timespan,
+            ));
+        }
+
+        // Try to extract timestamps and compute span
+        let mut timestamps: Vec<Option<i64>> = Vec::new();
+        for i in 0..array_len {
+            timestamps.push(Self::extract_single_i64_from_array(time_array, i));
+        }
+
+        // Find two consecutive valid timestamps to compute span
+        let mut span: Option<i64> = None;
+        for i in 0..timestamps.len().saturating_sub(1) {
+            if let (Some(t1), Some(t2)) = (timestamps[i], timestamps[i + 1]) {
+                span = Some((t2 - t1).abs());
+                break;
+            }
+        }
+
+        // Get the last valid timestamp
+        let last_timestamp = timestamps.iter().rev().find_map(|t| *t);
+
+        match (span, last_timestamp) {
+            (Some(time_span), Some(last_ts)) => {
+                // Generate future timestamps only
+                let mut future_timestamps: Vec<i64> = Vec::with_capacity(future_timespan);
+                let mut current_ts = last_ts;
+
+                for _ in 0..future_timespan {
+                    current_ts += time_span;
+                    future_timestamps.push(current_ts);
+                }
+
+                // Create array based on original type - ONLY the future timestamps
+                Self::create_time_array_from_timestamps(
+                    time_array.data_type(),
+                    &future_timestamps,
+                    Some(time_array),
+                )
+            }
+            _ => {
+                // Cannot compute span, return null array
+                Ok(arrow::array::new_null_array(
+                    time_array.data_type(),
+                    future_timespan,
+                ))
+            }
+        }
+    }
+
+    /// Extend an array by repeating the last value
+    fn extend_with_last_value(
+        &self,
+        array: &ArrayRef,
+        last_idx: usize,
+        count: usize,
+    ) -> Result<ArrayRef> {
+        if count == 0 {
+            return Ok(arrow::array::new_null_array(array.data_type(), 0));
+        }
+
+        match array.data_type() {
+            DataType::Int64 => {
+                if let Some(val) = Self::extract_single_i64_from_array(array, last_idx) {
+                    Ok(Arc::new(arrow::array::Int64Array::from(vec![val; count])) as ArrayRef)
+                } else {
+                    Ok(arrow::array::new_null_array(array.data_type(), count))
+                }
+            }
+            DataType::Float64 => {
+                let arr = array.as_primitive::<arrow::datatypes::Float64Type>();
+                if arr.is_valid(last_idx) {
+                    let val = arr.value(last_idx);
+                    Ok(Arc::new(Float64Array::from(vec![val; count])) as ArrayRef)
+                } else {
+                    Ok(arrow::array::new_null_array(array.data_type(), count))
+                }
+            }
+            _ => Ok(arrow::array::new_null_array(array.data_type(), count)),
+        }
     }
 }
 
@@ -308,6 +1302,9 @@ impl TableFunction for Predict {
             return Ok(None);
         }
 
+        // Validate parameters before processing (matching Python's lastCheck behavior)
+        self.validate_parameters()?;
+
         // Concatenate all buffered batches
         let mut all_rows = 0;
         for batch in &self.data_buffer {
@@ -321,7 +1318,61 @@ impl TableFunction for Predict {
         let first_batch = &self.data_buffer[0];
         let schema = first_batch.schema();
 
-        // Extract time series data for each field
+        // First, concatenate all batches into a single batch
+        let mut concatenated_columns: Vec<ArrayRef> = Vec::new();
+        for col_idx in 0..schema.fields().len() {
+            let mut arrays_to_concat = Vec::new();
+            for batch in &self.data_buffer {
+                arrays_to_concat.push(batch.column(col_idx).clone());
+            }
+            let concatenated = if arrays_to_concat.is_empty() {
+                self.data_buffer[0].column(col_idx).clone()
+            } else {
+                let refs: Vec<&dyn Array> = arrays_to_concat.iter().map(|a| a.as_ref()).collect();
+                concat(&refs).context("Failed to concatenate arrays")?
+            };
+            concatenated_columns.push(concatenated);
+        }
+
+        // Create the concatenated batch
+        let mut combined_batch = RecordBatch::try_new(schema.clone(), concatenated_columns.clone())
+            .context("Failed to create concatenated batch")?;
+
+        // Sort by _time column (ascending - earliest first) before prediction
+        if let Some(time_idx) = schema.fields().iter().position(|f| f.name() == "_time") {
+            let time_array = combined_batch.column(time_idx);
+
+            // Sort in ascending order (earliest time first)
+            let sort_options = SortOptions {
+                descending: false,
+                nulls_first: true,
+            };
+
+            let indices = sort_to_indices(time_array.as_ref(), Some(sort_options), None)
+                .context("Failed to sort by _time")?;
+
+            // Reorder all columns based on sorted indices
+            let mut sorted_columns: Vec<ArrayRef> = Vec::new();
+            for col in combined_batch.columns() {
+                let sorted_col =
+                    take(col.as_ref(), &indices, None).context("Failed to reorder column")?;
+                sorted_columns.push(sorted_col);
+            }
+
+            combined_batch = RecordBatch::try_new(schema.clone(), sorted_columns)
+                .context("Failed to create sorted batch")?;
+
+            // Update concatenated_columns with sorted data
+            concatenated_columns = combined_batch.columns().to_vec();
+        }
+
+        // Update data_buffer with the sorted combined batch for time span detection
+        self.data_buffer = vec![combined_batch.clone()];
+
+        // Detect time span information (now from sorted data)
+        let time_span_info = self.detect_time_span(&schema, &self.data_buffer)?;
+
+        // Extract time series data for each field and calculate beginning/missing_valued
         for config in &self.field_configs {
             let field_idx = schema
                 .fields()
@@ -329,39 +1380,68 @@ impl TableFunction for Predict {
                 .position(|f| f.name().as_str() == config.field_name.as_str())
                 .ok_or_else(|| anyhow!("Field not found: {}", config.field_name))?;
 
-            let mut values = Vec::new();
-            for batch in &self.data_buffer {
-                let array = batch.column(field_idx);
-                let batch_values = self.extract_numeric_values(array, batch.num_rows());
-                values.extend(batch_values);
-            }
+            // Extract values from the sorted combined batch
+            let array = combined_batch.column(field_idx);
+            let values = self.extract_numeric_values(array, combined_batch.num_rows());
 
+            // Calculate beginning (leading nulls) for this field
+            let beginning = self.calculate_beginning(&values);
+            // Update the field config with the calculated beginning
+            // Also check for missing values
+            let missing_valued = self.calculate_missing_valued(&values);
+
+            // Store in time_series_data
             self.time_series_data
                 .insert(config.field_name.clone(), values);
+
+            // Update the beginning and missing_valued for the first field
+            // (we use the first field's beginning as the global beginning for now)
+            if self.beginning == 0 {
+                self.beginning = beginning;
+                self.missing_valued = missing_valued;
+            }
         }
 
         // Generate predictions for each field
         let mut output_columns: Vec<ArrayRef> = Vec::new();
         let mut output_fields: Vec<Field> = Vec::new();
 
-        // First, concatenate all original columns from all batches
+        // Use the already sorted and concatenated columns
         for (col_idx, field) in schema.fields().iter().enumerate() {
-            let mut arrays_to_concat = Vec::new();
-            for batch in &self.data_buffer {
-                arrays_to_concat.push(batch.column(col_idx).clone());
-            }
+            let mut concatenated = concatenated_columns[col_idx].clone();
 
-            let mut concatenated = if arrays_to_concat.is_empty() {
-                self.data_buffer[0].column(col_idx).clone()
-            } else {
-                let refs: Vec<&dyn Array> = arrays_to_concat.iter().map(|a| a.as_ref()).collect();
-                concat(&refs).context("Failed to concatenate arrays")?
-            };
-
-            // Extend original columns with nulls for future_timespan rows
+            // Extend original columns with values for future_timespan rows
             if self.future_timespan > 0 {
-                // For nullable fields, use null array; for non-nullable, use default values
-                let extension_array = if field.is_nullable() {
+                // Check if this is a time column that should be extended with computed timestamps
+                let is_time_column = field.name() == "_time";
+
+                let extension_array = if is_time_column {
+                    // Try to extend _time column with computed future timestamps
+                    if let Some((time_span, time_idx)) = time_span_info.as_ref() {
+                        // Use detected time span info
+                        let last_valid_idx = all_rows.saturating_sub(1);
+                        self.extend_time_column(
+                            &concatenated,
+                            time_span,
+                            *time_idx,
+                            self.future_timespan,
+                            last_valid_idx,
+                        )?
+                    } else {
+                        // Try to compute time span directly from _time column
+                        self.extend_time_column_auto(&concatenated, self.future_timespan, all_rows)?
+                    }
+                } else if field.name() == "_span" || field.name() == "_spandays" {
+                    // Keep _span and _spandays constant for future rows
+                    if all_rows > 0 {
+                        // Get the last value and repeat it
+                        let last_idx = all_rows - 1;
+                        self.extend_with_last_value(&concatenated, last_idx, self.future_timespan)?
+                    } else {
+                        arrow::array::new_null_array(field.data_type(), self.future_timespan)
+                    }
+                } else if field.is_nullable() {
+                    // For nullable fields, use null array
                     arrow::array::new_null_array(field.data_type(), self.future_timespan)
                 } else {
                     // For non-nullable fields, create an array with default values
@@ -384,7 +1464,6 @@ impl TableFunction for Predict {
                             ])) as ArrayRef,
                         _ => {
                             // For other types, try to create null array even if field is non-nullable
-                            // This might fail, but it's better than crashing
                             arrow::array::new_null_array(field.data_type(), self.future_timespan)
                         }
                     }
@@ -428,6 +1507,11 @@ impl TableFunction for Predict {
                 upper_bounds.truncate(total_rows);
             }
 
+            // Determine the output column names (using underscores instead of parentheses)
+            let predicted_col_name = format!("prediction_{}", config.field_name);
+            let lower_col_name = format!("lower_{}", predicted_col_name);
+            let upper_col_name = format!("upper_{}", predicted_col_name);
+
             let predicted_array = Arc::new(Float64Array::from(predicted_values)) as ArrayRef;
             let lower_array = Arc::new(Float64Array::from(lower_bounds)) as ArrayRef;
             let upper_array = Arc::new(Float64Array::from(upper_bounds)) as ArrayRef;
@@ -436,21 +1520,9 @@ impl TableFunction for Predict {
             output_columns.push(lower_array);
             output_columns.push(upper_array);
 
-            output_fields.push(Field::new(
-                format!("{}_predicted", config.field_name),
-                DataType::Float64,
-                true,
-            ));
-            output_fields.push(Field::new(
-                format!("{}_lower", config.field_name),
-                DataType::Float64,
-                true,
-            ));
-            output_fields.push(Field::new(
-                format!("{}_upper", config.field_name),
-                DataType::Float64,
-                true,
-            ));
+            output_fields.push(Field::new(predicted_col_name, DataType::Float64, true));
+            output_fields.push(Field::new(lower_col_name, DataType::Float64, true));
+            output_fields.push(Field::new(upper_col_name, DataType::Float64, true));
         }
 
         // Create output schema
@@ -509,8 +1581,8 @@ mod tests {
     fn test_predict_basic() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let mut predict = Predict::new(Some(params), vec![]).expect("Failed to create Predict");
+        let named_args = vec![("fields".to_string(), Arg::String("value".to_string()))];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         // Process batch
         let result = predict.process(batch).expect("Processing failed");
@@ -524,22 +1596,24 @@ mod tests {
 
         // Check that we have original columns + 3 prediction columns (predicted, lower, upper)
         assert_eq!(output.num_columns(), 5); // 2 original + 3 prediction columns
-        assert_eq!(output.num_rows(), 15); // 5 original + 10 future_timespan (default)
+        assert_eq!(output.num_rows(), 10); // 5 original + 5 future_timespan (default)
 
         // Check prediction columns exist
         let schema = output.schema();
-        assert!(schema.field_with_name("value_predicted").is_ok());
-        assert!(schema.field_with_name("value_lower").is_ok());
-        assert!(schema.field_with_name("value_upper").is_ok());
+        assert!(schema.field_with_name("prediction_value").is_ok());
+        assert!(schema.field_with_name("lower_prediction_value").is_ok());
+        assert!(schema.field_with_name("upper_prediction_value").is_ok());
     }
 
     #[test]
     fn test_predict_with_algorithm() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![("algorithm".to_string(), Arg::String("LL".to_string()))];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("algorithm".to_string(), Arg::String("LL".to_string())),
+        ];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -554,9 +1628,11 @@ mod tests {
     fn test_predict_with_future_timespan() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![("future_timespan".to_string(), Arg::Int(5))];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("future_timespan".to_string(), Arg::Int(5)),
+        ];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -572,12 +1648,12 @@ mod tests {
     fn test_predict_with_holdback() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
             ("holdback".to_string(), Arg::Int(2)),
-            ("future_timespan".to_string(), Arg::Int(1)), // Must be positive
+            ("future_timespan".to_string(), Arg::Int(1)),
         ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -608,8 +1684,8 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
             .expect("Failed to create test RecordBatch");
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let mut predict = Predict::new(Some(params), vec![]).expect("Failed to create Predict");
+        let named_args = vec![("fields".to_string(), Arg::String("value".to_string()))];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -638,11 +1714,11 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![time_array, value1_array, value2_array])
             .expect("Failed to create test RecordBatch");
 
-        let params = Args::from(vec![
-            Arg::String("value1".to_string()),
-            Arg::String("value2".to_string()),
-        ]);
-        let mut predict = Predict::new(Some(params), vec![]).expect("Failed to create Predict");
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value1".to_string())),
+            ("fields".to_string(), Arg::String("value2".to_string())),
+        ];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -653,10 +1729,10 @@ mod tests {
         // Should have 3 original columns + 6 prediction columns (3 per field)
         assert_eq!(output.num_columns(), 9);
 
-        // Check both fields have prediction columns
+        // Check both fields have prediction columns (matching Python output format)
         let schema = output.schema();
-        assert!(schema.field_with_name("value1_predicted").is_ok());
-        assert!(schema.field_with_name("value2_predicted").is_ok());
+        assert!(schema.field_with_name("prediction_value1").is_ok());
+        assert!(schema.field_with_name("prediction_value2").is_ok());
     }
 
     #[test]
@@ -665,12 +1741,12 @@ mod tests {
         let values = vec![10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0];
         let batch = create_test_batch(values);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
             ("algorithm".to_string(), Arg::String("LLP".to_string())),
             ("period".to_string(), Arg::Int(3)),
         ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -685,9 +1761,11 @@ mod tests {
     fn test_predict_algorithm_llt() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![("algorithm".to_string(), Arg::String("LLT".to_string()))];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("algorithm".to_string(), Arg::String("LLT".to_string())),
+        ];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -702,9 +1780,11 @@ mod tests {
     fn test_predict_algorithm_llp5() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![("algorithm".to_string(), Arg::String("LLP5".to_string()))];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("algorithm".to_string(), Arg::String("LLP5".to_string())),
+        ];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -728,8 +1808,8 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
             .expect("Failed to create test RecordBatch");
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let mut predict = Predict::new(Some(params), vec![]).expect("Failed to create Predict");
+        let named_args = vec![("fields".to_string(), Arg::String("value".to_string()))];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict.finalize().expect("Finalize failed");
@@ -742,8 +1822,8 @@ mod tests {
     fn test_predict_invalid_field() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0]);
 
-        let params = Args::from(vec![Arg::String("nonexistent".to_string())]);
-        let mut predict = Predict::new(Some(params), vec![]).expect("Failed to create Predict");
+        let named_args = vec![("fields".to_string(), Arg::String("nonexistent".to_string()))];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let result = predict.finalize();
@@ -761,9 +1841,11 @@ mod tests {
 
     #[test]
     fn test_predict_invalid_algorithm() {
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![("algorithm".to_string(), Arg::String("INVALID".to_string()))];
-        let result = Predict::new(Some(params), named_args);
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("algorithm".to_string(), Arg::String("INVALID".to_string())),
+        ];
+        let result = Predict::new(None, named_args);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("algorithm"));
     }
@@ -772,12 +1854,12 @@ mod tests {
     fn test_predict_confidence_intervals() {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
             ("upper".to_string(), Arg::Float(0.99)),
             ("lower".to_string(), Arg::Float(0.95)),
         ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -813,8 +1895,8 @@ mod tests {
         let batch1 = create_test_batch(vec![10.0, 12.0, 14.0]);
         let batch2 = create_test_batch(vec![16.0, 18.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let mut predict = Predict::new(Some(params), vec![]).expect("Failed to create Predict");
+        let named_args = vec![("fields".to_string(), Arg::String("value".to_string()))];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         // Process multiple batches
         predict.process(batch1).expect("Processing failed");
@@ -826,7 +1908,7 @@ mod tests {
             .expect("No output");
 
         // Should have concatenated all rows
-        assert_eq!(output.num_rows(), 15); // 5 original + 10 future
+        assert_eq!(output.num_rows(), 10); // 5 original + 5 future
     }
 
     #[test]
@@ -843,8 +1925,8 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
             .expect("Failed to create test RecordBatch");
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let mut predict = Predict::new(Some(params), vec![]).expect("Failed to create Predict");
+        let named_args = vec![("fields".to_string(), Arg::String("value".to_string()))];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -888,12 +1970,12 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![time_array, count_array])
             .expect("Failed to create test RecordBatch");
 
-        let params = Args::from(vec![Arg::String("count".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("count".to_string())),
             ("algorithm".to_string(), Arg::String("LLT".to_string())),
             ("future_timespan".to_string(), Arg::Int(7)),
         ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -905,27 +1987,27 @@ mod tests {
         assert_eq!(output.num_rows(), 15);
         assert_eq!(output.num_columns(), 5); // 2 original + 3 prediction columns
 
-        // Check that prediction columns exist
+        // Check that prediction columns exist (matching Python output format)
         let schema = output.schema();
-        assert!(schema.field_with_name("count_predicted").is_ok());
-        assert!(schema.field_with_name("count_lower").is_ok());
-        assert!(schema.field_with_name("count_upper").is_ok());
+        assert!(schema.field_with_name("prediction_count").is_ok());
+        assert!(schema.field_with_name("lower_prediction_count").is_ok());
+        assert!(schema.field_with_name("upper_prediction_count").is_ok());
 
         // Extract prediction values
         let predicted_idx = schema
             .fields()
             .iter()
-            .position(|f| f.name() == "count_predicted")
+            .position(|f| f.name() == "prediction_count")
             .unwrap();
         let lower_idx = schema
             .fields()
             .iter()
-            .position(|f| f.name() == "count_lower")
+            .position(|f| f.name() == "lower_prediction_count")
             .unwrap();
         let upper_idx = schema
             .fields()
             .iter()
-            .position(|f| f.name() == "count_upper")
+            .position(|f| f.name() == "upper_prediction_count")
             .unwrap();
 
         let predicted_array = output
@@ -1062,12 +2144,12 @@ mod tests {
         // Test LLP1 algorithm (LLP with variance taking maximum)
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
             ("algorithm".to_string(), Arg::String("LLP1".to_string())),
             ("period".to_string(), Arg::Int(3)),
         ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -1077,13 +2159,13 @@ mod tests {
 
         // Check basic output structure
         assert_eq!(output.num_columns(), 5);
-        assert_eq!(output.num_rows(), 17); // 7 original + 10 future
+        assert_eq!(output.num_rows(), 12); // 7 original + 5 future
 
         // Check prediction columns exist
         let schema = output.schema();
-        assert!(schema.field_with_name("value_predicted").is_ok());
-        assert!(schema.field_with_name("value_lower").is_ok());
-        assert!(schema.field_with_name("value_upper").is_ok());
+        assert!(schema.field_with_name("prediction_value").is_ok());
+        assert!(schema.field_with_name("lower_prediction_value").is_ok());
+        assert!(schema.field_with_name("upper_prediction_value").is_ok());
     }
 
     #[test]
@@ -1091,12 +2173,12 @@ mod tests {
         // Test LLP2 algorithm (combines LL and LLP)
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0]);
 
-        let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
             ("algorithm".to_string(), Arg::String("LLP2".to_string())),
             ("period".to_string(), Arg::Int(3)),
         ];
-        let mut predict = Predict::new(Some(params), named_args).expect("Failed to create Predict");
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
 
         predict.process(batch).expect("Processing failed");
         let output = predict
@@ -1107,24 +2189,24 @@ mod tests {
         // Check basic output structure
         assert_eq!(output.num_columns(), 5);
 
-        // Check prediction columns exist
+        // Check prediction columns exist (matching Python output format)
         let schema = output.schema();
-        assert!(schema.field_with_name("value_predicted").is_ok());
+        assert!(schema.field_with_name("prediction_value").is_ok());
     }
 
     #[test]
     fn test_predict_algorithm_llp2_with_insufficient_period() {
         // LLP2 with period < 2 may either fail or use default behavior
         // The library may handle this gracefully by using the default period
-        let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
             ("algorithm".to_string(), Arg::String("LLP2".to_string())),
             ("period".to_string(), Arg::Int(1)),
         ];
 
         // Try to create the predictor - if it succeeds, it means the library
         // handles this case gracefully
-        let result = Predict::new(Some(params), named_args);
+        let result = Predict::new(None, named_args);
         // Either success or a specific error about period is acceptable
         if result.is_err() {
             let err_msg = result.unwrap_err().to_string();
@@ -1144,12 +2226,12 @@ mod tests {
         let batch = create_test_batch(vec![10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0]);
 
         // Test lowercase algorithm name with proper period
-        let params = Args::from(vec![Arg::String("value".to_string())]);
         let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
             ("algorithm".to_string(), Arg::String("llp1".to_string())),
             ("period".to_string(), Arg::Int(3)), // Need period for LLP1
         ];
-        let mut predict = Predict::new(Some(params), named_args)
+        let mut predict = Predict::new(None, named_args)
             .expect("Failed to create Predict with lowercase algorithm");
 
         predict.process(batch).expect("Processing failed");
@@ -1178,24 +2260,26 @@ mod tests {
         let periodic_batch = create_test_batch(vec![10.0, 12.0, 14.0, 10.0, 12.0, 14.0, 10.0]);
 
         for algo in algorithms {
-            let (params, named_args, batch): (Args, Vec<(String, Arg)>, RecordBatch) = match algo {
+            let (named_args, batch): (Vec<(String, Arg)>, RecordBatch) = match algo {
                 "LL" | "LLT" | "LLP5" => {
-                    let params = Args::from(vec![Arg::String("value".to_string())]);
-                    let named_args = vec![("algorithm".to_string(), Arg::String(algo.to_string()))];
-                    (params, named_args, simple_batch.clone())
+                    let named_args = vec![
+                        ("fields".to_string(), Arg::String("value".to_string())),
+                        ("algorithm".to_string(), Arg::String(algo.to_string())),
+                    ];
+                    (named_args, simple_batch.clone())
                 }
                 "LLP" | "LLP1" | "LLP2" => {
-                    let params = Args::from(vec![Arg::String("value".to_string())]);
                     let named_args = vec![
+                        ("fields".to_string(), Arg::String("value".to_string())),
                         ("algorithm".to_string(), Arg::String(algo.to_string())),
                         ("period".to_string(), Arg::Int(3)),
                     ];
-                    (params, named_args, periodic_batch.clone())
+                    (named_args, periodic_batch.clone())
                 }
                 _ => unreachable!(),
             };
 
-            let mut predict = Predict::new(Some(params), named_args.clone()).expect(&format!(
+            let mut predict = Predict::new(None, named_args.clone()).expect(&format!(
                 "Failed to create Predict with algorithm: {}",
                 algo
             ));
@@ -1220,13 +2304,15 @@ mod tests {
     #[test]
     fn test_predict_invalid_algorithm_name() {
         // Test that invalid algorithm names are rejected
-        let params = Args::from(vec![Arg::String("value".to_string())]);
-        let named_args = vec![(
-            "algorithm".to_string(),
-            Arg::String("INVALID_ALGORITHM".to_string()),
-        )];
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            (
+                "algorithm".to_string(),
+                Arg::String("INVALID_ALGORITHM".to_string()),
+            ),
+        ];
 
-        let result = Predict::new(Some(params), named_args);
+        let result = Predict::new(None, named_args);
         assert!(result.is_err());
         assert!(
             result
@@ -1234,5 +2320,729 @@ mod tests {
                 .to_string()
                 .contains("Unknown algorithm")
         );
+    }
+
+    // ==================== Parameter Tests ====================
+
+    #[test]
+    fn test_predict_nonnegative_parameter() {
+        // Test nonnegative parameter - forces all fields to be treated as counts
+        let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
+
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("nonnegative".to_string(), Arg::String("t".to_string())),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        // Should have prediction columns
+        assert!(output.num_columns() >= 3);
+        let schema = output.schema();
+        assert!(schema.field_with_name("prediction_value").is_ok());
+    }
+
+    #[test]
+    fn test_predict_start_parameter() {
+        // Test 'start' parameter for data start position
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("time", DataType::Int32, false),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        // Create data with some null values at the beginning
+        let time_array = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6])) as ArrayRef;
+        let value_array = Arc::new(Float64Array::from(vec![
+            None,
+            None,
+            Some(10.0),
+            Some(12.0),
+            Some(14.0),
+            Some(16.0),
+            Some(18.0),
+        ])) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
+            .expect("Failed to create test RecordBatch");
+
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("start".to_string(), Arg::Int(2)), // Start from index 2
+            ("future_timespan".to_string(), Arg::Int(2)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        assert!(output.num_rows() >= 7);
+    }
+
+    // ==================== Auto-Count Detection Tests ====================
+
+    #[test]
+    fn test_predict_auto_count_detection() {
+        // Test automatic count field detection based on field name
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("time", DataType::Int32, false),
+            Field::new("count", DataType::Float64, false), // Should be detected as count
+            Field::new("normal_field", DataType::Float64, false),
+        ]));
+
+        let time_array = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])) as ArrayRef;
+        let count_array =
+            Arc::new(Float64Array::from(vec![10.0, 12.0, 14.0, 16.0, 18.0])) as ArrayRef;
+        let normal_array = Arc::new(Float64Array::from(vec![5.0, 6.0, 7.0, 8.0, 9.0])) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![time_array, count_array, normal_array])
+            .expect("Failed to create test RecordBatch");
+
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("count".to_string())),
+            (
+                "fields".to_string(),
+                Arg::String("normal_field".to_string()),
+            ),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        // Both fields should be processed
+        assert!(output.num_columns() >= 7); // 3 original + 2*2 prediction columns
+    }
+
+    #[test]
+    fn test_predict_count_prefix_detection() {
+        // Test detection of various count field prefixes
+        let test_cases = vec![
+            ("c", "c prefix"),
+            ("count", "count prefix"),
+            ("dc", "dc prefix"),
+            ("distinct_count", "distinct_count prefix"),
+            ("estdc", "estdc prefix"),
+        ];
+
+        for (field_name, description) in test_cases {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("time", DataType::Int32, false),
+                Field::new(field_name, DataType::Float64, false),
+            ]));
+
+            let time_array = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])) as ArrayRef;
+            let value_array =
+                Arc::new(Float64Array::from(vec![10.0, 12.0, 14.0, 16.0, 18.0])) as ArrayRef;
+
+            let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
+                .expect("Failed to create test RecordBatch");
+
+            let named_args = vec![("fields".to_string(), Arg::String(field_name.to_string()))];
+
+            let mut predict = Predict::new(None, named_args)
+                .expect(&format!("Failed to create Predict for {}", description));
+            predict
+                .process(batch)
+                .expect(&format!("Processing failed for {}", description));
+
+            let result = predict.finalize();
+            // Should succeed even with count field detection
+            assert!(
+                result.is_ok(),
+                "Finalize should succeed for {}",
+                description
+            );
+        }
+    }
+
+    // ==================== Correlate Field Tests ====================
+
+    // ==================== Holdback and Future Timespan Tests ====================
+
+    #[test]
+    fn test_predict_holdback_with_future() {
+        // Test holdback combined with future_timespan
+        let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0]);
+
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("holdback".to_string(), Arg::Int(2)),
+            ("future_timespan".to_string(), Arg::Int(3)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        // 7 original + 3 future = 10 rows
+        assert_eq!(output.num_rows(), 10);
+    }
+
+    // ==================== Data Validation Tests ====================
+
+    #[test]
+    fn test_predict_future_timespan_validation() {
+        // Test that negative future_timespan is rejected
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("future_timespan".to_string(), Arg::Int(-1)),
+        ];
+
+        let result = Predict::new(None, named_args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_predict_period_validation() {
+        // Test that period < 1 is handled
+        let batch = create_test_batch(vec![10.0, 12.0, 14.0]);
+
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("period".to_string(), Arg::Int(0)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        // Should still work with period = 0 (use default)
+        let result = predict.finalize();
+        assert!(result.is_ok());
+    }
+
+    // ==================== Algorithm-Specific Tests ====================
+
+    #[test]
+    fn test_predict_algorithm_llb() {
+        // Test LLB (Local Level with Bivariate) algorithm
+        let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
+
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("algorithm".to_string(), Arg::String("LLB".to_string())),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        assert_eq!(output.num_columns(), 5);
+        assert!(output.num_rows() >= 5);
+    }
+
+    #[test]
+    fn test_predict_algorithm_bill() {
+        // Test BiLL (Bivariate Local Level) algorithm
+        let batch = create_test_batch(vec![10.0, 12.0, 14.0, 16.0, 18.0]);
+
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("algorithm".to_string(), Arg::String("BiLL".to_string())),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        assert_eq!(output.num_columns(), 5);
+    }
+
+    #[test]
+    fn test_predict_all_algorithms_with_periodic_data() {
+        // Test all algorithms with properly periodic data
+        // LLP, LLP1, LLP2 need periodic data to work properly
+        let periodic_values: Vec<f64> = (0..14).map(|i| (i % 7) as f64 * 10.0 + 5.0).collect();
+        let batch = create_test_batch(periodic_values);
+
+        let algorithms = vec!["LL", "LLT", "LLP", "LLP1", "LLP2", "LLP5"];
+
+        for algo in algorithms {
+            let named_args = vec![
+                ("fields".to_string(), Arg::String("value".to_string())),
+                ("algorithm".to_string(), Arg::String(algo.to_string())),
+                ("period".to_string(), Arg::Int(7)),
+            ];
+
+            let mut predict = Predict::new(None, named_args)
+                .expect(&format!("Failed to create Predict for {}", algo));
+            predict
+                .process(batch.clone())
+                .expect(&format!("Processing failed for {}", algo));
+
+            let result = predict.finalize();
+            assert!(result.is_ok(), "{} should work with periodic data", algo);
+        }
+    }
+
+    // ==================== Time Extension Tests ====================
+
+    #[test]
+    fn test_predict_time_extension_with_string_timestamps() {
+        // Test time extension with ISO8601 string format timestamps
+        // like "2005-06-07T22:00:00.000+0800"
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_time", DataType::Utf8, true),
+            Field::new("bits_transferred", DataType::Float64, true),
+        ]));
+
+        // Create test data with ISO8601 string timestamps (daily intervals)
+        let time_array = Arc::new(arrow::array::StringArray::from(vec![
+            "2005-06-05T22:00:00.000+0800",
+            "2005-06-06T22:00:00.000+0800",
+            "2005-06-07T22:00:00.000+0800",
+        ])) as ArrayRef;
+
+        let value_array = Arc::new(Float64Array::from(vec![
+            5548947933.0,
+            5648947933.0,
+            5748947933.0,
+        ])) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
+            .expect("Failed to create test RecordBatch");
+
+        let named_args = vec![
+            (
+                "fields".to_string(),
+                Arg::String("bits_transferred".to_string()),
+            ),
+            ("future_timespan".to_string(), Arg::Int(3)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        // Should have 3 original rows + 3 future rows = 6 rows
+        assert_eq!(output.num_rows(), 6);
+
+        // Check that _time column has been extended
+        let time_col_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "_time")
+            .expect("_time column not found");
+
+        let time_col = output.column(time_col_idx);
+
+        // Time column should be string type
+        assert!(
+            matches!(time_col.data_type(), DataType::Utf8),
+            "_time column should be Utf8"
+        );
+
+        let time_str_array = time_col.as_string::<i32>();
+
+        // All 6 rows should have non-null time values
+        for i in 0..6 {
+            assert!(
+                time_str_array.is_valid(i),
+                "Row {} should have valid time",
+                i
+            );
+            let time_val = time_str_array.value(i);
+            assert!(!time_val.is_empty(), "Row {} should have non-empty time", i);
+            println!("Row {}: _time = {}", i, time_val);
+        }
+
+        // Check prediction column
+        let pred_col_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "prediction_bits_transferred")
+            .expect("prediction_bits_transferred column not found");
+
+        let pred_col = output
+            .column(pred_col_idx)
+            .as_primitive::<arrow::datatypes::Float64Type>();
+
+        // All 6 rows should have prediction values
+        for i in 0..6 {
+            assert!(
+                pred_col.is_valid(i),
+                "Row {} should have valid prediction",
+                i
+            );
+            let pred_val = pred_col.value(i);
+            println!("Row {}: prediction_bits_transferred = {}", i, pred_val);
+        }
+    }
+
+    #[test]
+    fn test_predict_time_extension_with_int64_timestamps() {
+        // Test time extension with Int64 timestamps (microseconds)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_time", DataType::Int64, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        // Create test data with Int64 timestamps (daily intervals in microseconds)
+        // 86400 seconds = 1 day, 86400 * 1_000_000 = 86400000000 microseconds
+        let day_in_micros: i64 = 86400 * 1_000_000;
+        let base_time: i64 = 1117987200000000; // 2005-06-05 in microseconds
+
+        let time_array = Arc::new(arrow::array::Int64Array::from(vec![
+            base_time,
+            base_time + day_in_micros,
+            base_time + 2 * day_in_micros,
+        ])) as ArrayRef;
+
+        let value_array = Arc::new(Float64Array::from(vec![100.0, 200.0, 300.0])) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
+            .expect("Failed to create test RecordBatch");
+
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("future_timespan".to_string(), Arg::Int(2)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        // Should have 3 original rows + 2 future rows = 5 rows
+        assert_eq!(output.num_rows(), 5);
+
+        // Check that _time column has been extended
+        let time_col_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "_time")
+            .expect("_time column not found");
+
+        let time_col = output.column(time_col_idx);
+        let time_array = time_col.as_primitive::<arrow::datatypes::Int64Type>();
+
+        // All 5 rows should have non-null time values
+        for i in 0..5 {
+            assert!(time_array.is_valid(i), "Row {} should have valid time", i);
+            let time_val = time_array.value(i);
+            println!("Row {}: _time = {}", i, time_val);
+        }
+
+        // Verify that future timestamps are correctly computed
+        // Row 3 should be base_time + 3 * day_in_micros
+        // Row 4 should be base_time + 4 * day_in_micros
+        let expected_time_3 = base_time + 3 * day_in_micros;
+        let expected_time_4 = base_time + 4 * day_in_micros;
+
+        assert_eq!(
+            time_array.value(3),
+            expected_time_3,
+            "Row 3 should have correct future timestamp"
+        );
+        assert_eq!(
+            time_array.value(4),
+            expected_time_4,
+            "Row 4 should have correct future timestamp"
+        );
+    }
+
+    #[test]
+    fn test_predict_time_extension_with_microseconds_2hour_interval() {
+        // Test time extension with Int64 timestamps in microseconds format
+        // with 2-hour intervals (like the user's actual data)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_time", DataType::Int64, true),
+            Field::new("bits_transferred", DataType::Float64, true),
+        ]));
+
+        // Create test data with 2-hour intervals in microseconds
+        // 2 hours = 7200 seconds = 7200 * 1_000_000 = 7200000000 microseconds
+        let two_hours_in_micros: i64 = 7200 * 1_000_000;
+        // 2005-06-07T22:00:00+0800 in microseconds (Unix epoch)
+        let base_time: i64 = 1118156400 * 1_000_000; // seconds * 1M
+
+        let mut times: Vec<i64> = Vec::new();
+        let mut values: Vec<f64> = Vec::new();
+        for i in 0..5 {
+            times.push(base_time + i as i64 * two_hours_in_micros);
+            values.push(5548947933.0 + i as f64 * 100000000.0);
+        }
+
+        let time_array = Arc::new(arrow::array::Int64Array::from(times.clone())) as ArrayRef;
+        let value_array = Arc::new(Float64Array::from(values)) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
+            .expect("Failed to create test RecordBatch");
+
+        let named_args = vec![
+            (
+                "fields".to_string(),
+                Arg::String("bits_transferred".to_string()),
+            ),
+            ("future_timespan".to_string(), Arg::Int(3)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        // Should have 5 original rows + 3 future rows = 8 rows
+        assert_eq!(output.num_rows(), 8);
+
+        // Check that _time column has been extended
+        let time_col_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "_time")
+            .expect("_time column not found");
+
+        let time_col = output.column(time_col_idx);
+        let time_array = time_col.as_primitive::<arrow::datatypes::Int64Type>();
+
+        // All 8 rows should have valid time values
+        for i in 0..8 {
+            assert!(time_array.is_valid(i), "Row {} should have valid time", i);
+            let time_val = time_array.value(i);
+            println!("Row {}: _time = {} (microseconds)", i, time_val);
+        }
+
+        // Verify that future timestamps are correctly computed with 2-hour intervals
+        let expected_time_5 = base_time + 5 * two_hours_in_micros;
+        let expected_time_6 = base_time + 6 * two_hours_in_micros;
+        let expected_time_7 = base_time + 7 * two_hours_in_micros;
+
+        assert_eq!(
+            time_array.value(5),
+            expected_time_5,
+            "Row 5 should have correct future timestamp"
+        );
+        assert_eq!(
+            time_array.value(6),
+            expected_time_6,
+            "Row 6 should have correct future timestamp"
+        );
+        assert_eq!(
+            time_array.value(7),
+            expected_time_7,
+            "Row 7 should have correct future timestamp"
+        );
+
+        // Print human-readable times for verification
+        println!("\nHuman-readable times:");
+        for i in 0..8 {
+            let ts = time_array.value(i);
+            let ts_seconds = ts / 1_000_000;
+            if let Some(dt) = DateTime::<Utc>::from_timestamp(ts_seconds, 0) {
+                println!("Row {}: {}", i, dt.format("%Y-%m-%dT%H:%M:%S+0000"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_predict_time_extension_with_string_2hour_interval() {
+        // Test time extension with STRING timestamps in the exact format user provided
+        // with 2-hour intervals: 2005-07-27T20:00:00.000+0800
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_time", DataType::Utf8, true),
+            Field::new("bits_transferred", DataType::Float64, true),
+        ]));
+
+        // Create test data with 2-hour intervals using user's exact format
+        let times = vec![
+            "2005-06-07T22:00:00.000+0800",
+            "2005-06-08T00:00:00.000+0800",
+            "2005-06-08T02:00:00.000+0800",
+            "2005-06-08T04:00:00.000+0800",
+            "2005-06-08T06:00:00.000+0800",
+        ];
+        let values = vec![
+            5548947933.0,
+            7138793066.0,
+            7516418311.0,
+            7517711314.0,
+            6700932379.0,
+        ];
+
+        let time_array = Arc::new(arrow::array::StringArray::from(times)) as ArrayRef;
+        let value_array = Arc::new(Float64Array::from(values)) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
+            .expect("Failed to create test RecordBatch");
+
+        let named_args = vec![
+            (
+                "fields".to_string(),
+                Arg::String("bits_transferred".to_string()),
+            ),
+            ("future_timespan".to_string(), Arg::Int(3)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        // Should have 5 original rows + 3 future rows = 8 rows
+        assert_eq!(output.num_rows(), 8);
+
+        // Check that _time column has been extended
+        let time_col_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "_time")
+            .expect("_time column not found");
+
+        let time_col = output.column(time_col_idx);
+        let time_array = time_col.as_string::<i32>();
+
+        println!("String timestamp time extension test (2-hour interval):");
+        // All 8 rows should have valid time values
+        for i in 0..8 {
+            assert!(time_array.is_valid(i), "Row {} should have valid time", i);
+            let time_val = time_array.value(i);
+            println!("Row {}: _time = {}", i, time_val);
+        }
+
+        // Verify that future timestamps continue the 2-hour pattern
+        // Last original time: 2005-06-08T06:00:00.000+0800 (UTC: 2005-06-07T22:00:00)
+        // Next should be: 2005-06-08T08:00:00.000+0800 (UTC: 2005-06-08T00:00:00)
+        // But output format is +0000, so we expect UTC times
+        // Row 5 should be 2 hours after Row 4
+        // Row 4 (06:00+0800) = 22:00 UTC on June 7
+        // Row 5 should be 00:00 UTC on June 8 = 2005-06-08T00:00:00.000+0000
+        let row5_time = time_array.value(5);
+        let row6_time = time_array.value(6);
+        let row7_time = time_array.value(7);
+
+        println!("\nFuture timestamps:");
+        println!("Row 5 (should be +2h from Row 4): {}", row5_time);
+        println!("Row 6 (should be +4h from Row 4): {}", row6_time);
+        println!("Row 7 (should be +6h from Row 4): {}", row7_time);
+
+        // Verify the timestamps contain expected date patterns
+        assert!(
+            row5_time.contains("2005-06-08"),
+            "Row 5 should be on June 8: {}",
+            row5_time
+        );
+        assert!(
+            row6_time.contains("2005-06-08"),
+            "Row 6 should be on June 8: {}",
+            row6_time
+        );
+        assert!(
+            row7_time.contains("2005-06-08"),
+            "Row 7 should be on June 8: {}",
+            row7_time
+        );
+    }
+
+    #[test]
+    fn test_predict_time_sorting_before_prediction() {
+        // Test that data is sorted by _time before prediction
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_time", DataType::Int64, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        // Create test data with out-of-order timestamps
+        let time_array = Arc::new(arrow::array::Int64Array::from(vec![
+            300, // Should be last in sorted order
+            100, // Should be first in sorted order
+            200, // Should be middle in sorted order
+        ])) as ArrayRef;
+
+        let value_array = Arc::new(Float64Array::from(vec![30.0, 10.0, 20.0])) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
+            .expect("Failed to create test RecordBatch");
+
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("future_timespan".to_string(), Arg::Int(2)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        // Check that _time column is sorted
+        let time_col_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "_time")
+            .expect("_time column not found");
+
+        let time_col = output.column(time_col_idx);
+        let time_array = time_col.as_primitive::<arrow::datatypes::Int64Type>();
+
+        // First 3 rows should be sorted (100, 200, 300)
+        assert_eq!(time_array.value(0), 100, "Row 0 should be 100");
+        assert_eq!(time_array.value(1), 200, "Row 1 should be 200");
+        assert_eq!(time_array.value(2), 300, "Row 2 should be 300");
+
+        // Future rows should continue the pattern (400, 500)
+        assert_eq!(time_array.value(3), 400, "Row 3 should be 400");
+        assert_eq!(time_array.value(4), 500, "Row 4 should be 500");
+
+        // Check that values are also reordered
+        let value_col_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "value")
+            .expect("value column not found");
+
+        let value_col = output.column(value_col_idx);
+        let value_array = value_col.as_primitive::<arrow::datatypes::Float64Type>();
+
+        // Values should be reordered to match sorted times (10, 20, 30)
+        assert_eq!(value_array.value(0), 10.0, "Row 0 value should be 10.0");
+        assert_eq!(value_array.value(1), 20.0, "Row 1 value should be 20.0");
+        assert_eq!(value_array.value(2), 30.0, "Row 2 value should be 30.0");
     }
 }

@@ -101,15 +101,38 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
                     .parameter(ArgType::String) // field name(s)
                     .parameter((Some("algorithm"), ArgType::String, Some("LLP5")))
                     .parameter((Some("period"), ArgType::Int, Some(0)))
-                    .parameter((Some("future_timespan"), ArgType::Int, Some(10)))
+                    .parameter((Some("future_timespan"), ArgType::Int, Some(5)))
                     .parameter((Some("holdback"), ArgType::Int, Some(0)))
-                    .parameter((Some("upper"), ArgType::Float, Some(0.99)))
-                    .parameter((Some("lower"), ArgType::Float, Some(0.99)))
+                    .parameter((Some("nonnegative"), ArgType::Bool, Some(false)))
+                    .parameter((Some("start"), ArgType::Int, Some(0)))
                     .build()
                     .context("Failed to build signature parameters")?,
             )
             .build()
             .context("create `predict` registry failed")?,
+        FunctionRegistry::builder()
+            .name("anomalydetection")
+            .init(Arc::new(|ctx| {
+                AnomalyDetector::new(ctx.arguments, ctx.named_arguments)
+                    .map(|f| Box::new(f) as Box<dyn TableFunction>)
+            }))
+            .require_ordered(true)
+            .signature(
+                Signature::builder()
+                    .parameter((Some("method"), ArgType::String, Some("histogram")))
+                    .parameter((Some("action"), ArgType::String, Some("filter")))
+                    .parameter((Some("bins"), ArgType::Int, Some(10)))
+                    .parameter((Some("cutoff"), ArgType::Bool, Some(true)))
+                    .parameter((Some("pthresh"), ArgType::Float, Some(0.01)))
+                    .parameter((Some("sensitivity"), ArgType::String, Some("default")))
+                    .parameter((Some("param"), ArgType::Float, Some(1.5)))
+                    .parameter((Some("uselower"), ArgType::Bool, Some(false)))
+                    .parameter((Some("mark"), ArgType::Bool, Some(false)))
+                    .build()
+                    .context("Failed to build signature parameters")?,
+            )
+            .build()
+            .context("create `anomalydetection` registry failed")?,
     ])
 }
 
