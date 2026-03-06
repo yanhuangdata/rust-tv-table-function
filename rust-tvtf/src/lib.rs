@@ -128,6 +128,7 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
                     .parameter((Some("param"), ArgType::Float, Some(1.5)))
                     .parameter((Some("uselower"), ArgType::Bool, Some(false)))
                     .parameter((Some("mark"), ArgType::Bool, Some(false)))
+                    .parameter((Some("fields"), ArgType::String, Some("")))
                     .build()
                     .context("Failed to build signature parameters")?,
             )

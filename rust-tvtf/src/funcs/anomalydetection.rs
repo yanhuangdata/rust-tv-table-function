@@ -83,6 +83,9 @@ pub struct AnomalyDetector {
     ///
     /// Current implementation truncates values but cannot add the "000" prefix.
     mark: bool,
+    /// User-specified field names to use for anomaly detection.
+    /// If empty, all columns from the input are used.
+    target_fields: Vec<String>,
 }
 
 impl Default for AnomalyDetector {
@@ -100,6 +103,7 @@ impl Default for AnomalyDetector {
             param: Some(1.5),
             uselower: false,
             mark: false,
+            target_fields: Vec::new(),
         }
     }
 }
@@ -187,6 +191,15 @@ impl AnomalyDetector {
                 "uselower" => {
                     if let Arg::Bool(uselower) = arg {
                         detector.uselower = uselower;
+                    }
+                }
+                "fields" => {
+                    if let Arg::String(fields_str) = arg {
+                        detector.target_fields = fields_str
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
                     }
                 }
                 _ => {
@@ -1246,7 +1259,25 @@ impl TableFunction for AnomalyDetector {
         }
 
         let schema = input.schema();
-        let fields: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+        let all_fields: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+
+        let fields: Vec<String> = if self.target_fields.is_empty() {
+            all_fields.clone()
+        } else {
+            let invalid: Vec<&String> = self
+                .target_fields
+                .iter()
+                .filter(|f| !all_fields.contains(f))
+                .collect();
+            if !invalid.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Specified fields not found in input: {:?}. Available fields: {:?}",
+                    invalid,
+                    all_fields
+                ));
+            }
+            self.target_fields.clone()
+        };
 
         // Convert RecordBatch to Vec<Vec<(String, String)>>
         let data: Vec<Vec<(String, String)>> = (0..input.num_rows())
@@ -1929,5 +1960,214 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_fields_parameter_parsing() {
+        let params = vec![];
+        let named_params = vec![("fields".to_string(), Arg::String("status,code".to_string()))];
+
+        let detector = AnomalyDetector::new(Some(params), named_params)
+            .expect("Failed to create AnomalyDetector");
+
+        assert_eq!(detector.target_fields, vec!["status", "code"]);
+    }
+
+    #[test]
+    fn test_fields_parameter_single_field() {
+        let params = vec![];
+        let named_params = vec![("fields".to_string(), Arg::String("code".to_string()))];
+
+        let detector = AnomalyDetector::new(Some(params), named_params)
+            .expect("Failed to create AnomalyDetector");
+
+        assert_eq!(detector.target_fields, vec!["code"]);
+    }
+
+    #[test]
+    fn test_fields_parameter_with_spaces() {
+        let params = vec![];
+        let named_params = vec![(
+            "fields".to_string(),
+            Arg::String(" status , code ".to_string()),
+        )];
+
+        let detector = AnomalyDetector::new(Some(params), named_params)
+            .expect("Failed to create AnomalyDetector");
+
+        assert_eq!(detector.target_fields, vec!["status", "code"]);
+    }
+
+    #[test]
+    fn test_specified_fields_filter() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("status", DataType::Utf8, false),
+            Field::new("code", DataType::Int64, false),
+            Field::new("latency", DataType::Float64, false),
+        ]));
+
+        let status_col = Arc::new(StringArray::from(
+            std::iter::repeat("success")
+                .take(100)
+                .chain(std::iter::repeat("error").take(3))
+                .chain(std::iter::once("unknown"))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let code_col = Arc::new(Int64Array::from(
+            std::iter::repeat(200i64)
+                .take(100)
+                .chain(std::iter::repeat(500i64).take(3))
+                .chain(std::iter::once(999i64))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let latency_col = Arc::new(Float64Array::from(
+            std::iter::repeat(50.0)
+                .take(100)
+                .chain(std::iter::repeat(50.0).take(3))
+                .chain(std::iter::once(50.0))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+
+        let input_batch = RecordBatch::try_new(schema, vec![status_col, code_col, latency_col])
+            .expect("Failed to create record batch");
+
+        let params = vec![];
+        let named_params = vec![("fields".to_string(), Arg::String("status,code".to_string()))];
+        let mut detector = AnomalyDetector::new(Some(params), named_params)
+            .expect("Failed to create AnomalyDetector");
+
+        let output = detector.process(input_batch).expect("Processing failed");
+
+        assert!(output.is_some());
+        let output_batch = output.unwrap();
+
+        // Output should still have original columns + anomaly info columns
+        // 3 original + 4 anomaly info = 7
+        assert_eq!(output_batch.num_columns(), 7);
+        assert!(output_batch.num_rows() > 0);
+    }
+
+    #[test]
+    fn test_specified_fields_annotate() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("status", DataType::Utf8, false),
+            Field::new("code", DataType::Int64, false),
+            Field::new("latency", DataType::Float64, false),
+        ]));
+
+        let status_col = Arc::new(StringArray::from(
+            std::iter::repeat("success")
+                .take(100)
+                .chain(std::iter::repeat("error").take(3))
+                .chain(std::iter::once("unknown"))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let code_col = Arc::new(Int64Array::from(
+            std::iter::repeat(200i64)
+                .take(100)
+                .chain(std::iter::repeat(500i64).take(3))
+                .chain(std::iter::once(999i64))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let latency_col = Arc::new(Float64Array::from(
+            std::iter::repeat(50.0)
+                .take(100)
+                .chain(std::iter::repeat(50.0).take(3))
+                .chain(std::iter::once(50.0))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+
+        let input_batch = RecordBatch::try_new(schema, vec![status_col, code_col, latency_col])
+            .expect("Failed to create record batch");
+
+        let params = vec![];
+        let named_params = vec![
+            ("action".to_string(), Arg::String("annotate".to_string())),
+            ("fields".to_string(), Arg::String("code".to_string())),
+        ];
+        let mut detector = AnomalyDetector::new(Some(params), named_params)
+            .expect("Failed to create AnomalyDetector");
+
+        let output = detector.process(input_batch).expect("Processing failed");
+
+        assert!(output.is_some());
+        let output_batch = output.unwrap();
+
+        // Annotate returns all rows
+        assert_eq!(output_batch.num_rows(), 104);
+        // 3 original + 5 annotation = 8
+        assert_eq!(output_batch.num_columns(), 8);
+
+        // probable_cause should only reference "code" since that's the only field used
+        let probable_cause_col = output_batch
+            .column_by_name("probable_cause")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..probable_cause_col.len() {
+            assert_eq!(probable_cause_col.value(i), "code");
+        }
+    }
+
+    #[test]
+    fn test_invalid_field_name_returns_error() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("status", DataType::Utf8, false),
+            Field::new("code", DataType::Int64, false),
+        ]));
+
+        let status_col = Arc::new(StringArray::from(vec!["success"])) as ArrayRef;
+        let code_col = Arc::new(Int64Array::from(vec![200i64])) as ArrayRef;
+
+        let input_batch = RecordBatch::try_new(schema, vec![status_col, code_col])
+            .expect("Failed to create record batch");
+
+        let params = vec![];
+        let named_params = vec![("fields".to_string(), Arg::String("nonexistent".to_string()))];
+        let mut detector = AnomalyDetector::new(Some(params), named_params)
+            .expect("Failed to create AnomalyDetector");
+
+        let result = detector.process(input_batch);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_empty_fields_uses_all_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("status", DataType::Utf8, false),
+            Field::new("code", DataType::Int64, false),
+        ]));
+
+        let status_col = Arc::new(StringArray::from(
+            std::iter::repeat("success")
+                .take(100)
+                .chain(std::iter::repeat("error").take(3))
+                .chain(std::iter::once("unknown"))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let code_col = Arc::new(Int64Array::from(
+            std::iter::repeat(200i64)
+                .take(100)
+                .chain(std::iter::repeat(500i64).take(3))
+                .chain(std::iter::once(999i64))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+
+        let input_batch = RecordBatch::try_new(schema, vec![status_col, code_col])
+            .expect("Failed to create record batch");
+
+        // No fields parameter - should use all columns
+        let params = vec![];
+        let named_params = vec![];
+        let mut detector = AnomalyDetector::new(Some(params), named_params)
+            .expect("Failed to create AnomalyDetector");
+
+        assert!(detector.target_fields.is_empty());
+
+        let output = detector.process(input_batch).expect("Processing failed");
+        assert!(output.is_some());
+        assert!(output.unwrap().num_rows() > 0);
     }
 }
