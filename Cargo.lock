@@ -1137,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "predict"
-version = "0.2.37"
+version = "0.2.38"
 dependencies = [
  "anyhow",
 ]
@@ -1269,7 +1269,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rust-tvtf"
-version = "0.2.37"
+version = "0.2.38"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "rust-tvtf-api"
-version = "0.2.37"
+version = "0.2.38"
 dependencies = [
  "anyhow",
  "arrow",
@@ -1307,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "rust-tvtf-example"
-version = "0.2.37"
+version = "0.2.38"
 dependencies = [
  "anyhow",
  "arrow",
