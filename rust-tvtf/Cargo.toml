@@ -24,6 +24,7 @@ hashbrown = { workspace = true }
 csv = { workspace = true }
 ahash = "0.8"
 atoi_simd = "0.17.0"
+slotmap = "1.0.7"
 
 [build-dependencies]
 anyhow = { workspace = true }

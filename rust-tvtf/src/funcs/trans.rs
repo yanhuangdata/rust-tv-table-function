@@ -6,7 +6,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use hashbrown::Equivalent;
 use hashbrown::HashMap;
 use hashbrown::hash_map::RawEntryMut;
@@ -14,7 +14,9 @@ use parking_lot::Mutex;
 use regex::Regex;
 use rust_tvtf_api::TableFunction;
 use rust_tvtf_api::arg::{Arg, Args};
+use slotmap::{SlotMap, new_key_type};
 use smallvec::{SmallVec, smallvec};
+use std::hash::Hash;
 use std::sync::LazyLock;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
@@ -398,16 +400,7 @@ impl Transaction {
         }
     }
 
-    fn add_event(&mut self, event: &EventMap) -> Result<()> {
-        let time_str = event
-            .get(FIELD_TIME)
-            .context("Event missing _time field or _time is null")?;
-
-        let time_first = time_str.first().context("No _time in transaction")?;
-        let ts = atoi_simd::parse::<i64>(time_first.as_bytes())
-            .map_err(|_| anyhow!("Failed to parse _time as timestamp"))?;
-        let time = Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now);
-
+    fn add_event(&mut self, event: &EventMap, time: DateTime<Utc>) -> Result<()> {
         self.event_count += 1;
 
         if self.end_time.is_none() {
@@ -427,16 +420,7 @@ impl Transaction {
         Ok(())
     }
 
-    fn update_start_time_only(&mut self, event: &EventMap) -> Result<()> {
-        let time_str = event
-            .get(FIELD_TIME)
-            .context("Event missing _time field or _time is null")?;
-
-        let time_first = time_str.first().context("No _time in transaction")?;
-        let ts = atoi_simd::parse::<i64>(time_first.as_bytes())
-            .map_err(|_| anyhow!("Failed to parse _time as timestamp"))?;
-        let time = Utc.timestamp_micros(ts).earliest().unwrap_or_else(Utc::now);
-
+    fn update_start_time_only(&mut self, time: DateTime<Utc>) -> Result<()> {
         if self.start_time.is_none_or(|current| time < current) {
             self.start_time = Some(time);
         }
@@ -670,6 +654,29 @@ struct RefTransKey<'a> {
 
 type TransKey = OwnedTransKey;
 
+new_key_type! {
+    struct TxId;
+}
+
+#[derive(Clone, Debug)]
+struct ExpiryEntry {
+    expire_before: DateTime<Utc>,
+    tx_id: TxId,
+}
+
+#[derive(Clone, Debug)]
+enum TxLocation {
+    Live { key: TransKey },
+    Stack { key: TransKey },
+    Detached,
+}
+
+#[derive(Debug)]
+struct TxState {
+    tx: Transaction,
+    location: TxLocation,
+}
+
 impl<'a> Equivalent<OwnedTransKey> for RefTransKey<'a> {
     fn equivalent(&self, key: &OwnedTransKey) -> bool {
         if self.parts.len() != key.parts.len() {
@@ -710,12 +717,14 @@ impl Equivalent<OwnedTransKey> for SmallVec<[Option<String>; 4]> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TransactionPool {
     params: TransParams,
     frozen_trans: Vec<Transaction>,
-    live_trans: hashbrown::HashMap<TransKey, Transaction, ahash::RandomState>,
-    start_trans_stack: hashbrown::HashMap<TransKey, Vec<Transaction>, ahash::RandomState>, // Stack for pending start transactions
+    tx_store: SlotMap<TxId, TxState>,
+    expiry_queue: VecDeque<ExpiryEntry>,
+    live_trans: hashbrown::HashMap<TransKey, TxId, ahash::RandomState>,
+    start_trans_stack: hashbrown::HashMap<TransKey, VecDeque<TxId>, ahash::RandomState>, // Stack for pending start transactions
     earliest_event_timestamp: Option<DateTime<Utc>>,
     trans_complete_flag: hashbrown::HashMap<TransKey, bool, ahash::RandomState>,
 }
@@ -744,6 +753,8 @@ impl TransactionPool {
         TransactionPool {
             params,
             frozen_trans: Vec::new(),
+            tx_store: SlotMap::with_key(),
+            expiry_queue: VecDeque::new(),
             live_trans: hashbrown::HashMap::with_hasher(ahash::RandomState::new()),
             start_trans_stack: hashbrown::HashMap::with_hasher(ahash::RandomState::new()),
             earliest_event_timestamp: None,
@@ -772,69 +783,242 @@ impl TransactionPool {
     }
 
     fn freeze_trans_exceeded_max_span_restriction(&mut self) {
-        let Some(dur) = self.params.max_span else {
+        let Some(_) = self.max_span_delta() else {
             return;
         };
-        let max_span_secs = dur.as_secs();
-        if max_span_secs == 0 {
+        if self.expiry_queue.is_empty() {
             return;
         }
-        let max_span_micros_u64 = max_span_secs.saturating_mul(1_000_000);
-        let max_span_micros = if max_span_micros_u64 > i64::MAX as u64 {
-            i64::MAX
-        } else {
-            max_span_micros_u64 as i64
-        };
-
         let Some(earliest_ts) = self.earliest_event_timestamp else {
             return;
         };
-        let has_start_conditions = self.has_start_conditions();
-        let has_end_conditions = self.has_end_conditions();
-
-        // Move out the map to avoid cloning keys while deciding which entries to keep
-        let old_live = std::mem::take(&mut self.live_trans);
-        for (key, mut trans) in old_live.into_iter() {
-            if let Some(end_time) = trans.end_time {
-                let elapsed = end_time
-                    .signed_duration_since(earliest_ts)
-                    .num_microseconds()
-                    .unwrap_or(i64::MAX);
-                if elapsed > max_span_micros {
-                    mark_closed_for_flags(&mut trans, has_start_conditions, has_end_conditions);
-                    self.frozen_trans.push(trans);
-                    self.trans_complete_flag.remove(&key);
-                    continue;
-                }
+        while let Some(front) = self.expiry_queue.front() {
+            if earliest_ts >= front.expire_before {
+                break;
             }
-            // Keep the entry
-            self.live_trans.insert(key, trans);
+            let tx_id = front.tx_id;
+            self.expiry_queue.pop_front();
+
+            let Some(state) = self.tx_store.get(tx_id) else {
+                continue;
+            };
+            let location = state.location.clone();
+            if matches!(location, TxLocation::Detached) {
+                continue;
+            }
+
+            let Some(mut trans) = self.detach_expired_tx(tx_id, location) else {
+                continue;
+            };
+            let has_start_conditions = self.has_start_conditions();
+            let has_end_conditions = self.has_end_conditions();
+            mark_closed_for_flags(&mut trans, has_start_conditions, has_end_conditions);
+            self.frozen_trans.push(trans);
         }
+    }
 
-        self.start_trans_stack.retain(|_, stack| {
-            let mut idx = 0;
-            while idx < stack.len() {
-                let expire = stack[idx]
-                    .end_time
-                    .map(|end_time| {
-                        end_time
-                            .signed_duration_since(earliest_ts)
-                            .num_microseconds()
-                            .unwrap_or(i64::MAX)
-                            > max_span_micros
-                    })
-                    .unwrap_or(false);
+    fn max_span_delta(&self) -> Option<ChronoDuration> {
+        let dur = self.params.max_span?;
+        if dur.is_zero() {
+            return None;
+        }
+        ChronoDuration::from_std(dur).ok()
+    }
 
-                if expire {
-                    let mut trans = stack.remove(idx);
-                    mark_closed_for_flags(&mut trans, has_start_conditions, has_end_conditions);
-                    self.frozen_trans.push(trans);
-                } else {
-                    idx += 1;
+    fn enqueue_expiry_if_needed(&mut self, tx_id: TxId) {
+        let Some(max_span) = self.max_span_delta() else {
+            return;
+        };
+        let Some(state) = self.tx_store.get(tx_id) else {
+            return;
+        };
+        let Some(end_time) = state.tx.end_time else {
+            return;
+        };
+        self.expiry_queue.push_back(ExpiryEntry {
+            expire_before: end_time - max_span,
+            tx_id,
+        });
+    }
+
+    fn insert_new_live_tx(&mut self, key: TransKey, tx: Transaction) -> TxId {
+        let tx_id = self.tx_store.insert(TxState {
+            tx,
+            location: TxLocation::Live { key: key.clone() },
+        });
+        self.live_trans.insert(key, tx_id);
+        self.enqueue_expiry_if_needed(tx_id);
+        tx_id
+    }
+
+    fn insert_new_stack_tx(&mut self, key: TransKey, tx: Transaction) -> TxId {
+        let tx_id = self.tx_store.insert(TxState {
+            tx,
+            location: TxLocation::Stack { key: key.clone() },
+        });
+        self.start_trans_stack
+            .entry(key)
+            .or_default()
+            .push_back(tx_id);
+        self.enqueue_expiry_if_needed(tx_id);
+        tx_id
+    }
+
+    fn attach_live_tx(&mut self, key: TransKey, tx_id: TxId) {
+        if let Some(state) = self.tx_store.get_mut(tx_id) {
+            state.location = TxLocation::Live { key: key.clone() };
+        }
+        self.live_trans.insert(key, tx_id);
+    }
+
+    fn live_tx_id(&self, key_ref: &RefTransKey<'_>) -> Option<TxId> {
+        self.live_trans.get(key_ref).copied()
+    }
+
+    fn live_tx(&self, key_ref: &RefTransKey<'_>) -> Option<&Transaction> {
+        let tx_id = self.live_tx_id(key_ref)?;
+        self.tx_store.get(tx_id).map(|state| &state.tx)
+    }
+
+    #[cfg(test)]
+    fn live_tx_lookup<Q>(&self, key: &Q) -> Option<&Transaction>
+    where
+        Q: Hash + Equivalent<OwnedTransKey> + ?Sized,
+    {
+        let tx_id = self.live_trans.get(key).copied()?;
+        self.tx_store.get(tx_id).map(|state| &state.tx)
+    }
+
+    #[cfg(test)]
+    fn first_live_tx(&self) -> Option<&Transaction> {
+        let tx_id = self.live_trans.values().next().copied()?;
+        self.tx_store.get(tx_id).map(|state| &state.tx)
+    }
+
+    fn live_tx_mut(&mut self, key_ref: &RefTransKey<'_>) -> Option<&mut Transaction> {
+        let tx_id = self.live_tx_id(key_ref)?;
+        self.tx_store.get_mut(tx_id).map(|state| &mut state.tx)
+    }
+
+    fn remove_live_tx(&mut self, key_ref: &RefTransKey<'_>) -> Option<TxId> {
+        let tx_id = self.live_trans.remove(key_ref)?;
+        if let Some(state) = self.tx_store.get_mut(tx_id) {
+            state.location = TxLocation::Detached;
+        }
+        Some(tx_id)
+    }
+
+    fn remove_live_tx_owned(&mut self, key: &TransKey) -> Option<TxId> {
+        let tx_id = self.live_trans.remove(key)?;
+        if let Some(state) = self.tx_store.get_mut(tx_id) {
+            state.location = TxLocation::Detached;
+        }
+        Some(tx_id)
+    }
+
+    fn stack_back_tx_id(&self, key_ref: &RefTransKey<'_>) -> Option<TxId> {
+        self.start_trans_stack
+            .get(key_ref)
+            .and_then(|stack| stack.back().copied())
+    }
+
+    fn stack_back_tx(&self, key_ref: &RefTransKey<'_>) -> Option<&Transaction> {
+        let tx_id = self.stack_back_tx_id(key_ref)?;
+        self.tx_store.get(tx_id).map(|state| &state.tx)
+    }
+
+    fn pop_stack_back(&mut self, key_ref: &RefTransKey<'_>) -> Option<TxId> {
+        let tx_id = {
+            let stack = self.start_trans_stack.get_mut(key_ref)?;
+            let tx_id = stack.pop_back();
+            let should_remove = stack.is_empty();
+            (tx_id, should_remove)
+        };
+        let (tx_id, should_remove) = tx_id;
+        let tx_id = tx_id?;
+        if should_remove {
+            let _ = self.start_trans_stack.remove(key_ref);
+        }
+        if let Some(state) = self.tx_store.get_mut(tx_id) {
+            state.location = TxLocation::Detached;
+        }
+        Some(tx_id)
+    }
+
+    fn remove_tx_id_from_stack(&mut self, key: &TransKey, tx_id: TxId) -> bool {
+        let mut should_remove_key = false;
+        let removed = if let Some(stack) = self.start_trans_stack.get_mut(key) {
+            let removed = if stack.front().copied() == Some(tx_id) {
+                let _ = stack.pop_front();
+                true
+            } else if stack.back().copied() == Some(tx_id) {
+                let _ = stack.pop_back();
+                true
+            } else if let Some(pos) = stack.iter().position(|&candidate| candidate == tx_id) {
+                let _ = stack.remove(pos);
+                true
+            } else {
+                false
+            };
+            should_remove_key = stack.is_empty();
+            removed
+        } else {
+            false
+        };
+        if should_remove_key {
+            let _ = self.start_trans_stack.remove(key);
+        }
+        if removed && let Some(state) = self.tx_store.get_mut(tx_id) {
+            state.location = TxLocation::Detached;
+        }
+        removed
+    }
+
+    fn pop_stack_front_owned(&mut self, key: &TransKey) -> Option<TxId> {
+        let (tx_id, should_remove_key) = {
+            let stack = self.start_trans_stack.get_mut(key)?;
+            let tx_id = stack.pop_front()?;
+            (tx_id, stack.is_empty())
+        };
+        if should_remove_key {
+            let _ = self.start_trans_stack.remove(key);
+        }
+        Some(tx_id)
+    }
+
+    fn detach_expired_tx(&mut self, tx_id: TxId, location: TxLocation) -> Option<Transaction> {
+        match location {
+            TxLocation::Live { key } => {
+                if self.live_trans.get(&key).copied() == Some(tx_id) {
+                    let _ = self.live_trans.remove(&key);
+                }
+                self.trans_complete_flag.remove(&key);
+            }
+            TxLocation::Stack { key } => {
+                if self.pop_stack_front_owned(&key) != Some(tx_id) {
+                    let _ = self.remove_tx_id_from_stack(&key, tx_id);
                 }
             }
-            !stack.is_empty()
-        });
+            TxLocation::Detached => return None,
+        }
+        self.tx_store.remove(tx_id).map(|state| state.tx)
+    }
+
+    fn detach_and_take_tx(&mut self, tx_id: TxId) -> Option<Transaction> {
+        let location = self.tx_store.get(tx_id)?.location.clone();
+        match location {
+            TxLocation::Live { key } => {
+                if self.live_trans.get(&key).copied() == Some(tx_id) {
+                    let _ = self.live_trans.remove(&key);
+                }
+                self.trans_complete_flag.remove(&key);
+            }
+            TxLocation::Stack { key } => {
+                let _ = self.remove_tx_id_from_stack(&key, tx_id);
+            }
+            TxLocation::Detached => {}
+        }
+        self.tx_store.remove(tx_id).map(|state| state.tx)
     }
 
     fn make_trans_key_ref<'a>(&self, event: &'a EventMap) -> RefTransKey<'a> {
@@ -878,19 +1062,6 @@ impl TransactionPool {
             }
         }
         OwnedTransKey { parts }
-    }
-
-    fn get_or_insert_stack<'a>(
-        stack: &'a mut hashbrown::HashMap<TransKey, Vec<Transaction>, ahash::RandomState>,
-        key_ref: &RefTransKey<'_>,
-    ) -> &'a mut Vec<Transaction> {
-        match stack.raw_entry_mut().from_key(key_ref) {
-            RawEntryMut::Occupied(entry) => entry.into_mut(),
-            RawEntryMut::Vacant(entry) => {
-                let owned = Self::make_trans_key_owned_from_ref(key_ref);
-                entry.insert(owned, Vec::new()).1
-            }
-        }
     }
 
     pub fn add_event(&mut self, event: EventMap) -> Result<()> {
@@ -940,7 +1111,7 @@ impl TransactionPool {
             {
                 single.has_end_marker = true;
             }
-            single.add_event(&event)?;
+            single.add_event(&event, event_time)?;
             let has_brackets = has_start_conditions || has_end_conditions;
             if !has_brackets || (single.has_start_marker && single.has_end_marker) {
                 single.set_is_closed();
@@ -949,7 +1120,6 @@ impl TransactionPool {
             return Ok(());
         }
 
-        let event_time_micros = event_time.timestamp_micros();
         self.earliest_event_timestamp = Some(event_time);
 
         self.freeze_trans_exceeded_max_span_restriction();
@@ -976,107 +1146,129 @@ impl TransactionPool {
                         self.params.key_index_map.clone(),
                     );
                     new_trans.has_end_marker = true;
-                    new_trans.add_event(&event)?;
+                    new_trans.add_event(&event, event_time)?;
                     if matches_start {
                         new_trans.has_start_marker = true;
                         new_trans.set_is_closed();
                         self.frozen_trans.push(new_trans);
                     } else {
-                        let stack =
-                            Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
-                        stack.push(new_trans);
+                        let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
+                        self.insert_new_stack_tx(owned, new_trans);
                     }
                 } else {
                     // ends_only mode:
                     // ends_only mode, always use nested/backfill behavior
-                    let stack =
-                        Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
                     let mut end_only = Transaction::new(
                         self.params.fields.clone(),
                         self.params.key_index_map.clone(),
                     );
                     end_only.has_end_marker = true;
-                    end_only.add_event(&event)?;
-                    stack.push(end_only);
+                    end_only.add_event(&event, event_time)?;
+                    let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
+                    self.insert_new_stack_tx(owned, end_only);
                     if let Some(span) = self.params.max_span
                         && span.as_secs() > 0
-                        && let Some(mut_buffer) = self.live_trans.get_mut(&trans_key_ref)
+                        && self.live_tx_id(&trans_key_ref).is_some()
                     {
                         loop {
-                            while let Some(top) = stack.last()
+                            while let Some(top) = self.stack_back_tx(&trans_key_ref)
                                 && self.params.max_events > 0
                                 && top.get_event_count() >= self.params.max_events
                             {
-                                let mut full = stack.pop().unwrap();
+                                let full_id = self.pop_stack_back(&trans_key_ref).unwrap();
+                                let mut full = self.detach_and_take_tx(full_id).unwrap();
                                 if full.has_end_marker {
                                     full.set_is_closed();
                                 }
                                 self.frozen_trans.push(full);
                             }
-                            if mut_buffer.messages.is_empty() || stack.is_empty() {
+                            let Some(buffer_id) = self.live_tx_id(&trans_key_ref) else {
                                 break;
-                            }
-                            let top = stack.last_mut().unwrap();
-                            if self.params.max_events > 0
-                                && top.get_event_count() >= self.params.max_events
-                            {
-                                continue;
-                            }
-                            if let Some(&candidate_time) = mut_buffer.times.front() {
-                                if let Some(end_time) = top.end_time
-                                    && candidate_time > end_time
-                                {
-                                    break;
-                                }
-                                if top.span_exceeds_with_candidate(candidate_time, span.as_secs()) {
-                                    break;
-                                }
-                            } else {
+                            };
+                            let Some(top_id) = self.stack_back_tx_id(&trans_key_ref) else {
                                 break;
-                            }
-                            if let (Some(msgs), Some(ev_time)) = (
-                                mut_buffer.messages.pop_front(),
-                                mut_buffer.times.pop_front(),
-                            ) {
-                                top.messages.push_front(msgs);
-                                top.times.push_front(ev_time);
-                                top.start_time = Some(
-                                    top.start_time
-                                        .map(|cur| if ev_time < cur { ev_time } else { cur })
-                                        .unwrap_or(ev_time),
-                                );
-                                top.end_time = Some(
-                                    top.end_time
-                                        .map(|cur| if ev_time > cur { ev_time } else { cur })
-                                        .unwrap_or(ev_time),
-                                );
-                                top.event_count = top.event_count.saturating_add(1);
-                                if mut_buffer.event_count > 0 {
-                                    mut_buffer.event_count -= 1;
-                                }
-                                match (mut_buffer.times.front(), mut_buffer.times.back()) {
-                                    (Some(&s), Some(&e)) => {
-                                        mut_buffer.start_time = Some(s);
-                                        mut_buffer.end_time = Some(e);
+                            };
+
+                            let should_break = {
+                                let mut_buffer = &self.tx_store[buffer_id].tx;
+                                if mut_buffer.messages.is_empty() {
+                                    true
+                                } else if let Some(&candidate_time) = mut_buffer.times.front() {
+                                    let top = &self.tx_store[top_id].tx;
+                                    if let Some(end_time) = top.end_time
+                                        && candidate_time > end_time
+                                    {
+                                        true
+                                    } else {
+                                        top.span_exceeds_with_candidate(
+                                            candidate_time,
+                                            span.as_secs(),
+                                        )
                                     }
-                                    _ => {
-                                        mut_buffer.start_time = None;
-                                        mut_buffer.end_time = None;
-                                    }
+                                } else {
+                                    true
                                 }
-                            } else {
+                            };
+                            if should_break {
                                 break;
                             }
+
+                            let moved = {
+                                let mut_buffer = &mut self.tx_store.get_mut(buffer_id).unwrap().tx;
+                                if let (Some(msgs), Some(ev_time)) = (
+                                    mut_buffer.messages.pop_front(),
+                                    mut_buffer.times.pop_front(),
+                                ) {
+                                    if mut_buffer.event_count > 0 {
+                                        mut_buffer.event_count -= 1;
+                                    }
+                                    match (mut_buffer.times.front(), mut_buffer.times.back()) {
+                                        (Some(&s), Some(&e)) => {
+                                            mut_buffer.start_time = Some(s);
+                                            mut_buffer.end_time = Some(e);
+                                        }
+                                        _ => {
+                                            mut_buffer.start_time = None;
+                                            mut_buffer.end_time = None;
+                                        }
+                                    }
+                                    Some((msgs, ev_time))
+                                } else {
+                                    None
+                                }
+                            };
+                            let Some((msgs, ev_time)) = moved else {
+                                break;
+                            };
+
+                            let top = &mut self.tx_store.get_mut(top_id).unwrap().tx;
+                            top.messages.push_front(msgs);
+                            top.times.push_front(ev_time);
+                            top.start_time = Some(
+                                top.start_time
+                                    .map(|cur| if ev_time < cur { ev_time } else { cur })
+                                    .unwrap_or(ev_time),
+                            );
+                            top.end_time = Some(
+                                top.end_time
+                                    .map(|cur| if ev_time > cur { ev_time } else { cur })
+                                    .unwrap_or(ev_time),
+                            );
+                            top.event_count = top.event_count.saturating_add(1);
                         }
-                        if mut_buffer.messages.is_empty() {
-                            let _ = self.live_trans.remove(&trans_key_ref);
+                        if let Some(buffer_id) = self.live_tx_id(&trans_key_ref)
+                            && self.tx_store[buffer_id].tx.messages.is_empty()
+                            && let Some(removed_id) = self.remove_live_tx(&trans_key_ref)
+                        {
+                            let _ = self.detach_and_take_tx(removed_id);
                         }
                     }
-                    if let Some(top) = stack.last()
+                    if let Some(top) = self.stack_back_tx(&trans_key_ref)
                         && self.params.max_events > 0
                         && top.get_event_count() >= self.params.max_events
                     {
-                        let mut full = stack.pop().unwrap();
+                        let full_id = self.pop_stack_back(&trans_key_ref).unwrap();
+                        let mut full = self.detach_and_take_tx(full_id).unwrap();
                         if full.has_end_marker {
                             full.set_is_closed();
                         }
@@ -1087,29 +1279,27 @@ impl TransactionPool {
             } else if matches_start {
                 if has_end_conditions {
                     // When a start event is encountered, try to match with most recent unmatched end event
-                    let end_stack =
-                        Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
-
-                    // If the top end-only transaction already reached max_events, freeze it first
-                    if let Some(top) = end_stack.last()
+                    if let Some(top) = self.stack_back_tx(&trans_key_ref)
                         && self.params.max_events > 0
                         && top.get_event_count() >= self.params.max_events
                     {
-                        let mut trans_to_freeze = end_stack.pop().unwrap();
+                        let trans_id = self.pop_stack_back(&trans_key_ref).unwrap();
+                        let mut trans_to_freeze = self.detach_and_take_tx(trans_id).unwrap();
                         if trans_to_freeze.has_start_marker && trans_to_freeze.has_end_marker {
                             trans_to_freeze.set_is_closed();
                         }
                         self.frozen_trans.push(trans_to_freeze);
                     }
 
-                    if let Some(mut end_trans) = end_stack.pop() {
+                    if let Some(end_tx_id) = self.pop_stack_back(&trans_key_ref) {
+                        let mut end_trans = self.detach_and_take_tx(end_tx_id).unwrap();
                         if self.params.max_events > 0
                             && end_trans.get_event_count() >= self.params.max_events
                         {
-                            end_trans.update_start_time_only(&event)?;
+                            end_trans.update_start_time_only(event_time)?;
                         } else {
                             // Add the start event to the matched end transaction
-                            end_trans.add_event(&event)?;
+                            end_trans.add_event(&event, event_time)?;
                         }
                         end_trans.has_start_marker = true;
                         end_trans.set_is_closed(); // Mark as closed since it has both start and end
@@ -1120,7 +1310,8 @@ impl TransactionPool {
                         // If there is an existing live:
                         //  - If it is a regular (no start marker), merge that live with this start (attach start and keep live)
                         //  - If it already has a start marker, freeze it and start a new live with this start only
-                        if let Some(mut existing_trans) = self.live_trans.remove(&trans_key_ref) {
+                        if let Some(existing_id) = self.remove_live_tx(&trans_key_ref) {
+                            let mut existing_trans = self.detach_and_take_tx(existing_id).unwrap();
                             if existing_trans.has_start_marker {
                                 // Freeze previous start-only live, start a fresh one
                                 self.frozen_trans.push(existing_trans);
@@ -1129,21 +1320,21 @@ impl TransactionPool {
                                     self.params.key_index_map.clone(),
                                 );
                                 new_trans.has_start_marker = true;
-                                new_trans.add_event(&event)?;
+                                new_trans.add_event(&event, event_time)?;
                                 let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
-                                self.live_trans.insert(owned, new_trans);
+                                self.insert_new_live_tx(owned, new_trans);
                             } else {
                                 // Merge previously accumulated regular events into this start live
                                 existing_trans.has_start_marker = true;
                                 if self.params.max_events > 0
                                     && existing_trans.get_event_count() >= self.params.max_events
                                 {
-                                    existing_trans.update_start_time_only(&event)?;
+                                    existing_trans.update_start_time_only(event_time)?;
                                 } else {
-                                    existing_trans.add_event(&event)?;
+                                    existing_trans.add_event(&event, event_time)?;
                                 }
                                 let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
-                                self.live_trans.insert(owned, existing_trans);
+                                self.insert_new_live_tx(owned, existing_trans);
                             }
                         } else {
                             let mut new_trans = Transaction::new(
@@ -1151,58 +1342,69 @@ impl TransactionPool {
                                 self.params.key_index_map.clone(),
                             );
                             new_trans.has_start_marker = true;
-                            new_trans.add_event(&event)?;
+                            new_trans.add_event(&event, event_time)?;
                             let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
-                            self.live_trans.insert(owned, new_trans);
+                            self.insert_new_live_tx(owned, new_trans);
                         }
                     }
                 } else {
                     // starts_only mode:
                     // Use live_trans as buffer for regular events; maintain the current "start-live" on the stack.
-                    let stack =
-                        Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
-                    if let Some(mut prev_start_live) = stack.pop() {
+                    if let Some(prev_start_live_id) = self.pop_stack_back(&trans_key_ref) {
                         // Close and freeze the previous start-live when a new start arrives
+                        let mut prev_start_live =
+                            self.detach_and_take_tx(prev_start_live_id).unwrap();
                         prev_start_live.set_is_closed();
                         self.frozen_trans.push(prev_start_live);
                     }
                     // Merge buffer with this start
-                    let mut new_trans =
-                        if let Some(mut buffer) = self.live_trans.remove(&trans_key_ref) {
-                            if self.params.max_events > 0
-                                && buffer.get_event_count() >= self.params.max_events
-                            {
-                                buffer.update_start_time_only(&event)?;
-                            } else {
-                                buffer.add_event(&event)?;
-                            }
-                            buffer
+                    let mut new_trans = if let Some(buffer_id) = self.remove_live_tx(&trans_key_ref)
+                    {
+                        let mut buffer = self.detach_and_take_tx(buffer_id).unwrap();
+                        if self.params.max_events > 0
+                            && buffer.get_event_count() >= self.params.max_events
+                        {
+                            buffer.update_start_time_only(event_time)?;
                         } else {
-                            let mut t = Transaction::new(
-                                self.params.fields.clone(),
-                                self.params.key_index_map.clone(),
-                            );
-                            t.add_event(&event)?;
-                            t
-                        };
+                            buffer.add_event(&event, event_time)?;
+                        }
+                        buffer
+                    } else {
+                        let mut t = Transaction::new(
+                            self.params.fields.clone(),
+                            self.params.key_index_map.clone(),
+                        );
+                        t.add_event(&event, event_time)?;
+                        t
+                    };
                     new_trans.has_start_marker = true;
-                    stack.push(new_trans);
+                    let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
+                    self.insert_new_stack_tx(owned, new_trans);
                 }
             } else if has_start_conditions && has_end_conditions {
                 // Regular event in bracket mode: buffer into live_trans (to be merged with the next boundary)
-                let stack = Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
-                if let Some(trans) = stack.last_mut() {
-                    if self.params.max_events == 0
-                        || trans.get_event_count() < self.params.max_events
-                    {
-                        trans.add_event(&event)?;
+                if let Some(top_id) = self.stack_back_tx_id(&trans_key_ref) {
+                    let can_add = {
+                        let trans = &self.tx_store[top_id].tx;
+                        self.params.max_events == 0
+                            || trans.get_event_count() < self.params.max_events
+                    };
+                    if can_add {
+                        self.tx_store
+                            .get_mut(top_id)
+                            .unwrap()
+                            .tx
+                            .add_event(&event, event_time)?;
                     }
-                    // Check if max_events is reached after adding (or if it was already reached)
-                    if self.params.max_events > 0
-                        && trans.get_event_count() >= self.params.max_events
-                    {
+                    let should_freeze = {
+                        let trans = &self.tx_store[top_id].tx;
+                        self.params.max_events > 0
+                            && trans.get_event_count() >= self.params.max_events
+                    };
+                    if should_freeze {
                         // Immediately freeze and check conditions
-                        let mut trans_to_freeze = stack.pop().unwrap();
+                        let trans_id = self.pop_stack_back(&trans_key_ref).unwrap();
+                        let mut trans_to_freeze = self.detach_and_take_tx(trans_id).unwrap();
                         // For bracket mode: need both start and end markers to be closed
                         if trans_to_freeze.has_start_marker && trans_to_freeze.has_end_marker {
                             trans_to_freeze.set_is_closed();
@@ -1210,22 +1412,25 @@ impl TransactionPool {
                         // If only end marker, leave as open (closed=false)
                         self.frozen_trans.push(trans_to_freeze);
                     }
-                } else if let Some(existing) = self.live_trans.get_mut(&trans_key_ref) {
+                } else if let Some(existing) = self.live_tx(&trans_key_ref) {
                     if existing.has_start_marker {
                         // Freeze the current start-live segment; start a separate regular-live for this event
                         // Need to take ownership to freeze: remove then re-insert a new buffer
-                        let taken = self.live_trans.remove(&trans_key_ref).unwrap();
+                        let taken_id = self.remove_live_tx(&trans_key_ref).unwrap();
+                        let taken = self.detach_and_take_tx(taken_id).unwrap();
                         self.frozen_trans.push(taken);
                         let mut new_trans = Transaction::new(
                             self.params.fields.clone(),
                             self.params.key_index_map.clone(),
                         );
-                        new_trans.add_event(&event)?;
+                        new_trans.add_event(&event, event_time)?;
                         let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
-                        self.live_trans.insert(owned, new_trans);
+                        self.insert_new_live_tx(owned, new_trans);
                     } else {
                         // Continue accumulating regular events until a start arrives
-                        existing.add_event(&event)?;
+                        self.live_tx_mut(&trans_key_ref)
+                            .unwrap()
+                            .add_event(&event, event_time)?;
                     }
                 } else {
                     // Start a new regular-live buffer
@@ -1233,17 +1438,16 @@ impl TransactionPool {
                         self.params.fields.clone(),
                         self.params.key_index_map.clone(),
                     );
-                    new_trans.add_event(&event)?;
+                    new_trans.add_event(&event, event_time)?;
                     let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
-                    self.live_trans.insert(owned, new_trans);
+                    self.insert_new_live_tx(owned, new_trans);
                 }
             } else if has_end_conditions {
                 // ends_only: add to current end-live if present; otherwise buffer until an end comes
-                let stack = Self::get_or_insert_stack(&mut self.start_trans_stack, &trans_key_ref);
                 let mut handled_event = false;
-                if stack.last().is_some() {
+                if self.stack_back_tx_id(&trans_key_ref).is_some() {
                     loop {
-                        let Some(top) = stack.last() else {
+                        let Some(top) = self.stack_back_tx(&trans_key_ref) else {
                             break;
                         };
                         let mut should_freeze = false;
@@ -1259,7 +1463,8 @@ impl TransactionPool {
                         }
 
                         if should_freeze {
-                            let mut trans_to_freeze = stack.pop().unwrap();
+                            let trans_id = self.pop_stack_back(&trans_key_ref).unwrap();
+                            let mut trans_to_freeze = self.detach_and_take_tx(trans_id).unwrap();
                             mark_closed_for_flags(
                                 &mut trans_to_freeze,
                                 has_start_conditions,
@@ -1271,16 +1476,27 @@ impl TransactionPool {
                         break;
                     }
 
-                    if let Some(trans) = stack.last_mut() {
-                        if self.params.max_events == 0
-                            || trans.get_event_count() < self.params.max_events
-                        {
-                            trans.add_event(&event)?;
+                    if let Some(top_id) = self.stack_back_tx_id(&trans_key_ref) {
+                        let can_add = {
+                            let trans = &self.tx_store[top_id].tx;
+                            self.params.max_events == 0
+                                || trans.get_event_count() < self.params.max_events
+                        };
+                        if can_add {
+                            self.tx_store
+                                .get_mut(top_id)
+                                .unwrap()
+                                .tx
+                                .add_event(&event, event_time)?;
                         }
-                        if self.params.max_events > 0
-                            && trans.get_event_count() >= self.params.max_events
-                        {
-                            let mut trans_to_freeze = stack.pop().unwrap();
+                        let should_freeze = {
+                            let trans = &self.tx_store[top_id].tx;
+                            self.params.max_events > 0
+                                && trans.get_event_count() >= self.params.max_events
+                        };
+                        if should_freeze {
+                            let trans_id = self.pop_stack_back(&trans_key_ref).unwrap();
+                            let mut trans_to_freeze = self.detach_and_take_tx(trans_id).unwrap();
                             mark_closed_for_flags(
                                 &mut trans_to_freeze,
                                 has_start_conditions,
@@ -1293,29 +1509,29 @@ impl TransactionPool {
                 }
                 if handled_event {
                     // Event already merged into the latest end-only transaction
-                } else if let Some(existing) = self.live_trans.get_mut(&trans_key_ref) {
-                    existing.add_event(&event)?;
+                } else if let Some(existing) = self.live_tx_mut(&trans_key_ref) {
+                    existing.add_event(&event, event_time)?;
                 } else {
                     let mut new_trans = Transaction::new(
                         self.params.fields.clone(),
                         self.params.key_index_map.clone(),
                     );
-                    new_trans.add_event(&event)?;
+                    new_trans.add_event(&event, event_time)?;
                     let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
-                    self.live_trans.insert(owned, new_trans);
+                    self.insert_new_live_tx(owned, new_trans);
                 }
             } else {
                 // starts_only mode: buffer regular events in live_trans until a start comes
-                if let Some(existing) = self.live_trans.get_mut(&trans_key_ref) {
-                    existing.add_event(&event)?;
+                if let Some(existing) = self.live_tx_mut(&trans_key_ref) {
+                    existing.add_event(&event, event_time)?;
                 } else {
                     let mut new_trans = Transaction::new(
                         self.params.fields.clone(),
                         self.params.key_index_map.clone(),
                     );
-                    new_trans.add_event(&event)?;
+                    new_trans.add_event(&event, event_time)?;
                     let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
-                    self.live_trans.insert(owned, new_trans);
+                    self.insert_new_live_tx(owned, new_trans);
                 }
             }
         } else {
@@ -1326,32 +1542,40 @@ impl TransactionPool {
             let mut matched_existing = false;
 
             if !has_null_field {
-                if let Some(trans) = self.live_trans.get_mut(&trans_key_ref) {
-                    trans.add_event(&event)?;
+                if let Some(trans) = self.live_tx_mut(&trans_key_ref) {
+                    trans.add_event(&event, event_time)?;
                     matched_existing = true;
                 } else if let Some(candidate_key) = self.find_best_matching_transaction_key(
                     &self.live_trans,
                     &trans_key_ref,
-                    Some(event_time_micros),
+                    Some(event_time),
                 ) {
                     let candidate_is_partial =
                         candidate_key.parts.iter().any(|part| part.is_none());
                     if candidate_is_partial
-                        && let Some(mut pending_trans) = self.live_trans.remove(&candidate_key)
+                        && let Some(pending_tx_id) = self.remove_live_tx_owned(&candidate_key)
                     {
-                        pending_trans.add_event(&event)?;
+                        self.tx_store
+                            .get_mut(pending_tx_id)
+                            .unwrap()
+                            .tx
+                            .add_event(&event, event_time)?;
                         let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
-                        self.live_trans.insert(owned, pending_trans);
+                        self.attach_live_tx(owned, pending_tx_id);
                         matched_existing = true;
                     }
                 }
             } else if let Some(best_matching_key) = self.find_best_matching_transaction_key(
                 &self.live_trans,
                 &trans_key_ref,
-                Some(event_time_micros),
-            ) && let Some(trans) = self.live_trans.get_mut(&best_matching_key)
+                Some(event_time),
+            ) && let Some(tx_id) = self.live_trans.get(&best_matching_key).copied()
             {
-                trans.add_event(&event)?;
+                self.tx_store
+                    .get_mut(tx_id)
+                    .unwrap()
+                    .tx
+                    .add_event(&event, event_time)?;
                 matched_existing = true;
             }
 
@@ -1361,19 +1585,20 @@ impl TransactionPool {
                     self.params.fields.clone(),
                     self.params.key_index_map.clone(),
                 );
-                new_trans.add_event(&event)?;
+                new_trans.add_event(&event, event_time)?;
                 let owned = Self::make_trans_key_owned_from_ref(&trans_key_ref);
-                self.live_trans.insert(owned, new_trans);
+                self.insert_new_live_tx(owned, new_trans);
             }
         }
 
         // Do not auto-freeze the regular buffer in ends_only mode; keep it for backfill.
         let ends_only_mode = has_end_conditions && !has_start_conditions;
         if !ends_only_mode
-            && let Some(trans) = self.live_trans.get(&trans_key_ref)
+            && let Some(trans) = self.live_tx(&trans_key_ref)
             && trans.get_event_count() >= self.params.max_events
         {
-            let mut trans_to_freeze = self.live_trans.remove(&trans_key_ref).unwrap();
+            let tx_id = self.remove_live_tx(&trans_key_ref).unwrap();
+            let mut trans_to_freeze = self.detach_and_take_tx(tx_id).unwrap();
             mark_closed_for_flags(
                 &mut trans_to_freeze,
                 has_start_conditions,
@@ -1411,18 +1636,21 @@ impl TransactionPool {
     // Find the best matching transaction key based on non-null field matches (more non-null matches = better match)
     fn find_best_matching_transaction_key(
         &self,
-        collection: &hashbrown::HashMap<TransKey, Transaction, ahash::RandomState>,
+        collection: &hashbrown::HashMap<TransKey, TxId, ahash::RandomState>,
         target_key: &RefTransKey<'_>,
-        target_time: Option<i64>, // Time of the event being added
+        target_time: Option<DateTime<Utc>>, // Time of the event being added
     ) -> Option<TransKey> {
         let mut best_key: Option<TransKey> = None;
         let mut best_score: usize = 0;
         let mut best_time_diff: Option<i64> = None;
 
-        for (existing_key, transaction) in collection.iter() {
+        for (existing_key, tx_id) in collection.iter() {
             if !self.keys_match_with_null_wildcards_owned_ref(existing_key, target_key) {
                 continue;
             }
+            let Some(transaction) = self.tx_store.get(*tx_id).map(|state| &state.tx) else {
+                continue;
+            };
 
             let exact_non_null_matches = existing_key
                 .parts
@@ -1432,9 +1660,10 @@ impl TransactionPool {
                 .count();
 
             let time_diff = match (target_time, transaction.start_time) {
-                (Some(target_t), Some(start_time)) => {
-                    Some((target_t - start_time.timestamp_micros()).abs())
-                }
+                (Some(target_t), Some(start_time)) => target_t
+                    .signed_duration_since(start_time)
+                    .num_microseconds()
+                    .map(i64::abs),
                 _ => None,
             };
 
@@ -1518,7 +1747,10 @@ impl TransactionPool {
             && self.params.starts_if_field.is_none();
 
         // Add all remaining live transactions
-        for (_, mut trans) in self.live_trans.drain() {
+        for (_, tx_id) in self.live_trans.drain() {
+            let Some(mut trans) = self.tx_store.remove(tx_id).map(|state| state.tx) else {
+                continue;
+            };
             // If we are in ends_only mode, mark as closed if has end marker
             if has_end_only && trans.has_end_marker {
                 trans.set_is_closed();
@@ -1590,7 +1822,10 @@ impl TransactionPool {
         // Add all remaining start transactions from the stack
         // These are unmatched end events that never found their corresponding start events
         for (_key, mut trans_stack) in self.start_trans_stack.drain() {
-            for mut trans in trans_stack.drain(..) {
+            while let Some(tx_id) = trans_stack.pop_front() {
+                let Some(mut trans) = self.tx_store.remove(tx_id).map(|state| state.tx) else {
+                    continue;
+                };
                 // If we are in starts_only mode, mark remaining as closed if has start marker
                 if has_start_only && trans.has_start_marker {
                     trans.set_is_closed();
@@ -3729,9 +3964,15 @@ mod tests {
             &[("user_id", "user1"), ("status", "fail")],
         );
 
-        trans.add_event(&event2).unwrap();
-        trans.add_event(&event1).unwrap();
-        trans.add_event(&event3).unwrap();
+        trans
+            .add_event(&event2, now - ChronoDuration::seconds(10))
+            .unwrap();
+        trans
+            .add_event(&event1, now - ChronoDuration::seconds(20))
+            .unwrap();
+        trans
+            .add_event(&event3, now - ChronoDuration::seconds(30))
+            .unwrap();
 
         assert_eq!(trans.get_event_count(), 3);
         assert_eq!(trans.messages.len(), 3);
@@ -3795,18 +4036,24 @@ mod tests {
         let event2_time = now - ChronoDuration::seconds(10);
 
         trans
-            .add_event(&create_event(
-                event2_time.timestamp_micros(),
-                "second message",
-                &[("user_id", "user_a"), ("status", "completed")],
-            ))
+            .add_event(
+                &create_event(
+                    event2_time.timestamp_micros(),
+                    "second message",
+                    &[("user_id", "user_a"), ("status", "completed")],
+                ),
+                event2_time,
+            )
             .unwrap();
         trans
-            .add_event(&create_event(
-                event1_time.timestamp_micros(),
-                "first message",
-                &[("user_id", "user_a"), ("source", "web")],
-            ))
+            .add_event(
+                &create_event(
+                    event1_time.timestamp_micros(),
+                    "first message",
+                    &[("user_id", "user_a"), ("source", "web")],
+                ),
+                event1_time,
+            )
             .unwrap();
         trans.set_is_closed();
 
@@ -3895,10 +4142,7 @@ mod tests {
         pool.add_event(event2).unwrap();
         assert_eq!(pool.live_trans.len(), 1);
         assert_eq!(pool.frozen_trans.len(), 0);
-        assert_eq!(
-            pool.live_trans.values().next().unwrap().get_event_count(),
-            2
-        );
+        assert_eq!(pool.first_live_tx().unwrap().get_event_count(), 2);
 
         // Event 3 (different user)
         let event3 = create_event(
@@ -3919,15 +4163,13 @@ mod tests {
         assert_eq!(pool.live_trans.len(), 2);
         assert_eq!(pool.frozen_trans.len(), 0);
         assert_eq!(
-            pool.live_trans
-                .get(&smallvec![Some("user1".to_string())])
+            pool.live_tx_lookup(&smallvec![Some("user1".to_string())])
                 .unwrap()
                 .get_event_count(),
             3
         );
         assert_eq!(
-            pool.live_trans
-                .get(&smallvec![Some("user2".to_string())])
+            pool.live_tx_lookup(&smallvec![Some("user2".to_string())])
                 .unwrap()
                 .get_event_count(),
             1
@@ -4066,8 +4308,8 @@ mod tests {
         assert_eq!(pool.live_trans.len(), 2); // Two live transactions
         let key2 = smallvec![Some("1.1.1.1".to_string()), Some("404".to_string())];
         assert!(pool.live_trans.contains_key(&key2));
-        assert_eq!(pool.live_trans.get(&key1).unwrap().get_event_count(), 1);
-        assert_eq!(pool.live_trans.get(&key2).unwrap().get_event_count(), 1);
+        assert_eq!(pool.live_tx_lookup(&key1).unwrap().get_event_count(), 1);
+        assert_eq!(pool.live_tx_lookup(&key2).unwrap().get_event_count(), 1);
 
         // Event 3 (different client_ip, same status as key1) -> new transaction
         let event3 = create_event(
@@ -4088,7 +4330,7 @@ mod tests {
         );
         pool.add_event(event4).unwrap();
         assert_eq!(pool.live_trans.len(), 3); // Still three live transactions
-        assert_eq!(pool.live_trans.get(&key1).unwrap().get_event_count(), 2);
+        assert_eq!(pool.live_tx_lookup(&key1).unwrap().get_event_count(), 2);
     }
 
     #[test]
