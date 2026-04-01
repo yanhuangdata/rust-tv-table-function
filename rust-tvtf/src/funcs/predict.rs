@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use arrow::array::{Array, ArrayRef, AsArray, Float64Array};
+use arrow::array::{Array, ArrayRef, AsArray, Float64Array, UInt32Array};
 use arrow::compute::{SortOptions, cast, concat, sort_to_indices, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -58,6 +58,7 @@ pub struct FieldConfig {
 #[derive(Debug)]
 pub struct Predict {
     field_configs: Vec<FieldConfig>,
+    group_by_fields: Vec<String>,
     future_timespan: usize,
     holdback: usize,
     upper_confidence: f64,
@@ -93,6 +94,7 @@ impl Predict {
         let mut nonnegative = false;
         let mut data_start = 0;
         let mut field_names: Vec<String> = Vec::new();
+        let mut group_by_fields: Vec<String> = Vec::new();
 
         for (name, arg) in named_arguments {
             match name.as_str() {
@@ -101,6 +103,16 @@ impl Predict {
                         return Err(anyhow!("fields must be a string"));
                     };
                     field_names.push(s);
+                }
+                "group_by_fields" => {
+                    let Arg::String(s) = arg else {
+                        return Err(anyhow!("group_by_fields must be a string"));
+                    };
+                    group_by_fields.extend(
+                        s.split(',')
+                            .map(|field| field.trim().to_string())
+                            .filter(|field| !field.is_empty()),
+                    );
                 }
                 "algorithm" => {
                     let Arg::String(s) = arg else {
@@ -220,6 +232,7 @@ impl Predict {
 
         Ok(Predict {
             field_configs,
+            group_by_fields,
             future_timespan,
             holdback,
             upper_confidence,
@@ -311,6 +324,157 @@ impl Predict {
         self.check_period()?;
         // holdback, data_start, nonnegative: validated during Arg parsing
         Ok(())
+    }
+
+    fn reset_prediction_state(&mut self) {
+        self.time_series_data.clear();
+        self.beginning = 0;
+        self.missing_valued = false;
+    }
+
+    fn concat_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
+        let first_batch = batches
+            .first()
+            .ok_or_else(|| anyhow!("No batches available to concatenate"))?;
+        let schema = first_batch.schema();
+        let mut concatenated_columns = Vec::with_capacity(schema.fields().len());
+
+        for col_idx in 0..schema.fields().len() {
+            let arrays_to_concat: Vec<ArrayRef> = batches
+                .iter()
+                .map(|batch| batch.column(col_idx).clone())
+                .collect();
+            let refs: Vec<&dyn Array> = arrays_to_concat.iter().map(|a| a.as_ref()).collect();
+            let concatenated = concat(&refs).context("Failed to concatenate arrays")?;
+            concatenated_columns.push(concatenated);
+        }
+
+        RecordBatch::try_new(schema, concatenated_columns)
+            .context("Failed to create concatenated batch")
+    }
+
+    fn sort_batch_by_time(batch: RecordBatch) -> Result<RecordBatch> {
+        let schema = batch.schema();
+        let Some(time_idx) = schema.fields().iter().position(|f| f.name() == "_time") else {
+            return Ok(batch);
+        };
+
+        let time_array = batch.column(time_idx);
+        let sort_options = SortOptions {
+            descending: false,
+            nulls_first: true,
+        };
+        let indices = sort_to_indices(time_array.as_ref(), Some(sort_options), None)
+            .context("Failed to sort by _time")?;
+
+        let mut sorted_columns = Vec::with_capacity(batch.num_columns());
+        for col in batch.columns() {
+            let sorted_col =
+                take(col.as_ref(), &indices, None).context("Failed to reorder column")?;
+            sorted_columns.push(sorted_col);
+        }
+
+        RecordBatch::try_new(schema, sorted_columns).context("Failed to create sorted batch")
+    }
+
+    fn take_rows(batch: &RecordBatch, row_indices: &[u32]) -> Result<RecordBatch> {
+        let schema = batch.schema();
+        let indices = UInt32Array::from(row_indices.to_vec());
+        let mut columns = Vec::with_capacity(batch.num_columns());
+
+        for column in batch.columns() {
+            let taken =
+                take(column.as_ref(), &indices, None).context("Failed to take grouped rows")?;
+            columns.push(taken);
+        }
+
+        RecordBatch::try_new(schema, columns).context("Failed to create grouped batch")
+    }
+
+    fn group_key_value(array: &ArrayRef, row_idx: usize) -> Result<String> {
+        if row_idx >= array.len() || array.is_null(row_idx) {
+            return Ok("<null>".to_string());
+        }
+
+        let value = match array.data_type() {
+            DataType::Utf8 => format!("s:{}", array.as_string::<i32>().value(row_idx)),
+            DataType::LargeUtf8 => format!("ls:{}", array.as_string::<i64>().value(row_idx)),
+            DataType::Boolean => {
+                let arr = array.as_boolean();
+                format!("b:{}", arr.value(row_idx))
+            }
+            DataType::Int32 => {
+                let arr = array.as_primitive::<arrow::datatypes::Int32Type>();
+                format!("i32:{}", arr.value(row_idx))
+            }
+            DataType::Int64 => {
+                let arr = array.as_primitive::<arrow::datatypes::Int64Type>();
+                format!("i64:{}", arr.value(row_idx))
+            }
+            DataType::Float64 => {
+                let arr = array.as_primitive::<arrow::datatypes::Float64Type>();
+                format!("f64:{}", arr.value(row_idx))
+            }
+            DataType::Timestamp(_, _)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Float32
+            | DataType::UInt32
+            | DataType::UInt64 => {
+                let casted = cast(array, &DataType::Utf8)
+                    .context("Failed to stringify group_by_fields value")?;
+                format!("cast:{}", casted.as_string::<i32>().value(row_idx))
+            }
+            _ => {
+                let casted = cast(array, &DataType::Utf8)
+                    .context("Failed to stringify group_by_fields value")?;
+                format!("cast:{}", casted.as_string::<i32>().value(row_idx))
+            }
+        };
+
+        Ok(value)
+    }
+
+    fn partition_group_rows(&self, batch: &RecordBatch) -> Result<Vec<Vec<u32>>> {
+        if self.group_by_fields.is_empty() {
+            return Ok(vec![(0..batch.num_rows() as u32).collect()]);
+        }
+
+        let schema = batch.schema();
+        let mut group_field_indices = Vec::with_capacity(self.group_by_fields.len());
+        for field_name in &self.group_by_fields {
+            let idx = schema
+                .fields()
+                .iter()
+                .position(|field| field.name().as_str() == field_name.as_str())
+                .ok_or_else(|| anyhow!("Group-by field not found: {}", field_name))?;
+            group_field_indices.push(idx);
+        }
+
+        let mut group_positions: HashMap<String, usize> = HashMap::new();
+        let mut grouped_rows: Vec<Vec<u32>> = Vec::new();
+
+        for row_idx in 0..batch.num_rows() {
+            let mut key_parts = Vec::with_capacity(group_field_indices.len());
+            for field_idx in &group_field_indices {
+                key_parts.push(Self::group_key_value(batch.column(*field_idx), row_idx)?);
+            }
+            let group_key = key_parts.join("\x1f");
+
+            if let Some(existing_idx) = group_positions.get(&group_key) {
+                grouped_rows[*existing_idx].push(row_idx as u32);
+            } else {
+                let next_idx = grouped_rows.len();
+                group_positions.insert(group_key, next_idx);
+                grouped_rows.push(vec![row_idx as u32]);
+            }
+        }
+
+        Ok(grouped_rows)
+    }
+
+    fn is_group_by_field(&self, field_name: &str) -> bool {
+        self.group_by_fields.iter().any(|field| field == field_name)
     }
 
     fn extract_numeric_values(&self, array: &ArrayRef, num_rows: usize) -> Vec<Option<f64>> {
@@ -1273,112 +1437,30 @@ impl Predict {
         if count == 0 {
             return Ok(arrow::array::new_null_array(array.data_type(), 0));
         }
-
-        match array.data_type() {
-            DataType::Int64 => {
-                if let Some(val) = Self::extract_single_i64_from_array(array, last_idx) {
-                    Ok(Arc::new(arrow::array::Int64Array::from(vec![val; count])) as ArrayRef)
-                } else {
-                    Ok(arrow::array::new_null_array(array.data_type(), count))
-                }
-            }
-            DataType::Float64 => {
-                let arr = array.as_primitive::<arrow::datatypes::Float64Type>();
-                if arr.is_valid(last_idx) {
-                    let val = arr.value(last_idx);
-                    Ok(Arc::new(Float64Array::from(vec![val; count])) as ArrayRef)
-                } else {
-                    Ok(arrow::array::new_null_array(array.data_type(), count))
-                }
-            }
-            _ => Ok(arrow::array::new_null_array(array.data_type(), count)),
+        if last_idx >= array.len() {
+            return Ok(arrow::array::new_null_array(array.data_type(), count));
         }
-    }
-}
 
-impl TableFunction for Predict {
-    fn process(&mut self, input: RecordBatch) -> Result<Option<RecordBatch>> {
-        // Buffer all data for time series analysis
-        self.data_buffer.push(input);
-        Ok(None)
+        let indices = UInt32Array::from(vec![last_idx as u32; count]);
+        take(array.as_ref(), &indices, None).context("Failed to extend array with last value")
     }
 
-    fn finalize(&mut self) -> Result<Option<RecordBatch>> {
-        if self.data_buffer.is_empty() {
-            return Ok(None);
-        }
-
-        // Validate parameters before processing (matching Python's lastCheck behavior)
-        self.validate_parameters()?;
-
-        // Concatenate all buffered batches
-        let mut all_rows = 0;
-        for batch in &self.data_buffer {
-            all_rows += batch.num_rows();
-        }
+    fn predict_batch(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
+        let combined_batch = Self::sort_batch_by_time(batch)?;
+        let all_rows = combined_batch.num_rows();
 
         if all_rows == 0 {
-            return Ok(None);
+            return Err(anyhow!("Cannot predict an empty batch"));
         }
 
-        let first_batch = &self.data_buffer[0];
-        let schema = first_batch.schema();
+        let schema = combined_batch.schema();
+        let concatenated_columns = combined_batch.columns().to_vec();
 
-        // First, concatenate all batches into a single batch
-        let mut concatenated_columns: Vec<ArrayRef> = Vec::new();
-        for col_idx in 0..schema.fields().len() {
-            let mut arrays_to_concat = Vec::new();
-            for batch in &self.data_buffer {
-                arrays_to_concat.push(batch.column(col_idx).clone());
-            }
-            let concatenated = if arrays_to_concat.is_empty() {
-                self.data_buffer[0].column(col_idx).clone()
-            } else {
-                let refs: Vec<&dyn Array> = arrays_to_concat.iter().map(|a| a.as_ref()).collect();
-                concat(&refs).context("Failed to concatenate arrays")?
-            };
-            concatenated_columns.push(concatenated);
-        }
+        self.reset_prediction_state();
 
-        // Create the concatenated batch
-        let mut combined_batch = RecordBatch::try_new(schema.clone(), concatenated_columns.clone())
-            .context("Failed to create concatenated batch")?;
+        let time_span_info =
+            self.detect_time_span(schema.as_ref(), std::slice::from_ref(&combined_batch))?;
 
-        // Sort by _time column (ascending - earliest first) before prediction
-        if let Some(time_idx) = schema.fields().iter().position(|f| f.name() == "_time") {
-            let time_array = combined_batch.column(time_idx);
-
-            // Sort in ascending order (earliest time first)
-            let sort_options = SortOptions {
-                descending: false,
-                nulls_first: true,
-            };
-
-            let indices = sort_to_indices(time_array.as_ref(), Some(sort_options), None)
-                .context("Failed to sort by _time")?;
-
-            // Reorder all columns based on sorted indices
-            let mut sorted_columns: Vec<ArrayRef> = Vec::new();
-            for col in combined_batch.columns() {
-                let sorted_col =
-                    take(col.as_ref(), &indices, None).context("Failed to reorder column")?;
-                sorted_columns.push(sorted_col);
-            }
-
-            combined_batch = RecordBatch::try_new(schema.clone(), sorted_columns)
-                .context("Failed to create sorted batch")?;
-
-            // Update concatenated_columns with sorted data
-            concatenated_columns = combined_batch.columns().to_vec();
-        }
-
-        // Update data_buffer with the sorted combined batch for time span detection
-        self.data_buffer = vec![combined_batch.clone()];
-
-        // Detect time span information (now from sorted data)
-        let time_span_info = self.detect_time_span(&schema, &self.data_buffer)?;
-
-        // Extract time series data for each field and calculate beginning/missing_valued
         for config in &self.field_configs {
             let field_idx = schema
                 .fields()
@@ -1386,22 +1468,14 @@ impl TableFunction for Predict {
                 .position(|f| f.name().as_str() == config.field_name.as_str())
                 .ok_or_else(|| anyhow!("Field not found: {}", config.field_name))?;
 
-            // Extract values from the sorted combined batch
             let array = combined_batch.column(field_idx);
             let values = self.extract_numeric_values(array, combined_batch.num_rows());
-
-            // Calculate beginning (leading nulls) for this field
             let beginning = self.calculate_beginning(&values);
-            // Update the field config with the calculated beginning
-            // Also check for missing values
             let missing_valued = self.calculate_missing_valued(&values);
 
-            // Store in time_series_data
             self.time_series_data
                 .insert(config.field_name.clone(), values);
 
-            // Update the beginning and missing_valued for the first field
-            // (we use the first field's beginning as the global beginning for now)
             if self.beginning == 0 {
                 self.beginning = beginning;
                 self.missing_valued = missing_valued;
@@ -1415,24 +1489,16 @@ impl TableFunction for Predict {
             .map(|values| self.calculate_effective_future_timespan(values))
             .min()
             .unwrap_or(self.future_timespan);
-
-        // Generate predictions for each field
         let mut output_columns: Vec<ArrayRef> = Vec::new();
         let mut output_fields: Vec<Field> = Vec::new();
 
-        // Use the already sorted and concatenated columns
         for (col_idx, field) in schema.fields().iter().enumerate() {
             let mut concatenated = concatenated_columns[col_idx].clone();
 
-            // Extend original columns with values for future_timespan rows
             if effective_future_timespan > 0 {
-                // Check if this is a time column that should be extended with computed timestamps
                 let is_time_column = field.name() == "_time";
-
                 let extension_array = if is_time_column {
-                    // Try to extend _time column with computed future timestamps
                     if let Some((time_span, time_idx)) = time_span_info.as_ref() {
-                        // Use detected time span info
                         let last_valid_idx = all_rows.saturating_sub(1);
                         self.extend_time_column(
                             &concatenated,
@@ -1442,17 +1508,17 @@ impl TableFunction for Predict {
                             last_valid_idx,
                         )?
                     } else {
-                        // Try to compute time span directly from _time column
                         self.extend_time_column_auto(
                             &concatenated,
                             effective_future_timespan,
                             all_rows,
                         )?
                     }
-                } else if field.name() == "_span" || field.name() == "_spandays" {
-                    // Keep _span and _spandays constant for future rows
+                } else if field.name() == "_span"
+                    || field.name() == "_spandays"
+                    || self.is_group_by_field(field.name())
+                {
                     if all_rows > 0 {
-                        // Get the last value and repeat it
                         let last_idx = all_rows - 1;
                         self.extend_with_last_value(
                             &concatenated,
@@ -1463,29 +1529,26 @@ impl TableFunction for Predict {
                         arrow::array::new_null_array(field.data_type(), effective_future_timespan)
                     }
                 } else if field.is_nullable() {
-                    // For nullable fields, use null array
                     arrow::array::new_null_array(field.data_type(), effective_future_timespan)
                 } else {
-                    // For non-nullable fields, create an array with default values
                     match field.data_type() {
                         DataType::Int32 => Arc::new(arrow::array::Int32Array::from(vec![
-                                0;
-                                effective_future_timespan
-                            ])) as ArrayRef,
+                            0;
+                            effective_future_timespan
+                        ])) as ArrayRef,
                         DataType::Int64 => Arc::new(arrow::array::Int64Array::from(vec![
-                                0i64;
-                                effective_future_timespan
-                            ])) as ArrayRef,
+                            0i64;
+                            effective_future_timespan
+                        ])) as ArrayRef,
                         DataType::Float64 => Arc::new(arrow::array::Float64Array::from(vec![
-                                0.0;
-                                effective_future_timespan
-                            ])) as ArrayRef,
+                            0.0;
+                            effective_future_timespan
+                        ])) as ArrayRef,
                         DataType::Utf8 => Arc::new(arrow::array::StringArray::from(vec![
-                                "";
-                                effective_future_timespan
-                            ])) as ArrayRef,
+                            "";
+                            effective_future_timespan
+                        ])) as ArrayRef,
                         _ => {
-                            // For other types, try to create null array even if field is non-nullable
                             arrow::array::new_null_array(
                                 field.data_type(),
                                 effective_future_timespan,
@@ -1501,7 +1564,6 @@ impl TableFunction for Predict {
             output_fields.push(field.as_ref().clone());
         }
 
-        // Add prediction columns for each configured field
         for config in &self.field_configs {
             let values = self
                 .time_series_data
@@ -1509,14 +1571,11 @@ impl TableFunction for Predict {
                 .ok_or_else(|| anyhow!("No data for field: {}", config.field_name))?;
 
             let predictions = self.predict_field(values, config, effective_future_timespan)?;
-
-            // Ensure predictions match the length of input data
             let total_rows = all_rows + effective_future_timespan;
             let mut predicted_values: Vec<f64> = predictions.iter().map(|p| p.0).collect();
             let mut lower_bounds: Vec<f64> = predictions.iter().map(|p| p.1).collect();
             let mut upper_bounds: Vec<f64> = predictions.iter().map(|p| p.2).collect();
 
-            // Pad if needed
             if predicted_values.len() < total_rows {
                 let last_pred = predicted_values.last().copied().unwrap_or(0.0);
                 let last_lower = lower_bounds.last().copied().unwrap_or(0.0);
@@ -1532,7 +1591,6 @@ impl TableFunction for Predict {
                 upper_bounds.truncate(total_rows);
             }
 
-            // Determine the output column names (using underscores instead of parentheses)
             let predicted_col_name = format!("prediction_{}", config.field_name);
             let lower_col_name = format!("lower_{}", predicted_col_name);
             let upper_col_name = format!("upper_{}", predicted_col_name);
@@ -1550,10 +1608,7 @@ impl TableFunction for Predict {
             output_fields.push(Field::new(upper_col_name, DataType::Float64, true));
         }
 
-        // Create output schema
         let output_schema = Arc::new(Schema::new(output_fields));
-
-        // Ensure all columns have the same length
         let expected_len = output_columns[0].len();
         for col in &output_columns {
             if col.len() != expected_len {
@@ -1568,8 +1623,47 @@ impl TableFunction for Predict {
         let output = RecordBatch::try_new(output_schema, output_columns)
             .context("Failed to create output RecordBatch")?;
 
+        self.reset_prediction_state();
+        Ok(output)
+    }
+}
+
+impl TableFunction for Predict {
+    fn process(&mut self, input: RecordBatch) -> Result<Option<RecordBatch>> {
+        // Buffer all data for time series analysis
+        self.data_buffer.push(input);
+        Ok(None)
+    }
+
+    fn finalize(&mut self) -> Result<Option<RecordBatch>> {
+        if self.data_buffer.is_empty() {
+            return Ok(None);
+        }
+
+        self.validate_parameters()?;
+        let combined_batch = Self::concat_batches(&self.data_buffer)?;
+        if combined_batch.num_rows() == 0 {
+            self.data_buffer.clear();
+            self.reset_prediction_state();
+            return Ok(None);
+        }
+
+        let output = if self.group_by_fields.is_empty() {
+            self.predict_batch(combined_batch)?
+        } else {
+            let group_rows = self.partition_group_rows(&combined_batch)?;
+            let mut grouped_outputs = Vec::with_capacity(group_rows.len());
+
+            for rows in group_rows {
+                let group_batch = Self::take_rows(&combined_batch, &rows)?;
+                grouped_outputs.push(self.predict_batch(group_batch)?);
+            }
+
+            Self::concat_batches(&grouped_outputs)?
+        };
+
         self.data_buffer.clear();
-        self.time_series_data.clear();
+        self.reset_prediction_state();
 
         Ok(Some(output))
     }
@@ -1578,7 +1672,7 @@ impl TableFunction for Predict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Float64Array, Int32Array};
+    use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{Field, Schema};
     use rust_tvtf_api::TableFunction;
@@ -1639,6 +1733,21 @@ mod tests {
         let effective_future_timespan = predict.calculate_effective_future_timespan(&values);
 
         assert_eq!(effective_future_timespan, 0);
+    }
+
+    fn create_grouped_test_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_time", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        let time_array = Arc::new(Int64Array::from(vec![2, 1, 2, 1])) as ArrayRef;
+        let category_array = Arc::new(StringArray::from(vec!["b", "a", "a", "b"])) as ArrayRef;
+        let value_array = Arc::new(Float64Array::from(vec![20.0, 10.0, 12.0, 18.0])) as ArrayRef;
+
+        RecordBatch::try_new(schema, vec![time_array, category_array, value_array])
+            .expect("Failed to create grouped test RecordBatch")
     }
 
     #[test]
@@ -2044,7 +2153,7 @@ mod tests {
         // Test with real data from llt_input.csv
         // Input: [4991, 5804, 5847, 5578, 5552, 5414, 5747, 599]
         // Expected output from llt_output.csv
-        let input_values = vec![
+        let input_values = [
             4991.0, 5804.0, 5847.0, 5578.0, 5552.0, 5414.0, 5747.0, 599.0,
         ];
 
@@ -2203,10 +2312,13 @@ mod tests {
         // Note: Current implementation may differ from Splunk's exact algorithm
         // This is expected as algorithm parameters may need fine-tuning
         println!("\n=== Prediction Comparison (for reference) ===");
-        for i in 0..8.min(expected_predictions.len()) {
+        for (i, expected) in expected_predictions
+            .iter()
+            .enumerate()
+            .take(8.min(expected_predictions.len()))
+        {
             if predicted_array.is_valid(i) {
                 let predicted = predicted_array.value(i);
-                let expected = expected_predictions[i];
                 let diff = (predicted - expected).abs();
                 println!(
                     "Row {}: predicted={:.2}, expected={:.2}, diff={:.2}",
@@ -2309,8 +2421,8 @@ mod tests {
         // handles this case gracefully
         let result = Predict::new(None, named_args);
         // Either success or a specific error about period is acceptable
-        if result.is_err() {
-            let err_msg = result.unwrap_err().to_string();
+        if let Err(err) = result {
+            let err_msg = err.to_string();
             assert!(
                 err_msg.contains("period")
                     || err_msg.contains("LLP2")
@@ -2380,18 +2492,17 @@ mod tests {
                 _ => unreachable!(),
             };
 
-            let mut predict = Predict::new(None, named_args.clone()).expect(&format!(
-                "Failed to create Predict with algorithm: {}",
-                algo
-            ));
+            let mut predict = Predict::new(None, named_args.clone())
+                .unwrap_or_else(|_| panic!("Failed to create Predict with algorithm: {}", algo));
 
             predict
                 .process(batch.clone())
-                .expect(&format!("Processing failed for algorithm: {}", algo));
+                .unwrap_or_else(|_| panic!("Processing failed for algorithm: {}", algo));
             let output = predict
                 .finalize()
-                .expect(&format!("Finalize failed for algorithm: {}", algo));
-            let output_batch = output.expect(&format!("No output for algorithm: {}", algo));
+                .unwrap_or_else(|_| panic!("Finalize failed for algorithm: {}", algo));
+            let output_batch =
+                output.unwrap_or_else(|| panic!("No output for algorithm: {}", algo));
 
             // All algorithms should produce valid output
             assert!(
@@ -2555,10 +2666,10 @@ mod tests {
             let named_args = vec![("fields".to_string(), Arg::String(field_name.to_string()))];
 
             let mut predict = Predict::new(None, named_args)
-                .expect(&format!("Failed to create Predict for {}", description));
+                .unwrap_or_else(|_| panic!("Failed to create Predict for {}", description));
             predict
                 .process(batch)
-                .expect(&format!("Processing failed for {}", description));
+                .unwrap_or_else(|_| panic!("Processing failed for {}", description));
 
             let result = predict.finalize();
             // Should succeed even with count field detection
@@ -2691,10 +2802,10 @@ mod tests {
             ];
 
             let mut predict = Predict::new(None, named_args)
-                .expect(&format!("Failed to create Predict for {}", algo));
+                .unwrap_or_else(|_| panic!("Failed to create Predict for {}", algo));
             predict
                 .process(batch.clone())
-                .expect(&format!("Processing failed for {}", algo));
+                .unwrap_or_else(|_| panic!("Processing failed for {}", algo));
 
             let result = predict.finalize();
             assert!(result.is_ok(), "{} should work with periodic data", algo);
@@ -3145,5 +3256,162 @@ mod tests {
         assert_eq!(value_array.value(0), 10.0, "Row 0 value should be 10.0");
         assert_eq!(value_array.value(1), 20.0, "Row 1 value should be 20.0");
         assert_eq!(value_array.value(2), 30.0, "Row 2 value should be 30.0");
+    }
+
+    #[test]
+    fn test_predict_group_by_fields_keeps_group_blocks_and_values() {
+        let batch = create_grouped_test_batch();
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            (
+                "group_by_fields".to_string(),
+                Arg::String("category".to_string()),
+            ),
+            ("future_timespan".to_string(), Arg::Int(1)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        assert_eq!(output.num_rows(), 6);
+
+        let category_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "category")
+            .expect("category column not found");
+        let time_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "_time")
+            .expect("_time column not found");
+
+        let category_array = output.column(category_idx).as_string::<i32>();
+        let time_array = output
+            .column(time_idx)
+            .as_primitive::<arrow::datatypes::Int64Type>();
+
+        let categories: Vec<&str> = (0..output.num_rows())
+            .map(|idx| category_array.value(idx))
+            .collect();
+        assert_eq!(categories, vec!["b", "b", "b", "a", "a", "a"]);
+
+        assert_eq!(time_array.value(0), 1);
+        assert_eq!(time_array.value(1), 2);
+        assert_eq!(time_array.value(2), 3);
+        assert_eq!(time_array.value(3), 1);
+        assert_eq!(time_array.value(4), 2);
+        assert_eq!(time_array.value(5), 3);
+    }
+
+    #[test]
+    fn test_predict_group_by_fields_preserves_group_value_on_future_rows() {
+        let batch = create_grouped_test_batch();
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            (
+                "group_by_fields".to_string(),
+                Arg::String("category".to_string()),
+            ),
+            ("future_timespan".to_string(), Arg::Int(2)),
+        ];
+
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+        predict.process(batch).expect("Processing failed");
+
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        let category_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "category")
+            .expect("category column not found");
+        let value_idx = output
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "value")
+            .expect("value column not found");
+
+        let category_array = output.column(category_idx).as_string::<i32>();
+        let value_array = output
+            .column(value_idx)
+            .as_primitive::<arrow::datatypes::Float64Type>();
+
+        assert_eq!(output.num_rows(), 8);
+
+        for idx in [2_usize, 3, 6, 7] {
+            assert!(
+                value_array.is_null(idx),
+                "Future row {idx} should have null value"
+            );
+        }
+
+        assert_eq!(category_array.value(2), "b");
+        assert_eq!(category_array.value(3), "b");
+        assert_eq!(category_array.value(6), "a");
+        assert_eq!(category_array.value(7), "a");
+    }
+
+    #[test]
+    fn test_predict_empty_group_by_fields_matches_ungrouped_behavior() {
+        let batch = create_grouped_test_batch();
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("group_by_fields".to_string(), Arg::String(String::new())),
+            ("future_timespan".to_string(), Arg::Int(1)),
+        ];
+
+        let mut grouped_predict =
+            Predict::new(None, named_args).expect("Failed to create grouped Predict");
+        grouped_predict
+            .process(batch.clone())
+            .expect("Processing with empty group_by_fields failed");
+
+        let grouped_output = grouped_predict
+            .finalize()
+            .expect("Finalize with empty group_by_fields failed")
+            .expect("No grouped output");
+
+        let mut plain_predict = Predict::new(
+            None,
+            vec![
+                ("fields".to_string(), Arg::String("value".to_string())),
+                ("future_timespan".to_string(), Arg::Int(1)),
+            ],
+        )
+        .expect("Failed to create plain Predict");
+        plain_predict
+            .process(batch)
+            .expect("Processing without group_by_fields failed");
+
+        let plain_output = plain_predict
+            .finalize()
+            .expect("Finalize without group_by_fields failed")
+            .expect("No plain output");
+
+        assert_eq!(grouped_output.num_rows(), plain_output.num_rows());
+        assert_eq!(grouped_output.num_columns(), plain_output.num_columns());
+
+        for (left, right) in grouped_output
+            .schema()
+            .fields()
+            .iter()
+            .zip(plain_output.schema().fields().iter())
+        {
+            assert_eq!(left.name(), right.name());
+            assert_eq!(left.data_type(), right.data_type());
+        }
     }
 }
