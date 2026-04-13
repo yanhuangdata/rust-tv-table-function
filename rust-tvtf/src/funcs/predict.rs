@@ -360,6 +360,7 @@ impl Predict {
         &self,
         values: &[Option<f64>],
         config: &FieldConfig,
+        future_timespan: usize,
     ) -> anyhow::Result<Vec<(f64, f64, f64)>> {
         // Calculate effective training data (after holdback)
         let numvals = values.len();
@@ -446,7 +447,7 @@ impl Predict {
         let confidence = (self.upper_confidence + self.lower_confidence) / 2.0;
 
         let mut predictions = Vec::new();
-        let total_pred_points = numvals + self.future_timespan;
+        let total_pred_points = numvals + future_timespan;
 
         if is_univar {
             // Univariate algorithms (LL, LLT, LLP, LLP1, LLP2, LLP5)
@@ -457,7 +458,7 @@ impl Predict {
                 data_start,
                 data_end_for_model,
                 period,
-                self.future_timespan,
+                future_timespan,
             )
             .context("Failed to create Univar model")?;
 
@@ -515,7 +516,7 @@ impl Predict {
                 data_start,
                 data_end_for_model,
                 period,
-                self.future_timespan,
+                future_timespan,
             )
             .context("Failed to create model for multivariate algorithm")?;
 
@@ -592,6 +593,11 @@ impl Predict {
     fn calculate_missing_valued(&self, values: &[Option<f64>]) -> bool {
         // Check if there are any missing values in the data
         values.iter().any(|v| v.is_none())
+    }
+
+    fn calculate_effective_future_timespan(&self, values: &[Option<f64>]) -> usize {
+        let missing_count = values.iter().filter(|v| v.is_none()).count();
+        self.future_timespan.saturating_sub(missing_count)
     }
 }
 
@@ -1402,6 +1408,14 @@ impl TableFunction for Predict {
             }
         }
 
+        let effective_future_timespan = self
+            .field_configs
+            .iter()
+            .filter_map(|config| self.time_series_data.get(&config.field_name))
+            .map(|values| self.calculate_effective_future_timespan(values))
+            .min()
+            .unwrap_or(self.future_timespan);
+
         // Generate predictions for each field
         let mut output_columns: Vec<ArrayRef> = Vec::new();
         let mut output_fields: Vec<Field> = Vec::new();
@@ -1411,7 +1425,7 @@ impl TableFunction for Predict {
             let mut concatenated = concatenated_columns[col_idx].clone();
 
             // Extend original columns with values for future_timespan rows
-            if self.future_timespan > 0 {
+            if effective_future_timespan > 0 {
                 // Check if this is a time column that should be extended with computed timestamps
                 let is_time_column = field.name() == "_time";
 
@@ -1424,47 +1438,58 @@ impl TableFunction for Predict {
                             &concatenated,
                             time_span,
                             *time_idx,
-                            self.future_timespan,
+                            effective_future_timespan,
                             last_valid_idx,
                         )?
                     } else {
                         // Try to compute time span directly from _time column
-                        self.extend_time_column_auto(&concatenated, self.future_timespan, all_rows)?
+                        self.extend_time_column_auto(
+                            &concatenated,
+                            effective_future_timespan,
+                            all_rows,
+                        )?
                     }
                 } else if field.name() == "_span" || field.name() == "_spandays" {
                     // Keep _span and _spandays constant for future rows
                     if all_rows > 0 {
                         // Get the last value and repeat it
                         let last_idx = all_rows - 1;
-                        self.extend_with_last_value(&concatenated, last_idx, self.future_timespan)?
+                        self.extend_with_last_value(
+                            &concatenated,
+                            last_idx,
+                            effective_future_timespan,
+                        )?
                     } else {
-                        arrow::array::new_null_array(field.data_type(), self.future_timespan)
+                        arrow::array::new_null_array(field.data_type(), effective_future_timespan)
                     }
                 } else if field.is_nullable() {
                     // For nullable fields, use null array
-                    arrow::array::new_null_array(field.data_type(), self.future_timespan)
+                    arrow::array::new_null_array(field.data_type(), effective_future_timespan)
                 } else {
                     // For non-nullable fields, create an array with default values
                     match field.data_type() {
                         DataType::Int32 => Arc::new(arrow::array::Int32Array::from(vec![
                                 0;
-                                self.future_timespan
+                                effective_future_timespan
                             ])) as ArrayRef,
                         DataType::Int64 => Arc::new(arrow::array::Int64Array::from(vec![
                                 0i64;
-                                self.future_timespan
+                                effective_future_timespan
                             ])) as ArrayRef,
                         DataType::Float64 => Arc::new(arrow::array::Float64Array::from(vec![
                                 0.0;
-                                self.future_timespan
+                                effective_future_timespan
                             ])) as ArrayRef,
                         DataType::Utf8 => Arc::new(arrow::array::StringArray::from(vec![
                                 "";
-                                self.future_timespan
+                                effective_future_timespan
                             ])) as ArrayRef,
                         _ => {
                             // For other types, try to create null array even if field is non-nullable
-                            arrow::array::new_null_array(field.data_type(), self.future_timespan)
+                            arrow::array::new_null_array(
+                                field.data_type(),
+                                effective_future_timespan,
+                            )
                         }
                     }
                 };
@@ -1483,10 +1508,10 @@ impl TableFunction for Predict {
                 .get(&config.field_name)
                 .ok_or_else(|| anyhow!("No data for field: {}", config.field_name))?;
 
-            let predictions = self.predict_field(values, config)?;
+            let predictions = self.predict_field(values, config, effective_future_timespan)?;
 
             // Ensure predictions match the length of input data
-            let total_rows = all_rows + self.future_timespan;
+            let total_rows = all_rows + effective_future_timespan;
             let mut predicted_values: Vec<f64> = predictions.iter().map(|p| p.0).collect();
             let mut lower_bounds: Vec<f64> = predictions.iter().map(|p| p.1).collect();
             let mut upper_bounds: Vec<f64> = predictions.iter().map(|p| p.2).collect();
@@ -1575,6 +1600,45 @@ mod tests {
 
         RecordBatch::try_new(schema, vec![time_array, value_array])
             .expect("Failed to create test RecordBatch")
+    }
+
+    fn create_predict_with_future_timespan(future_timespan: i64) -> Predict {
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("future_timespan".to_string(), Arg::Int(future_timespan)),
+        ];
+
+        Predict::new(None, named_args).expect("Failed to create Predict")
+    }
+
+    #[test]
+    fn test_calculate_effective_future_timespan_without_missing_values() {
+        let predict = create_predict_with_future_timespan(4);
+        let values = vec![Some(10.0), Some(12.0), Some(14.0)];
+
+        let effective_future_timespan = predict.calculate_effective_future_timespan(&values);
+
+        assert_eq!(effective_future_timespan, 4);
+    }
+
+    #[test]
+    fn test_calculate_effective_future_timespan_subtracts_missing_values() {
+        let predict = create_predict_with_future_timespan(5);
+        let values = vec![Some(10.0), None, Some(14.0), None, Some(18.0)];
+
+        let effective_future_timespan = predict.calculate_effective_future_timespan(&values);
+
+        assert_eq!(effective_future_timespan, 3);
+    }
+
+    #[test]
+    fn test_calculate_effective_future_timespan_clamps_at_zero() {
+        let predict = create_predict_with_future_timespan(2);
+        let values = vec![None, Some(12.0), None, Some(16.0), None];
+
+        let effective_future_timespan = predict.calculate_effective_future_timespan(&values);
+
+        assert_eq!(effective_future_timespan, 0);
     }
 
     #[test]
@@ -1693,8 +1757,45 @@ mod tests {
             .expect("Finalize failed")
             .expect("No output");
 
+        // Default future_timespan is 5, reduced by 2 missing values to 3
+        assert_eq!(output.num_rows(), 8);
         // Should handle missing values gracefully
         assert_eq!(output.num_columns(), 5);
+    }
+
+    #[test]
+    fn test_predict_missing_values_reduce_future_timespan_to_zero() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("time", DataType::Int32, false),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        let time_array = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])) as ArrayRef;
+        let value_array = Arc::new(Float64Array::from(vec![
+            Some(10.0),
+            None,
+            Some(14.0),
+            Some(16.0),
+            None,
+        ])) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![time_array, value_array])
+            .expect("Failed to create test RecordBatch");
+
+        let named_args = vec![
+            ("fields".to_string(), Arg::String("value".to_string())),
+            ("future_timespan".to_string(), Arg::Int(1)),
+        ];
+        let mut predict = Predict::new(None, named_args).expect("Failed to create Predict");
+
+        predict.process(batch).expect("Processing failed");
+        let output = predict
+            .finalize()
+            .expect("Finalize failed")
+            .expect("No output");
+
+        // 1 future point reduced by 2 missing values should clamp to 0
+        assert_eq!(output.num_rows(), 5);
     }
 
     #[test]
