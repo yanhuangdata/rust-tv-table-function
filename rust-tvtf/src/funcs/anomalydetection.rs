@@ -228,12 +228,9 @@ impl AnomalyDetector {
                 }
             }
             "iqr" => {
-                // pthresh is not supported for IQR method
-                if detector.pthresh.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "Invalid argument: 'pthresh' is not supported with method 'iqr'"
-                    ));
-                }
+                // Ignore pthresh for IQR so callers that always materialize signature
+                // defaults do not fail function creation for an unused parameter.
+                detector.pthresh = None;
                 if !matches!(
                     detector.action.as_str(),
                     "remove" | "transform" | "rm" | "tf"
@@ -1683,8 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pthresh_invalid_for_iqr() {
-        // pthresh should return an error when used with IQR method
+    fn test_pthresh_is_ignored_for_iqr() {
         let params = vec![];
         let named_params = vec![
             ("method".to_string(), Arg::String("iqr".to_string())),
@@ -1692,11 +1688,11 @@ mod tests {
         ];
 
         let result = AnomalyDetector::new(Some(params), named_params);
-        assert!(result.is_err());
+        assert!(result.is_ok());
 
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("pthresh"));
-        assert!(err_msg.contains("iqr"));
+        let detector = result.unwrap();
+        assert_eq!(detector.method, "iqr");
+        assert_eq!(detector.pthresh, None);
     }
 
     #[test]
