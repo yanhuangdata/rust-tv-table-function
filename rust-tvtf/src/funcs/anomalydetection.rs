@@ -856,12 +856,12 @@ impl AnomalyDetector {
         summary: SummaryData,
     ) -> anyhow::Result<Option<RecordBatch>> {
         let fields = vec![
-            Arc::new(Field::new("num_anomalies", DataType::Int64, false)),
-            Arc::new(Field::new("thresh", DataType::Float64, false)),
-            Arc::new(Field::new("max_logprob", DataType::Float64, false)),
-            Arc::new(Field::new("min_logprob", DataType::Float64, false)),
-            Arc::new(Field::new("1st_quartile", DataType::Float64, false)),
-            Arc::new(Field::new("3rd_quartile", DataType::Float64, false)),
+            Arc::new(Field::new("num_anomalies", DataType::Int64, true)),
+            Arc::new(Field::new("thresh", DataType::Float64, true)),
+            Arc::new(Field::new("max_logprob", DataType::Float64, true)),
+            Arc::new(Field::new("min_logprob", DataType::Float64, true)),
+            Arc::new(Field::new("1st_quartile", DataType::Float64, true)),
+            Arc::new(Field::new("3rd_quartile", DataType::Float64, true)),
         ];
 
         let schema = Arc::new(Schema::new(fields));
