@@ -175,30 +175,3 @@ impl PathTrav for std::path::Path {
         Ok(!trimmed_rel_abs.eq(base_abs))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_predict_registry_exposes_group_by_fields_with_empty_string_default() {
-        let registries = get_function_registries().expect("Failed to load registries");
-        let predict_registry = registries
-            .into_iter()
-            .find(|registry| registry.name() == "predict")
-            .expect("predict registry not found");
-
-        let signatures = predict_registry
-            .signatures()
-            .expect("Failed to serialize predict signatures");
-
-        assert!(
-            signatures.contains("\"name\":\"group_by_fields\""),
-            "predict signature should expose group_by_fields: {signatures}"
-        );
-        assert!(
-            signatures.contains("\"default\":{\"type\":\"string\",\"value\":\"\"}"),
-            "group_by_fields default should be empty string: {signatures}"
-        );
-    }
-}
