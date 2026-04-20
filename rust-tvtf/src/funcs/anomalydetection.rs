@@ -853,12 +853,12 @@ impl AnomalyDetector {
         summary: SummaryData,
     ) -> anyhow::Result<Option<RecordBatch>> {
         let fields = vec![
-            Arc::new(Field::new("num_anomalies", DataType::Int64, false)),
-            Arc::new(Field::new("thresh", DataType::Float64, false)),
-            Arc::new(Field::new("max_logprob", DataType::Float64, false)),
-            Arc::new(Field::new("min_logprob", DataType::Float64, false)),
-            Arc::new(Field::new("1st_quartile", DataType::Float64, false)),
-            Arc::new(Field::new("3rd_quartile", DataType::Float64, false)),
+            Arc::new(Field::new("num_anomalies", DataType::Int64, true)),
+            Arc::new(Field::new("thresh", DataType::Float64, true)),
+            Arc::new(Field::new("max_logprob", DataType::Float64, true)),
+            Arc::new(Field::new("min_logprob", DataType::Float64, true)),
+            Arc::new(Field::new("1st_quartile", DataType::Float64, true)),
+            Arc::new(Field::new("3rd_quartile", DataType::Float64, true)),
         ];
 
         let schema = Arc::new(Schema::new(fields));
@@ -917,18 +917,14 @@ impl AnomalyDetector {
         output_fields.push(Arc::new(Field::new(
             "log_event_prob",
             DataType::Float64,
-            false,
+            true,
         )));
-        output_fields.push(Arc::new(Field::new("max_freq", DataType::Float64, false)));
-        output_fields.push(Arc::new(Field::new(
-            "probable_cause",
-            DataType::Utf8,
-            false,
-        )));
+        output_fields.push(Arc::new(Field::new("max_freq", DataType::Float64, true)));
+        output_fields.push(Arc::new(Field::new("probable_cause", DataType::Utf8, true)));
         output_fields.push(Arc::new(Field::new(
             "probable_cause_freq",
             DataType::Float64,
-            false,
+            true,
         )));
         let output_schema = Arc::new(Schema::new(output_fields));
 
@@ -1350,18 +1346,14 @@ impl TableFunction for AnomalyDetector {
                 output_fields.push(Arc::new(Field::new(
                     "log_event_prob",
                     DataType::Float64,
-                    false,
+                    true,
                 )));
-                output_fields.push(Arc::new(Field::new("max_freq", DataType::Float64, false)));
-                output_fields.push(Arc::new(Field::new(
-                    "probable_cause",
-                    DataType::Utf8,
-                    false,
-                )));
+                output_fields.push(Arc::new(Field::new("max_freq", DataType::Float64, true)));
+                output_fields.push(Arc::new(Field::new("probable_cause", DataType::Utf8, true)));
                 output_fields.push(Arc::new(Field::new(
                     "probable_cause_freq",
                     DataType::Float64,
-                    false,
+                    true,
                 )));
                 let output_schema = Arc::new(Schema::new(output_fields));
                 self.create_annotated_output(&anomaly_records, &input, output_schema)
@@ -1396,8 +1388,8 @@ mod tests {
     fn test_anomaly_detector_basic() {
         // Create test data with some obvious anomalies
         let schema = Arc::new(Schema::new(vec![
-            Field::new("status", DataType::Utf8, false),
-            Field::new("code", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("code", DataType::Int64, true),
         ]));
 
         // Most entries are "success" with 200 (100 times)
@@ -1514,7 +1506,7 @@ mod tests {
 
     #[test]
     fn test_anomaly_detector_empty_input() {
-        let schema = Arc::new(Schema::new(vec![Field::new("col1", DataType::Utf8, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new("col1", DataType::Utf8, true)]));
         let col = Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
         let input_batch =
             RecordBatch::try_new(schema, vec![col]).expect("Failed to create record batch");
@@ -1730,8 +1722,8 @@ mod tests {
     #[test]
     fn test_action_summary_output() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("status", DataType::Utf8, false),
-            Field::new("code", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("code", DataType::Int64, true),
         ]));
 
         let status_col = Arc::new(StringArray::from(
@@ -1780,8 +1772,8 @@ mod tests {
     #[test]
     fn test_action_annotate_output() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("status", DataType::Utf8, false),
-            Field::new("code", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("code", DataType::Int64, true),
         ]));
 
         let status_col = Arc::new(StringArray::from(
@@ -1859,8 +1851,8 @@ mod tests {
     fn test_action_rm_processing() {
         // Test that "rm" (abbreviation for "remove") actually removes anomalies
         let schema = Arc::new(Schema::new(vec![
-            Field::new("status", DataType::Utf8, false),
-            Field::new("code", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("code", DataType::Int64, true),
         ]));
 
         let status_col = Arc::new(StringArray::from(
@@ -1915,7 +1907,7 @@ mod tests {
             Arc::new(Schema::new(vec![Field::new(
                 "value",
                 DataType::Float64,
-                false,
+                true,
             )])),
             vec![value_col],
         )
@@ -1997,9 +1989,9 @@ mod tests {
     #[test]
     fn test_specified_fields_filter() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("status", DataType::Utf8, false),
-            Field::new("code", DataType::Int64, false),
-            Field::new("latency", DataType::Float64, false),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("code", DataType::Int64, true),
+            Field::new("latency", DataType::Float64, true),
         ]));
 
         let status_col = Arc::new(StringArray::from(
@@ -2046,9 +2038,9 @@ mod tests {
     #[test]
     fn test_specified_fields_annotate() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("status", DataType::Utf8, false),
-            Field::new("code", DataType::Int64, false),
-            Field::new("latency", DataType::Float64, false),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("code", DataType::Int64, true),
+            Field::new("latency", DataType::Float64, true),
         ]));
 
         let status_col = Arc::new(StringArray::from(
@@ -2109,8 +2101,8 @@ mod tests {
     #[test]
     fn test_invalid_field_name_returns_error() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("status", DataType::Utf8, false),
-            Field::new("code", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("code", DataType::Int64, true),
         ]));
 
         let status_col = Arc::new(StringArray::from(vec!["success"])) as ArrayRef;
@@ -2132,8 +2124,8 @@ mod tests {
     #[test]
     fn test_empty_fields_uses_all_columns() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("status", DataType::Utf8, false),
-            Field::new("code", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("code", DataType::Int64, true),
         ]));
 
         let status_col = Arc::new(StringArray::from(
