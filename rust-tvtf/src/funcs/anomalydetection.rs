@@ -6,7 +6,11 @@ use anyhow::Context;
 use arrow::{
     array::{Array, ArrayRef, AsArray, Float64Array, StringArray},
     compute,
-    datatypes::{Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type},
+    datatypes::{
+        Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
+        TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+        TimestampSecondType,
+    },
     record_batch::RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
@@ -680,6 +684,179 @@ impl AnomalyDetector {
         }
     }
 
+    fn stringify_column_values(col: &ArrayRef) -> anyhow::Result<Vec<String>> {
+        let len = col.len();
+
+        match col.data_type() {
+            DataType::Utf8 => Ok((0..len)
+                .map(|row_idx| {
+                    if col.is_null(row_idx) {
+                        "null".to_string()
+                    } else {
+                        col.as_string::<i32>().value(row_idx).to_string()
+                    }
+                })
+                .collect()),
+            DataType::LargeUtf8 => Ok((0..len)
+                .map(|row_idx| {
+                    if col.is_null(row_idx) {
+                        "null".to_string()
+                    } else {
+                        col.as_string::<i64>().value(row_idx).to_string()
+                    }
+                })
+                .collect()),
+            DataType::Int8 => Ok((0..len)
+                .map(|row_idx| {
+                    if col.is_null(row_idx) {
+                        "null".to_string()
+                    } else {
+                        col.as_primitive::<Int8Type>().value(row_idx).to_string()
+                    }
+                })
+                .collect()),
+            DataType::Int16 => Ok((0..len)
+                .map(|row_idx| {
+                    if col.is_null(row_idx) {
+                        "null".to_string()
+                    } else {
+                        col.as_primitive::<Int16Type>().value(row_idx).to_string()
+                    }
+                })
+                .collect()),
+            DataType::Int32 => Ok((0..len)
+                .map(|row_idx| {
+                    if col.is_null(row_idx) {
+                        "null".to_string()
+                    } else {
+                        col.as_primitive::<Int32Type>().value(row_idx).to_string()
+                    }
+                })
+                .collect()),
+            DataType::Int64 => Ok((0..len)
+                .map(|row_idx| {
+                    if col.is_null(row_idx) {
+                        "null".to_string()
+                    } else {
+                        col.as_primitive::<Int64Type>().value(row_idx).to_string()
+                    }
+                })
+                .collect()),
+            DataType::Float32 => Ok((0..len)
+                .map(|row_idx| {
+                    if col.is_null(row_idx) {
+                        "null".to_string()
+                    } else {
+                        col.as_primitive::<Float32Type>().value(row_idx).to_string()
+                    }
+                })
+                .collect()),
+            DataType::Float64 => Ok((0..len)
+                .map(|row_idx| {
+                    if col.is_null(row_idx) {
+                        "null".to_string()
+                    } else {
+                        col.as_primitive::<Float64Type>().value(row_idx).to_string()
+                    }
+                })
+                .collect()),
+            DataType::Boolean => Ok((0..len)
+                .map(|row_idx| {
+                    if col.is_null(row_idx) {
+                        "null".to_string()
+                    } else {
+                        col.as_boolean().value(row_idx).to_string()
+                    }
+                })
+                .collect()),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Second, _) => Ok((0..len)
+                .map(|row_idx| {
+                    if col.is_null(row_idx) {
+                        "null".to_string()
+                    } else {
+                        col.as_primitive::<TimestampSecondType>()
+                            .value(row_idx)
+                            .to_string()
+                    }
+                })
+                .collect()),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, _) => Ok((0..len)
+                .map(|row_idx| {
+                    if col.is_null(row_idx) {
+                        "null".to_string()
+                    } else {
+                        col.as_primitive::<TimestampMillisecondType>()
+                            .value(row_idx)
+                            .to_string()
+                    }
+                })
+                .collect()),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _) => Ok((0..len)
+                .map(|row_idx| {
+                    if col.is_null(row_idx) {
+                        "null".to_string()
+                    } else {
+                        col.as_primitive::<TimestampMicrosecondType>()
+                            .value(row_idx)
+                            .to_string()
+                    }
+                })
+                .collect()),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => Ok((0..len)
+                .map(|row_idx| {
+                    if col.is_null(row_idx) {
+                        "null".to_string()
+                    } else {
+                        col.as_primitive::<TimestampNanosecondType>()
+                            .value(row_idx)
+                            .to_string()
+                    }
+                })
+                .collect()),
+            _ => {
+                // Cast unsupported columns once per column instead of once per row.
+                let casted = compute::cast(col, &DataType::Utf8)
+                    .context("Failed to cast unsupported column to Utf8")?;
+
+                Ok((0..len)
+                    .map(|row_idx| {
+                        if casted.is_null(row_idx) {
+                            "null".to_string()
+                        } else {
+                            casted.as_string::<i32>().value(row_idx).to_string()
+                        }
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    fn build_detection_rows(
+        input: &RecordBatch,
+        fields: &[String],
+    ) -> anyhow::Result<Vec<Vec<(String, String)>>> {
+        let schema = input.schema();
+        let column_values: Vec<(String, Vec<String>)> = fields
+            .iter()
+            .map(|field| {
+                let col_idx = schema
+                    .index_of(field)
+                    .with_context(|| format!("Field '{}' not found in input schema", field))?;
+                let values = Self::stringify_column_values(input.column(col_idx))?;
+                Ok((field.clone(), values))
+            })
+            .collect::<anyhow::Result<_>>()?;
+
+        Ok((0..input.num_rows())
+            .map(|row_idx| {
+                column_values
+                    .iter()
+                    .map(|(field, values)| (field.clone(), values[row_idx].clone()))
+                    .collect()
+            })
+            .collect())
+    }
+
     /// Detect anomalies in the data
     fn detect_anomalies(
         &mut self,
@@ -1272,58 +1449,8 @@ impl TableFunction for AnomalyDetector {
             self.target_fields.clone()
         };
 
-        // Convert RecordBatch to Vec<Vec<(String, String)>>
-        let data: Vec<Vec<(String, String)>> = (0..input.num_rows())
-            .map(|row_idx| {
-                let mut row = Vec::new();
-                for col_idx in 0..input.num_columns() {
-                    let col = input.column(col_idx);
-                    let field_name = schema.field(col_idx).name();
-
-                    let value = if col.is_null(row_idx) {
-                        "null".to_string()
-                    } else {
-                        match col.data_type() {
-                            DataType::Utf8 => col.as_string::<i32>().value(row_idx).to_string(),
-                            DataType::LargeUtf8 => {
-                                col.as_string::<i64>().value(row_idx).to_string()
-                            }
-                            DataType::Int8 => {
-                                col.as_primitive::<Int8Type>().value(row_idx).to_string()
-                            }
-                            DataType::Int16 => {
-                                col.as_primitive::<Int16Type>().value(row_idx).to_string()
-                            }
-                            DataType::Int32 => {
-                                col.as_primitive::<Int32Type>().value(row_idx).to_string()
-                            }
-                            DataType::Int64 => {
-                                col.as_primitive::<Int64Type>().value(row_idx).to_string()
-                            }
-                            DataType::Float32 => {
-                                col.as_primitive::<Float32Type>().value(row_idx).to_string()
-                            }
-                            DataType::Float64 => {
-                                col.as_primitive::<Float64Type>().value(row_idx).to_string()
-                            }
-                            DataType::Boolean => col.as_boolean().value(row_idx).to_string(),
-                            _ => {
-                                // For unsupported types, use arrow's cast to Utf8
-                                match compute::cast(col, &DataType::Utf8) {
-                                    Ok(casted) => {
-                                        casted.as_string::<i32>().value(row_idx).to_string()
-                                    }
-                                    Err(_) => "".to_string(),
-                                }
-                            }
-                        }
-                    };
-
-                    row.push((field_name.clone(), value));
-                }
-                row
-            })
-            .collect();
+        // Only stringify the columns that participate in anomaly detection.
+        let data = Self::build_detection_rows(&input, &fields)?;
 
         // Detect anomalies
         let anomaly_records = self.detect_anomalies(&data, &fields);
@@ -1383,7 +1510,6 @@ impl TableFunction for AnomalyDetector {
 mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
-
     #[test]
     fn test_anomaly_detector_basic() {
         // Create test data with some obvious anomalies
