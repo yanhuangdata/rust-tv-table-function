@@ -1548,12 +1548,10 @@ impl Predict {
                             "";
                             effective_future_timespan
                         ])) as ArrayRef,
-                        _ => {
-                            arrow::array::new_null_array(
-                                field.data_type(),
-                                effective_future_timespan,
-                            )
-                        }
+                        _ => arrow::array::new_null_array(
+                            field.data_type(),
+                            effective_future_timespan,
+                        ),
                     }
                 };
                 let refs: Vec<&dyn Array> = vec![concatenated.as_ref(), extension_array.as_ref()];
