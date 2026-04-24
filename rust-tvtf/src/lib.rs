@@ -103,6 +103,7 @@ pub fn get_function_registries() -> anyhow::Result<Vec<FunctionRegistry>> {
                     .parameter((Some("period"), ArgType::Int, Some(0)))
                     .parameter((Some("future_timespan"), ArgType::Int, Some(5)))
                     .parameter((Some("holdback"), ArgType::Int, Some(0)))
+                    .parameter((Some("group_by_fields"), ArgType::String, Some("")))
                     .parameter((Some("nonnegative"), ArgType::Bool, Some(false)))
                     .parameter((Some("start"), ArgType::Int, Some(0)))
                     .build()
