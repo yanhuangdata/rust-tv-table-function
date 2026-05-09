@@ -253,22 +253,24 @@ impl AnomalyDetector {
 
     /// Check if a string value can be converted to a number
     fn is_numeric(value: &str) -> bool {
-        let clean_value = value
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_lowercase();
-        clean_value.parse::<f64>().is_ok()
+        Self::parse_finite_numeric(value).is_some()
     }
 
-    /// Clean and convert string to numeric value
-    fn clean_numeric_value(value: &str) -> f64 {
+    /// Parse a string into a finite numeric value.
+    /// Treat NaN and infinities as missing values so they do not enter statistics.
+    fn parse_finite_numeric(value: &str) -> Option<f64> {
         let clean_value = value
             .trim()
             .trim_matches('"')
             .trim_matches('\'')
             .to_lowercase();
-        clean_value.parse::<f64>().unwrap_or(0.0)
+        clean_value.parse::<f64>().ok().filter(|v| v.is_finite())
+    }
+
+    #[cfg(test)]
+    /// Clean and convert string to numeric value
+    fn clean_numeric_value(value: &str) -> f64 {
+        Self::parse_finite_numeric(value).unwrap_or(0.0)
     }
 
     /// Analyze field type based on value distribution
@@ -379,12 +381,17 @@ impl AnomalyDetector {
 
     /// Build frequency distribution for a numerical field - exactly matching Python
     fn build_numerical_field_frequency(&mut self, field: &str, data: &[Vec<(String, String)>]) {
-        // Collect numeric values (matching Python's _clean_numeric_value)
-        let values: Vec<f64> = data
+        // Collect finite numeric values only. NaN/inf are treated as missing values.
+        let numeric_rows: Vec<(String, f64)> = data
             .iter()
-            .filter_map(|row| row.iter().find(|(f, _)| f == field))
-            .map(|(_, v)| Self::clean_numeric_value(v))
+            .filter_map(|row| {
+                row.iter()
+                    .find(|(f, _)| f == field)
+                    .and_then(|(_, v)| Self::parse_finite_numeric(v).map(|num| (v.clone(), num)))
+            })
             .collect();
+
+        let values: Vec<f64> = numeric_rows.iter().map(|(_, v)| *v).collect();
 
         if values.is_empty() {
             return;
@@ -416,13 +423,10 @@ impl AnomalyDetector {
 
             // Build frequency map - match Python's logic exactly
             let mut value_frequencies = HashMap::new();
-            for (i, row) in data.iter().enumerate() {
-                if let Some((_, v)) = row.iter().find(|(f, _)| f == field) {
-                    let numeric_val = values[i];
-                    if let Some(&bin_idx) = value_to_bin.get(&numeric_val.to_string()) {
-                        let bin_freq = bin_counts[bin_idx] as f64 / total_count;
-                        value_frequencies.insert(v.clone(), bin_freq);
-                    }
+            for (original_value, numeric_val) in &numeric_rows {
+                if let Some(&bin_idx) = value_to_bin.get(&numeric_val.to_string()) {
+                    let bin_freq = bin_counts[bin_idx] as f64 / total_count;
+                    value_frequencies.insert(original_value.clone(), bin_freq);
                 }
             }
 
@@ -431,10 +435,8 @@ impl AnomalyDetector {
         } else {
             // Use direct frequency counting - matching Python
             let mut counter: HashMap<String, usize> = HashMap::new();
-            for row in data {
-                if let Some((_, v)) = row.iter().find(|(f, _)| f == field) {
-                    *counter.entry(v.clone()).or_insert(0) += 1;
-                }
+            for (original_value, _) in &numeric_rows {
+                *counter.entry(original_value.clone()).or_insert(0) += 1;
             }
 
             let total = counter.values().sum::<usize>() as f64;
@@ -747,7 +749,12 @@ impl AnomalyDetector {
                     if col.is_null(row_idx) {
                         "null".to_string()
                     } else {
-                        col.as_primitive::<Float32Type>().value(row_idx).to_string()
+                        let value = col.as_primitive::<Float32Type>().value(row_idx);
+                        if value.is_finite() {
+                            value.to_string()
+                        } else {
+                            "null".to_string()
+                        }
                     }
                 })
                 .collect()),
@@ -756,7 +763,12 @@ impl AnomalyDetector {
                     if col.is_null(row_idx) {
                         "null".to_string()
                     } else {
-                        col.as_primitive::<Float64Type>().value(row_idx).to_string()
+                        let value = col.as_primitive::<Float64Type>().value(row_idx);
+                        if value.is_finite() {
+                            value.to_string()
+                        } else {
+                            "null".to_string()
+                        }
                     }
                 })
                 .collect()),
@@ -1221,7 +1233,13 @@ impl AnomalyDetector {
                 }
                 DataType::Float64 => {
                     let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-                    let values: Vec<f64> = (0..num_rows).map(|i| arr.value(i)).collect();
+                    let values: Vec<f64> = (0..num_rows)
+                        .map(|i| arr.value(i))
+                        .filter(|v| v.is_finite())
+                        .collect();
+                    if values.is_empty() {
+                        continue;
+                    }
                     let mut sorted_values = values.clone();
                     sorted_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     let q1 = percentile(&sorted_values, 25.0);
@@ -1672,6 +1690,9 @@ mod tests {
         assert!(AnomalyDetector::is_numeric("-123.45"));
         assert!(AnomalyDetector::is_numeric("1.23e-4"));
         assert!(AnomalyDetector::is_numeric("1E+5"));
+        assert!(!AnomalyDetector::is_numeric("NaN"));
+        assert!(!AnomalyDetector::is_numeric("inf"));
+        assert!(!AnomalyDetector::is_numeric("-inf"));
         assert!(!AnomalyDetector::is_numeric("abc"));
         assert!(!AnomalyDetector::is_numeric(""));
     }
@@ -1684,6 +1705,48 @@ mod tests {
         assert_eq!(AnomalyDetector::clean_numeric_value("1.23e-4"), 0.000123);
         assert_eq!(AnomalyDetector::clean_numeric_value("abc"), 0.0);
         assert_eq!(AnomalyDetector::clean_numeric_value(""), 0.0);
+    }
+
+    #[test]
+    fn test_histogram_with_nan_input_does_not_crash() {
+        let input_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Float64,
+                true,
+            )])),
+            vec![Arc::new(Float64Array::from(vec![10.0, 11.0, f64::NAN, 12.0, 500.0])) as ArrayRef],
+        )
+        .expect("Failed to create record batch");
+
+        let mut detector =
+            AnomalyDetector::new(Some(vec![]), vec![]).expect("Failed to create AnomalyDetector");
+
+        let output = detector.process(input_batch).expect("Processing failed");
+        assert!(output.is_some());
+    }
+
+    #[test]
+    fn test_iqr_transform_with_nan_input_does_not_crash() {
+        let input_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Float64,
+                true,
+            )])),
+            vec![Arc::new(Float64Array::from(vec![10.0, 11.0, f64::NAN, 12.0, 500.0])) as ArrayRef],
+        )
+        .expect("Failed to create record batch");
+
+        let named_params = vec![
+            ("method".to_string(), Arg::String("iqr".to_string())),
+            ("action".to_string(), Arg::String("transform".to_string())),
+        ];
+        let mut detector = AnomalyDetector::new(Some(vec![]), named_params)
+            .expect("Failed to create AnomalyDetector");
+
+        let output = detector.process(input_batch).expect("Processing failed");
+        assert!(output.is_some());
     }
 
     #[test]
