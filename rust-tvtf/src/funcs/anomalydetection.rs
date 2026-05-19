@@ -304,7 +304,7 @@ impl AnomalyDetector {
 
         // Sort values to compute percentiles like NumPy
         let mut sorted_values = values.to_vec();
-        sorted_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted_values.sort_by(|a, b| a.total_cmp(b));
 
         // Compute bin edges using NumPy's percentile-based method
         // NumPy uses: bin_edges[i] = quantiles[i] where quantiles are evenly spaced
@@ -400,7 +400,7 @@ impl AnomalyDetector {
         // Calculate unique count (matching Python)
         let unique_count = {
             let mut unique: Vec<f64> = values.clone();
-            unique.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            unique.sort_by(|a, b| a.total_cmp(b));
             unique.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
             unique.len()
         };
@@ -494,7 +494,7 @@ impl AnomalyDetector {
         }
 
         let mut sorted_probs: Vec<f64> = log_probabilities.to_vec();
-        sorted_probs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted_probs.sort_by(|a, b| a.total_cmp(b));
 
         let threshold = match self.method.as_str() {
             "histogram" => self.calculate_histogram_threshold(&sorted_probs, fields),
@@ -547,7 +547,7 @@ impl AnomalyDetector {
                 // Pure categorical: Use very strict threshold (only absolute minimums)
                 // Python: unique_probs[0] + 0.001
                 let mut unique_probs: Vec<f64> = sorted_probs.to_vec();
-                unique_probs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                unique_probs.sort_by(|a, b| a.total_cmp(b));
                 unique_probs.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
                 if unique_probs.len() > 1 {
                     unique_probs[0] + 0.001
@@ -646,7 +646,7 @@ impl AnomalyDetector {
     fn apply_sensitivity_adjustment(&self, threshold: f64, log_probs: &[f64]) -> f64 {
         // Sort log_probs for percentile calculation
         let mut sorted_probs: Vec<f64> = log_probs.to_vec();
-        sorted_probs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted_probs.sort_by(|a, b| a.total_cmp(b));
 
         match self.sensitivity.as_str() {
             "strict" => {
@@ -954,7 +954,7 @@ impl AnomalyDetector {
                     } else {
                         // Primarily numerical - use cumulative method
                         let mut sorted_freqs = all_field_freqs;
-                        sorted_freqs.sort_by(|a, b| b.partial_cmp(a).unwrap()); // descending
+                        sorted_freqs.sort_by(|a, b| b.total_cmp(a)); // descending
                         let mut cumulative = 0.0f64;
                         let target_coverage = 0.91;
 
@@ -991,7 +991,7 @@ impl AnomalyDetector {
                 .filter(|r| r.log_prob < threshold)
                 .map(|r| r.log_prob)
                 .collect();
-            anomalous_probs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            anomalous_probs.sort_by(|a, b| a.total_cmp(b));
 
             let representative_log_prob = anomalous_probs.first().copied();
 
@@ -1021,7 +1021,7 @@ impl AnomalyDetector {
 
         // Sort log_probs for percentile calculation
         let mut sorted_probs: Vec<f64> = log_probs.to_vec();
-        sorted_probs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted_probs.sort_by(|a, b| a.total_cmp(b));
 
         let first_quartile = percentile(&sorted_probs, 25.0);
         let third_quartile = percentile(&sorted_probs, 75.0);
@@ -1223,7 +1223,7 @@ impl AnomalyDetector {
                     let values: Vec<i64> = (0..num_rows).map(|i| arr.value(i)).collect();
                     let float_values: Vec<f64> = values.iter().map(|v| *v as f64).collect();
                     let mut sorted_values = float_values.clone();
-                    sorted_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    sorted_values.sort_by(|a, b| a.total_cmp(b));
                     let q1 = percentile(&sorted_values, 25.0);
                     let q3 = percentile(&sorted_values, 75.0);
                     let iqr = q3 - q1;
@@ -1241,7 +1241,7 @@ impl AnomalyDetector {
                         continue;
                     }
                     let mut sorted_values = values.clone();
-                    sorted_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    sorted_values.sort_by(|a, b| a.total_cmp(b));
                     let q1 = percentile(&sorted_values, 25.0);
                     let q3 = percentile(&sorted_values, 75.0);
                     let iqr = q3 - q1;
